@@ -4,10 +4,18 @@ magic_codec is a small utility to make writng preprocessors for Python easier. T
 
 ## Loading builtins
 Currently the following preprocessors are available:
-- [braces](src/magic_codec/builtin/braces.py) Python with braces - inspired by Bython (ie. `python tests/braces/test.by`)
-- [incdec](src/magic_codec/builtin/incdec.py) Extends python with unary prefix `++i` and postfix `i++` increment/decrement expressions (ie. `python tests/incdec/incdec.py`)
+- [braces](src/magic_codec/builtin/braces.py) Python with braces - inspired by Bython
+    - magic line: `# coding: magic.braces`
+    - example: `python tests/braces/test.by`
+- [incdec](src/magic_codec/builtin/incdec.py) Extends python with unary prefix `++i` and postfix `i++` increment/decrement expressions
+    - magic line: `# coding: magic.incdec`
+    - example: `python tests/incdec/incdec.py`
 - [cpp](src/magic_codec/builtin/cpp.py) lets the Python interpreter interpret C++ via cppyy (ie. `python tests/test.cpp`)
-- [toml](src/magic_codec/builtin/toml.py) validate toml files using json schemas (ie. `python tests/toml/data_valid.toml -s tests/toml/schema.json`)
+    - magic line: `# coding: magic.cpp`
+    - example: `python tests/test.cpp`
+- [toml](src/magic_codec/builtin/toml.py) validate toml files using json schemas (ie. )
+    - magic line: `# coding: magic.toml`
+    - example: `python tests/toml/data_valid.toml -s tests/toml/schema.json`
 
 Builtins can be loaded by setting the codec to `magic.builtin_name` where `builtin_name` is the name of the builtin.
 
@@ -19,3 +27,6 @@ The expected signature of `preprocess` is as follows:
 def preprocess(data: str) -> str:
     raise NotImplementedError
 ```
+
+
+You can find an example extension in [example](example/).
