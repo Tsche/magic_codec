@@ -1,0 +1,37 @@
+[build-system]
+    requires      = ["setuptools>=65", "wheel"]
+    build-backend = "setuptools.build_meta"
+
+[tool.mypy]
+    mypy_path              = "src"
+    plugins                = []
+    check_untyped_defs     = true
+    ignore_missing_imports = true
+    no_implicit_optional   = true
+    show_error_codes       = true
+    strict_equality        = true
+    warn_redundant_casts   = true
+    warn_return_any        = true
+    warn_unreachable       = true
+    warn_unused_configs    = true
+    no_implicit_reexport   = true
+    warn_unused_ignores    = true
+
+[tool.pylint.'MESSAGES CONTROL']
+    disable = """
+        C0114,
+        E0401,
+        C0115,
+        R0903,
+        C0116,
+        missing-class-docstring,
+        no-name-in-module,
+        import-outside-toplevel
+    """
+    max-line-length = 120
+
+[tool.autopep8]
+    max_line_length = 120
+
+[tool.isort]
+    line_length = 120

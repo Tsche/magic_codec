@@ -1,0 +1,17 @@
+# coding: magic.braces
+def print_message(num_of_times) {
+    for i in range(num_of_times) {  
+   print("braces ftw");
+  print({'x': 3})
+ }
+}
+
+x = {        \
+  'foo': 42, \
+  'bar': 5   \
+}
+
+if __name__ == "__main__" {
+print_message(2);
+    print({k:v for k, v in x.items()})
+}

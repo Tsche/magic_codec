@@ -1,0 +1,23 @@
+{
+    "type": "object",
+    "properties": {
+        "name": {"type": "string"},
+        "age": {"type": "number"},
+        "scores": {
+            "type": "array",
+            "items": {"type": "number"}
+        },
+        "address": {"$ref": "#/$defs/address"}
+    },
+    "required": ["name"],
+    "$defs": {
+        "address": {
+            "type": "object",
+            "properties": {
+                "street": {"type": "string"},
+                "postcode": {"type": "number"}
+            },
+            "required": ["street"]
+        }
+    }
+}
