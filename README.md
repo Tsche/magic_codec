@@ -11,7 +11,7 @@ Currently the following preprocessors are available:
     - magic line: `# coding: magic.incdec`
     - example: `python tests/incdec/incdec.py`
 - [cpp](src/magic_codec/builtin/cpp.py) lets the Python interpreter interpret C++ via cppyy (ie. `python tests/test.cpp`)
-    - magic line: `# coding: magic.cpp`
+    - magic line: `#define CODEC "coding:magic.cpp"`
     - example: `python tests/test.cpp`
 - [toml](src/magic_codec/builtin/toml.py) validate toml files using json schemas (ie. )
     - magic line: `# coding: magic.toml`
