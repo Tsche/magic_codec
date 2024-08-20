@@ -1,4 +1,5 @@
 # coding: magic.toml
+
 name = "John Doe"
 age = 42
 scores = [40, 20, 80, 90]

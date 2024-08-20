@@ -18,7 +18,7 @@ def make_decoder(preprocessor: Callable):
             try:
                 processed = preprocessor(decoded)
             except Exception:
-                print(traceback.format_exc())
+                traceback.print_exc()
                 raise
             return processed, consumed
 
@@ -78,7 +78,7 @@ def find_codec(encoding: str) -> Optional[codecs.CodecInfo]:
         )
     except CodecError as exc:
         print(exc)
-    except Exception as exc:
-        print(exc.with_traceback())
+    except Exception:
+        traceback.print_exc()
 
     return None
