@@ -22,13 +22,13 @@ def make_decoder(preprocessor: Callable):
                 raise
             return processed, consumed
 
-        def decode(self, input, final=False) -> str:
-            self.buffer += input
+        def decode(self, data, final=False) -> str:
+            self.buffer += data
 
             if self.buffer and final:
                 buffer = self.buffer
                 self.reset()
-                return self.do_decode(buffer)[0]
+                return self.do_decode(buffer, self.errors)[0]
 
             return ""
 
