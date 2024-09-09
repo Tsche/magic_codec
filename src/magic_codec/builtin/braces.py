@@ -1,12 +1,12 @@
 from io import StringIO
-from tokenize import generate_tokens, untokenize
+from tokenize import TokenInfo, generate_tokens, untokenize
 import tokenize
+from typing import Generator, Iterable
 
 
-def transform(data: str):
-    tokens = list(generate_tokens(StringIO(data).readline))
+def preprocess_tokens(tokens: Iterable[TokenInfo]) -> Generator[TokenInfo | tuple[int, str], None, None]:
     indent = 0
-
+    tokens = list(tokens)
     for (idx, token) in enumerate(tokens):
         if token.type in (tokenize.INDENT, tokenize.DEDENT):
             continue
@@ -23,7 +23,7 @@ def transform(data: str):
             if token.string == '{':
                 assert idx < len(tokens) - 1
                 if tokens[idx + 1].type in (tokenize.NL, tokenize.NEWLINE):
-                    yield (tokenize.OP, ':')
+                    yield tokenize.COLON
                     indent += 1
                     continue
 
@@ -34,12 +34,26 @@ def transform(data: str):
                     continue
 
         elif token.type in (tokenize.NL, tokenize.NEWLINE):
-            yield (token.type, token.string)
-            yield (tokenize.INDENT, '    '*indent)
+            yield token
+            yield tokenize.INDENT, '    '*indent
             continue
 
-        yield (token.type, token.string)
+        yield token
+
+
+EXACT_TOKENS = {type_: value for value, type_ in tokenize.EXACT_TOKEN_TYPES.items()}
+
+
+def cleanup(tokens: Iterable[TokenInfo | tuple[int, str] | int]):
+    for token in tokens:
+        if isinstance(token, int):
+            assert token in EXACT_TOKENS, f"Invalid token type {token}"
+            yield tokenize.OP, EXACT_TOKENS[token]
+        else:
+            yield token
 
 
 def preprocess(data: str):
-    return untokenize(transform(data))
+    tokens = list(generate_tokens(StringIO(data).readline))
+    processed = preprocess_tokens(tokens)
+    return untokenize(cleanup(processed))
