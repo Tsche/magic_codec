@@ -13,13 +13,14 @@ def make_decoder(preprocessor: Callable):
         def _buffer_decode(self, input, errors, final):  """not used"""
 
         @staticmethod
-        def do_decode(data: bytes, errors='strict') -> tuple[str, int]:
+        def do_decode(data: bytes, errors='strict') -> tuple[str, int] | None:
             decoded, consumed = codecs.utf_8_decode(data, errors, True)
             try:
                 processed = preprocessor(decoded)
             except Exception:
                 traceback.print_exc()
                 raise
+
             return processed, consumed
 
         def decode(self, data, final=False) -> str:

@@ -3,13 +3,7 @@ import keyword
 from tokenize import TokenInfo, generate_tokens
 import tokenize
 
-
-def is_valid_unary_operator(token):
-    return token.type == tokenize.OP and token.string in ('+', '-')
-
-
-def is_valid_name(token):
-    return token.type == tokenize.NAME and not keyword.iskeyword(token.string)
+from magic_codec.util import TokenStream
 
 
 class UnaryExpr:
@@ -57,32 +51,33 @@ class UnaryExpr:
         ]
 
 
+def is_valid_unary_operator(token):
+    return token.type == tokenize.OP and token.string in ('+', '-')
+
+
+def is_valid_name(token):
+    return token.type == tokenize.NAME and not keyword.iskeyword(token.string)
+
+
 def transform(data):
-    tokens = list(generate_tokens(StringIO(data).readline))
-    idx = 0
+    tokens = TokenStream(generate_tokens(StringIO(data).readline))
 
-    while idx < len(tokens) - 2:
-        current = tokens[idx]
-
+    for current in tokens:
         if is_valid_name(current):
-            peek1, peek2 = tokens[idx + 1], tokens[idx + 2]
+            peek1, peek2 = tokens.peek(2)
             if is_valid_unary_operator(peek1) and peek1.string == peek2.string:
                 yield from UnaryExpr.from_tokens((current, peek1, peek2)).to_tokens()
-                idx += 3
+                tokens.commit()
                 continue
 
         elif is_valid_unary_operator(current):
-            peek, name = tokens[idx + 1], tokens[idx + 2]
+            peek, name = tokens.peek(2)
             if peek.string == current.string and is_valid_name(name):
                 yield from UnaryExpr.from_tokens((current, peek, name)).to_tokens()
-                idx += 3
+                tokens.commit()
                 continue
 
         yield current.type, current.string
-        idx += 1
-
-    yield tokens[len(tokens) - 2].type, tokens[len(tokens) - 2].string
-    yield tokens[len(tokens) - 1].type, tokens[len(tokens) - 1].string
 
 
 def preprocess(data: str):

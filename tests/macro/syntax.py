@@ -1,22 +1,18 @@
 # coding: magic.macro
-macro def zoinks(code):
-    yield from code.tokens
 
+macro from typing_extensions import deprecated
+
+macro def foo(code):
+    print(code.string)
+    return code
+
+@deprecated("foo")
 @macro
-def foo(test=3):
-    def wrap(code):
-        return code
-    return wrap
+@foo
+def bar(code):
+    print(code.string)
+    return code
 
-foo = a @ b
-bar @= c
-
-@identity(foo="bar")
-@foo(42)
-@boo.z
-@zoinks
-def bar():
+@bar
+def zoinks():
     return 3
-
-if __name__ == "__main__":
-    print(bar())

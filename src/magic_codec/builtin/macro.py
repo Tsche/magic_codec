@@ -1,40 +1,13 @@
 # pylint: disable=eval-used,exec-used
 
 import ast as _ast
-from collections import namedtuple
-from functools import cache
 from io import StringIO
 from token import DEDENT, ENDMARKER, INDENT, NAME, NEWLINE, NL, NUMBER, OP, STRING
-from tokenize import TokenInfo, generate_tokens, untokenize
+from tokenize import generate_tokens, untokenize
 from types import EllipsisType
-from typing import Any, Iterable, Optional, Self
+from typing import Any, Optional
 
-
-Token = namedtuple("Token", ["type", "string"])
-
-
-@cache
-def get_tokens(data: str) -> list[Token]:
-    return [Token(token.type, token.string) for token in list(generate_tokens(StringIO(data).readline))][:-1]
-
-
-class Code:
-    tokens: list[Token]
-
-    def __init__(self, tokens: Iterable[Token] | Self):
-        if isinstance(tokens, Code):
-            self.tokens = tokens.tokens
-        else:
-            # force conversion to Token in case a proc macro returned a plain tuple
-            self.tokens = [Token(type_, string) for type_, string in tokens]
-
-    @property
-    def string(self):
-        return untokenize(self.tokens)
-
-    @property
-    def ast(self):
-        return _ast.parse(self.string, type_comments=True)
+from magic_codec.util import Code, Token, get_tokens
 
 
 def macro(fnc):
@@ -137,31 +110,51 @@ def parse_decorators(tokens: list[Token]):
         decorators.append((name, args))
         idx += 1 + len(args)
 
-    if tokens[idx].type != NAME or tokens[idx].string not in ('def', 'class'):
+    if tokens[idx].type != NAME or tokens[idx].string not in ('def', 'class', 'macro'):
         return [], 0
 
     return decorators, idx
 
 
-def convert(expression: list[Token], target_type: str):
-    return [Token(NAME, target_type), Token(OP, '('), *expression, Token(OP, ')')]
+def synthesize_call(function: str | list[Token], expression: list[Token]):
+    name = [Token(NAME, function)] if isinstance(function, str) else [*function]
+    return [*name, Token(OP, '('), *expression, Token(OP, ')')]
 
 
-def chain_macros(calls: list[list[Token]], args: list[Token], convert_to: Optional[str] = None):
+def chain_calls(calls: list[list[Token]], args: list[Token], convert_to: Optional[str] = None):
     if not calls:
-        return convert(args, convert_to) if convert_to else args
+        return synthesize_call(convert_to, args) if convert_to else args
+    call = synthesize_call(calls[0], chain_calls(calls[1:], args, convert_to))
+    return synthesize_call(convert_to, call) if convert_to else call
 
-    call = [*calls[0],
-            Token(OP, string='('),
-            *chain_macros(calls[1:], args, convert_to),
-            Token(OP, string=')')]
 
-    return convert(call, convert_to) if convert_to else call
+def tokenize_constant(value: Any):
+    if value is None:
+        return
+    elif isinstance(value, bool):
+        yield Token(NAME, str(value))
+    elif isinstance(value, (int, float)):
+        yield Token(NUMBER, str(value))
+    elif isinstance(value, str):
+        try:
+            node = _ast.parse(value, mode="eval")
+            if isinstance(node.body, _ast.Constant):
+                yield Token(STRING, value)
+            elif isinstance(node.body, _ast.Name):
+                yield Token(NAME, value)
+            else:
+                # string contains more than one token - insert all of them into the token stream
+                raise SyntaxError
+        except SyntaxError:
+            yield from get_tokens(value)[:-1]
+    else:
+        # couldn't find something to replace the constant with
+        # assume a replacement wasn't desired
+        yield from get_tokens(value)[:-1]
 
 
 class MacroProcessor:
-    def __init__(self, tokens: Iterable[TokenInfo]):
-        self.tokens = [Token(token.type, token.string) for token in tokens]
+    def __init__(self):
         self.globals: dict[str, Any] = {
                                         # 'tokenize': tokenize,
                                         # 'ast': _ast,
@@ -195,19 +188,36 @@ class MacroProcessor:
             exec(untokenize(code), self.globals, self.locals)
         return len(code)
 
-    def parse_macro_function(self, tokens: list[Token]):
+    def parse_macro_function(self, tokens: list[Token],
+                             decorators: list[list[Token]],
+                             macro_decorators: Optional[list[list[Token]]] = None):
         body = consume_match(tokens, (INDENT, ...), (DEDENT, ''))
+        consumed = len(body)
+        
+        body = [*[token
+                  for decorator in decorators
+                  for token in decorator], *body]
+
         if not body:
             return 0
 
+        if macro_decorators:
+            call = chain_calls(macro_decorators, args=[Token(NAME, "__magic_macro_code_object")], convert_to="_Code")
+            call_locals = {**self.locals,
+                           '__magic_macro_code_object': body,
+                           '_Code': _Code}
+            transformed = eval(untokenize(call), self.globals, call_locals)
+            body = transformed.tokens
+
         exec(untokenize(body), self.globals, self.locals)
-        return len(body)
+        return consumed
 
     def apply_macros(self, macros: list[list[Token]], tokens: list[Token]):
         if tokens[0].type != NAME or tokens[0].string not in ('def', 'class'):
             return [], 0
+
         code = consume_match(tokens, (INDENT, ...), (DEDENT, ...))
-        call = chain_macros(macros, args=[Token(NAME, "__magic_macro_code_object")], convert_to="_Code")
+        call = chain_calls(macros, args=[Token(NAME, "__magic_macro_code_object")], convert_to="_Code")
         call_locals = {**self.locals,
                        '__magic_macro_code_object': code,
                        '_Code': _Code}
@@ -225,45 +235,22 @@ class MacroProcessor:
                 continue
             yield token
 
-    def convert_constant(self, value: Any):
-        if value is None:
-            return
-        elif isinstance(value, bool):
-            yield Token(NAME, str(value))
-        elif isinstance(value, (int, float)):
-            yield Token(NUMBER, str(value))
-        elif isinstance(value, str):
-            try:
-                node = _ast.parse(value, mode="eval")
-                if isinstance(node.body, _ast.Constant):
-                    yield Token(STRING, value)
-                elif isinstance(node.body, _ast.Name):
-                    yield Token(NAME, value)
-                else:
-                    # string contains more than one token - insert all of them into the token stream
-                    raise SyntaxError
-            except SyntaxError:
-                yield from get_tokens(value)[:-1]
-        else:
-            # couldn't find something to replace the constant with
-            # assume a replacement wasn't desired
-            yield from get_tokens(value)[:-1]
-
     def replace_constant(self, token: Token):
         value = self.locals[token.string]
-        yield from self.convert_constant(value)
+        yield from tokenize_constant(value)
 
-    def transform(self):
+    def transform(self, tokens: list[Token]):
         idx = 0
-        while idx < len(self.tokens):
-            token = self.tokens[idx]
+        while idx < len(tokens):
+            token = tokens[idx]
+
             if token.type == NAME and token.string == "macro":
                 idx += 1
-                assert self.tokens[idx].type == NAME, "`macro` can only be followed by an identifier, def or class"
-                next_token = self.tokens[idx]
-                remaining_tokens = self.tokens[idx:]
+                assert tokens[idx].type == NAME, "`macro` can only be followed by an identifier, def or class"
+                next_token = tokens[idx]
+                remaining_tokens = tokens[idx:]
                 if next_token.string in ("def", "class"):
-                    idx += self.parse_macro_function(remaining_tokens)
+                    idx += self.parse_macro_function(remaining_tokens, [])
                 elif next_token.string in ("import", "from"):
                     idx += self.parse_macro_import(remaining_tokens)
                 elif next_token.type == NAME:
@@ -273,28 +260,36 @@ class MacroProcessor:
                     yield token
                 continue
 
-            if token == (OP, '@'):
-                decorators, consumed = parse_decorators(self.tokens[idx:])
+            elif token == (OP, '@'):
+                decorators, consumed = parse_decorators(tokens[idx:])
                 if consumed:
-                    # this was actually a decorated class or function
-                    if any(len(name) == 1 and name[0].string == 'macro' for name, _ in decorators):
-                        idx += self.parse_macro_function(self.tokens[idx:])
-                        continue
-
                     idx += consumed
+                    decorators_ = []
                     macro_decorators = []
+                    is_macro = False
                     for decorator_name, decorator_args in decorators:
+                        if len(decorator_name) == 1 and decorator_name[0].string == "macro":
+                            is_macro = True
+                            continue
+
+                        # TODO properly look up decorators with more than one token as name
                         if len(decorator_name) > 1 or decorator_name[0].string not in self.locals:
                             # yield non-macro decorators
-                            yield Token(OP, '@')
-                            yield from decorator_name
-                            yield from decorator_args
-                            yield Token(NEWLINE, '\n')
+                            decorators_.append([Token(OP, '@'), *decorator_name, *decorator_args, Token(NEWLINE, '\n')])
                             continue
                         macro_decorators.append([*decorator_name, *decorator_args])
 
+                    if tokens[idx] == (NAME, "macro"):
+                        idx += 1
+                        is_macro = True
+
+                    if is_macro:
+                        idx += self.parse_macro_function(tokens[idx:], decorators_, macro_decorators)
+                        continue
+
+                    yield from decorators_
                     if macro_decorators:
-                        new_tokens, consumed = self.apply_macros(macro_decorators, self.tokens[idx:])
+                        new_tokens, consumed = self.apply_macros(macro_decorators, tokens[idx:])
                         idx += consumed
                         yield from new_tokens
 
@@ -302,25 +297,36 @@ class MacroProcessor:
 
             elif token.type == NAME and token.string in self.locals:
                 idx += 1
-                if self.tokens[idx].type == OP and self.tokens[idx].string == '(':
+                if tokens[idx].type == OP and tokens[idx].string == '(':
                     # function-like macro call
-                    args = consume_match(self.tokens[idx:], (OP, '('), (OP, ')'))
+                    args = consume_match(tokens[idx:], (OP, '('), (OP, ')'))
                     idx += len(args)
 
                     call = [token, *args]
                     result = eval(untokenize(call), self.globals, self.locals)
-                    yield from self.convert_constant(result)
+                    yield from tokenize_constant(result)
                 else:
                     # constant
                     yield from self.replace_constant(token)
                 continue
 
+            elif token.type == NAME and token.string in ("def", "class"):
+                name_token = tokens[idx + 1]
+                macro_token = tokens[idx + 2]
+
+                if macro_token == (OP, '!'):
+                    print("MACRO FUNCTION")
+                    idx += 3
+                    continue
+
             idx += 1
             yield token.type, token.string
 
 
+# @cache
 def preprocess(data: str):
-    tokens = generate_tokens(StringIO(data).readline)
-    processor = MacroProcessor(tokens)
-    new_tokens = processor.transform()
-    return untokenize(new_tokens)
+    tokens = generate_tokens(StringIO("\n" + data).readline)
+    processor = MacroProcessor()
+    new_tokens = processor.transform([Token(token.type, token.string) for token in tokens])
+    new_source = untokenize(new_tokens)
+    return new_source
