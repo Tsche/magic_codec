@@ -1,4 +1,4 @@
-# coding: magic.macro(foobar)
+# coding: magic.macro
 macro import tokenize
 
 macro def replace_zeroes(code):
