@@ -43,7 +43,9 @@ def get_preprocessor(module_name: str, package_name: Optional[str] = None) -> Ca
 
         module = importlib.import_module(module_path, package_name)
     except ModuleNotFoundError as exc:
-        raise CodecError(f"Invalid magic_codec: `{module_name}` not found") from exc
+        if exc.name == package_name:
+            raise CodecError(f"Invalid magic_codec: `{module_name}` not found") from exc
+        raise
 
     preprocessor = getattr(module, "preprocess", None)
     if preprocessor is None:
