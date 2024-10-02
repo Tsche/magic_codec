@@ -12,7 +12,8 @@ from typing import Any, Deque, Iterable, Iterator, Optional, Self, TypeVar, Call
 import ast as _ast
 import token
 
-from colorama import Back, Fore, Style
+from colorama import Fore, Style
+from colorama.ansi import AnsiFore, AnsiBack, AnsiStyle
 
 
 def force_conversion(to: type | Callable | None = None):
@@ -33,7 +34,7 @@ def force_conversion(to: type | Callable | None = None):
     return wrapper(to)
 
 
-def decorated(message: Any, fg: Optional[Fore] = None, bg: Optional[Back] = None, style: Optional[Style] = None,):
+def decorated(message: Any, fg: Optional[AnsiFore] = None, bg: Optional[AnsiBack] = None, style: Optional[AnsiStyle] = None,):
     if not isinstance(message, str):
         message = str(message)
 
@@ -420,7 +421,7 @@ class TokenStream(PeekableStream):
         return self.consume_until(([token.NL, token.NEWLINE, token.ENDMARKER], ...))
 
     @force_conversion(list)
-    def consume_balanced(self, increase: TokenQuery, decrease: TokenQuery, level: int = 0) -> list[Token]:
+    def consume_balanced(self, increase: TokenQuery, decrease: TokenQuery, level: int = 0):
         for item in self:
             yield item
 
@@ -434,9 +435,6 @@ class TokenStream(PeekableStream):
             if level == 0:
                 return
             raise ParseError(f"Unexpected eof - expected {decrease}", self.error_context())
-
-    def consume_block(self) -> list[Token]:
-        return self.consume_balanced((token.INDENT, ...), (token.DEDENT, ...))
 
     @force_conversion(list)
     def peek_while(self, condition: TokenQuery) -> list[Token]:
@@ -475,13 +473,11 @@ class TokenStream(PeekableStream):
             # raise ParseError(f"Unexpected eof - expected {decrease}", self.error_context())
         return peeked
 
-    def peek_block(self):
-        return self.peek_balanced((token.INDENT, ...), (token.DEDENT, ...))
-
     def error_context(self):
         if not self.line_buffer and not self._cursor:
             # token stream hasn't been used yet, cancel
-            return
+            return ""
+
         if not self._cursor:
             tokens_before = self.line_buffer[:-1]
             current_token = self.line_buffer[-1]

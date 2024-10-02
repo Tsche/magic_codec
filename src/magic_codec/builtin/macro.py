@@ -19,6 +19,10 @@ class _Code(Code):
     """ Tag type to mark code objects coming from the preprocessor """
 
 
+class UnresolvedSymbol(Exception): 
+    """ Raised when a symbol cannot be resolved in the context of the preprocessor. """
+
+
 class MacroDecorator(type):
     def __call__(cls, *args, **kwargs):
         ctor = super().__call__
@@ -47,67 +51,58 @@ class NodeTransformer(_ast.NodeTransformer, metaclass=MacroDecorator):
         yield Token(NEWLINE, '\n')
 
 
-def transform_macro_name(name: str):
-    return f"___magic_macro___{name}"
+MACRO_PREFIX = "___magic_macro___"
 
+def parse_name(tokens: TokenStream):
+    current = tokens.peek()
+    if current.type != NAME:
+        return None
+    tokens.commit()
 
-def parse_name(tokens: TokenStream, with_bang=False):
-    name = []
-    for current in tokens:
-        assert current.type == NAME, f"Type mismatch. Expected NAME, got {current.type}. {current}"
-        next_token = tokens.peek()
-        if with_bang and next_token == (OP, '!'):
-            tokens.commit()
-            name.append(Token(NAME, transform_macro_name(current.string), offset=current.offset))
-            next_token = tokens.peek()
-        else:
-            name.append(current)
-        if next_token != (OP, '.'):
-            break
-
-        name.append(next_token)
+    if tokens.peek() == (OP, '!'):
         tokens.commit()
+        return MACRO_PREFIX + current.string
+    tokens.revert()
+    return current.string
 
-    if name[-1] == (OP, '.'):
-        raise ParseError("Name cannot end in a dot")
+def parse_dotted_name(tokens: TokenStream, with_bang=False):
+    name = []
+    while (segment := parse_name(tokens)):
+        name.append(segment)
+        if tokens.peek() != (OP, '.'):
+            tokens.revert()
+
     return name
 
 
-@force_conversion(list)
+def parse_block(tokens: TokenStream):
+    if tokens.peek().type not in (NL, NEWLINE):
+        # simple statement(s) following head - parse until next line, ie:
+        # def foo(): ...
+        # def foo(): x=2;y=3;return x*y;
+        return tokens.consume_line()
+    return tokens.consume_balanced((INDENT, ...), (DEDENT, ...))
+
+
 def parse_decorators(tokens: TokenStream):
-    idx = 0
     decorators = []
     for current in tokens:
         if current != (OP, '@'):
             # unexpected token, stop
             break
-
-        name = parse_name(tokens)
         
-    while tokens[idx] == (OP, '@') and idx <= len(tokens) - 2:
-        name = parse_name(tokens[idx + 1:])
-        if not name:
+        # TODO iter until next NL from here
+        current_decorator = parse_dotted_name(tokens)
+        if not current_decorator:
             break
 
-        idx += len(name)
-        args = []
-
-        if tokens[idx + 1] == (OP, '('):
-            args = list(consume_match(tokens[idx+1:], (OP, '('), (OP, ')')))
-            idx += 1
-        elif tokens[idx + 1].type in (NL, NEWLINE):
-            idx += 1
-        else:
-            break
-
-        decorators.append((name, args))
-        idx += 1 + len(args)
-
-    if tokens[idx].type != NAME or tokens[idx].string not in ('def', 'class', 'macro'):
-        return [], 0
-
-    return decorators, idx
-
+        if tokens.peek() == (OP, '('):
+            arg_list = tokens.consume_balanced((OP, '('), (OP, ')'), 1)
+            # TODO: decorators like @foo().bar().baz() might exist
+            current_decorator.append(arg_list)
+        
+        decorators.append(current_decorator)
+    return decorators
 
 def synthesize_call(function: str | list[Token], expression: list[Token]):
     name = [Token(NAME, function)] if isinstance(function, str) else [*function]
@@ -121,7 +116,7 @@ def chain_calls(calls: list[list[Token]], args: list[Token], convert_to: Optiona
     return synthesize_call(convert_to, call) if convert_to else call
 
 
-def tokenize_constant(value: Any):
+def synthesize_constant(value: Any):
     if value is None:
         return
     elif isinstance(value, bool):
@@ -145,8 +140,101 @@ def tokenize_constant(value: Any):
         # assume a replacement wasn't desired
         yield from get_tokens(value)[:-1]
 
-def parse_function_head(tokens: TokenStream):
-    ...
+
+class Definition:
+    def __init__(self, name, body) -> None:
+        self.name = name
+        self.body = body
+    
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        yield from self.name
+        yield (OP, '=')
+        yield from self.body
+
+
+class ClassDefinition(Definition):
+    def __init__(self, name, body, bases, generics=None) -> None:
+        super().__init__(name, body)
+        self.name = name
+        self.bases = bases
+        self.generics = generics
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        yield NAME, "class"
+        yield self.name
+        if self.generics:
+            yield from self.generics
+
+        if self.bases:
+            yield from self.bases
+
+
+class FunctionDefinition(Definition):
+    def __init__(self, name, body, params, generics=None, return_type=None) -> None:
+        super().__init__(name, body)
+        self.params = params
+        self.generics = generics
+        self.return_type = return_type
+
+    def __iter__(self):
+        return self
+    
+    def __next__(self):
+        yield NAME, "def"
+        yield self.name
+        if self.generics:
+            yield from self.generics
+        yield from self.params
+        if self.return_type:
+            yield from self.return_type
+
+def parse_function_or_class_head(tokens: TokenStream):
+    is_macro, is_async, is_class = False, False, False
+    while (next_token := tokens.peek()):
+        if next_token.type != NAME:
+            raise ParseError("Unexpected token type {next_token.type}", tokens.error_context())
+        match next_token.string:
+            case 'macro':
+                is_macro = True
+            case 'async':
+                is_async = True
+            case 'class':
+                is_class = True
+            case 'def':
+                pass
+
+    assert kind == (NAME, "def", "class")
+
+    name = tokens.next()
+    assert name.type == NAME
+
+    # TODO parameterized generics
+    next_token = tokens.peek()
+    generics = None
+    if next_token == (OP, '['):
+        generics = tokens.consume_balanced((OP, '['), (OP, ']'))
+        next_token = tokens.peek()
+
+    assert next_token == (OP, '(')
+    param_list = tokens.consume_balanced((OP, '('), (OP, ')'))
+    assert param_list
+
+    if kind.string == 'def':
+        return_type = None
+        if tokens.peek() == (OP, '->'):
+            # trailing type annotation
+            return_type = tokens.consume_until((OP, ':'))
+            body = parse_block(tokens)
+            return FunctionDefinition(name, body, generics=generics, params=param_list, return_type=return_type)
+    body = parse_block(tokens)
+    return ClassDefinition(name, body, generics=generics, bases=param_list)
+
 
 class MacroProcessor:
     __default_globals = {
@@ -163,6 +251,15 @@ class MacroProcessor:
         self.globals: dict[str, Any] = self.__default_globals
         self.locals: dict[str, Any] = {}
 
+    def resolve_symbol(self, name: str, expand=True):
+        if expand and not name.startswith(MACRO_PREFIX):
+            name = MACRO_PREFIX + name
+        try:
+            return self.locals.get(name, self.globals[name])
+        except KeyError as exc:
+            raise UnresolvedSymbol(f"Cannot find {name}") from exc
+
+
     def exec(self, code: str, locals: Optional[dict[str, Any]] = None):
         exec(code, self.globals, locals or self.locals)
 
@@ -174,6 +271,9 @@ class MacroProcessor:
         self.locals = {}
 
     def parse_macro_import(self, tokens: TokenStream):
+        # TODO from ... import foo
+        # parsed as name ellipsis name name
+
         code = []
         for token in tokens:
             code.append(token)
@@ -195,11 +295,11 @@ class MacroProcessor:
             return untokenize(code)
 
     def parse_macro_function(self, tokens: TokenStream,
-                             decorators: list[list[Token]] = None,
+                             decorators: Optional[list[list[Token]]] = None,
                              macro_decorators: Optional[list[list[Token]]] = None):
         kind = tokens.next()
         assert kind == (NAME, ["def", "class"])
-        name = parse_name(tokens)
+        name = parse_dotted_name(tokens)
         body = [kind, *name]
         body.extend(tokens.consume_balanced((INDENT, ...), (DEDENT, '')))
 
@@ -235,7 +335,7 @@ class MacroProcessor:
 
     def replace_constant(self, token: Token):
         value = self.locals[token.string]
-        yield from tokenize_constant(value)
+        yield from synthesize_constant(value)
 
     def transform(self, tokens: TokenStream):
         # holding globals and locals in the MacroProcessor object while having this
@@ -318,7 +418,7 @@ class MacroProcessor:
 
                         call = [token, *args]
                         result = eval(untokenize(call), self.globals, self.locals)
-                        yield from tokenize_constant(result)
+                        yield from synthesize_constant(result)
                     elif next_token == (OP, '!'):
                         next_token = lookahead.next()
                         # macro bangs can only be parsed as
