@@ -8,7 +8,7 @@ from collections import deque, namedtuple
 import re
 from tokenize import generate_tokens
 from types import EllipsisType
-from typing import Any, Deque, Iterable, Iterator, Optional, Self, TypeVar, Callable, get_type_hints
+from typing import Any, Deque, Iterable, Iterator, Optional, Self, Callable, get_type_hints, Sized
 import ast as _ast
 import token
 
@@ -75,10 +75,10 @@ class ParseError(Exception):
         self.context = context
 
 
-T = TypeVar("T")
+# T = TypeVar("T")
 
 
-class PeekableStream:
+class PeekableStream[T]:
     def __init__(self,
                  iterable: Iterable[T],
                  max_cache_size: Optional[int] = None,
@@ -100,29 +100,31 @@ class PeekableStream:
         self.revert()
         return self._cache.popleft() if self._cache else next(self.__iterator)
 
-    def next(self, n=1):
-        if n == 1:
-            return next(self, self.default)
+    def next(self) -> Optional[T]:
+        return next(self, self.default)
+        
+    def next_n(self, n: int) -> list[T]:
         return [next(self, self.default) for _ in range(n or 1)]
+    
+    def cache_next(self, *, advance_cursor=True) -> T:
+        next_item = next(self.__iterator)
+        self._cache.append(next_item)
 
-    def cache_next(self, *, advance_cursor=True, n=1):
-        if n == 1:
-            next_item = next(self.__iterator)
-            self._cache.append(next_item)
-        else:
-            next_item = list(itertools.islice(self.__iterator, n))
-            if not next_item:
-                raise StopIteration
-            self._cache.extend(next_item)
+        if advance_cursor:
+            self._cursor = len(self._cache)
+        return next_item  # type: ignore
+
+    def cache_n(self, n, *, advance_cursor=True) -> list[T]:
+        next_item = list(itertools.islice(self.__iterator, n))
+        if not next_item:
+            raise StopIteration
+        self._cache.extend(next_item)
 
         if advance_cursor:
             self._cursor = len(self._cache)
         return next_item
 
-    def peek(self, n: Optional[int] = None):
-        if n is not None:
-            return self.peek_n(n)
-
+    def peek(self) -> Optional[T]:
         if self._cursor < len(self._cache):
             item = self._cache[self._cursor]
             self._cursor += 1
@@ -133,12 +135,12 @@ class PeekableStream:
 
         return self.default
 
-    def peek_n(self, n: int) -> list[T]:
+    def peek_n(self, n: int) -> list[Optional[T]]:
         needed = n - (len(self._cache) - self._cursor)
         cursor = self._cursor
         if needed > 0:
             with contextlib.suppress(StopIteration):
-                self.cache_next(n=needed)
+                self.cache_n(n=needed)
 
         items = list(itertools.islice(self._cache, 
                                       cursor, 
@@ -205,8 +207,14 @@ class PeekableStream:
 
                 return parent.default
 
-            def cache_next(self, *, advance_cursor=True, n=1):
-                next_item = parent.cache_next(advance_cursor=False, n=n)
+            def cache_next(self, *, advance_cursor=True) -> T:
+                next_item = parent.cache_next(advance_cursor=False)
+                if advance_cursor:
+                    self._cursor = len(self._cache)
+                return next_item
+
+            def cache_n(self, n: int,  *, advance_cursor=True) -> list[T]:
+                next_item = parent.cache_n(n, advance_cursor=False)
                 if advance_cursor:
                     self._cursor = len(self._cache)
                 return next_item
@@ -233,6 +241,8 @@ TokenNames: dict[int, str] = {value: key for key, value in token.__dict__.items(
 
 
 class Token(namedtuple("Token", ["type", "string"])):
+    offset: Optional[int]
+
     def __new__(cls, type: int, string: str, offset: Optional[int] = None):
         obj = super().__new__(cls, type, string)
         # add optional offset. Token must still behave like a 2-tuple for compatibility with tokenize.untokenize
@@ -256,36 +266,38 @@ class Token(namedtuple("Token", ["type", "string"])):
     def __str__(self):
         return f"({TokenNames.get(self.type, self.type)}, {self.string!r})"
 
-    def __eq__(self, query: TokenQuery):
-        query_type, query_string = query
+    def __eq__(self, other: object | TokenQuery):
+        if isinstance(other, Sized) and len(other) == 2 and isinstance(other, Iterable):
+            query_type, query_string = other
 
-        result = True  # wildcard (..., ...) matches everything
+            result = True  # wildcard (..., ...) matches everything
 
-        if query_type is not ...:
-            if isinstance(query_type, int):
-                result &= query_type == self.type
-            elif isinstance(query_type, Iterable):
-                result &= any(type_ == self.type for type_ in query_type)
-            else:
-                raise TypeError
-        if query_string is not ...:
-            if isinstance(query_string, (str, re.Pattern)):
-                result &= self.check_string(query_string)
-            elif isinstance(query_string, Iterable):
-                result &= any(self.check_string(needle) for needle in query_string)
-            else:
-                raise TypeError
+            if query_type is not ...:
+                if isinstance(query_type, int):
+                    result &= query_type == self.type
+                elif isinstance(query_type, Iterable):
+                    result &= any(type_ == self.type for type_ in query_type)
+                else:
+                    raise TypeError
+            if query_string is not ...:
+                if isinstance(query_string, (str, re.Pattern)):
+                    result &= self.check_string(query_string)
+                elif isinstance(query_string, Iterable):
+                    result &= any(self.check_string(needle) for needle in query_string)
+                else:
+                    raise TypeError
 
-        return result
+            return result
+        return id(other) == id(self)
 
-    def __ne__(self, query: TokenQuery):
+    def __ne__(self, query: object | TokenQuery):
         return not self.__eq__(query)
 
 
 def tokenize(code: str, with_endmarker: bool = False):
     last_line, last_column = 1, 0
     remove_indent = False
-    indent = []
+    indent: list[str] = []
 
     for current in generate_tokens(StringIO(code).readline):
         if current.type == token.ENDMARKER and not with_endmarker:
@@ -321,9 +333,11 @@ def tokenize(code: str, with_endmarker: bool = False):
 
 def untokenize(tokens: Iterable[Token], last_type: Optional[int] = None):
     fragments = []
-    indents = []
+    indents: list[int] = []
     last_type = last_type or 0
     for current in tokens:
+        assert isinstance(last_type, int)
+
         if current.type == token.ENCODING:
             continue
         elif current.type == token.ENDMARKER:
@@ -372,16 +386,16 @@ def get_tokens(data: str) -> list[Token]:
     return [Token(token.type, token.string) for token in list(generate_tokens(StringIO(data).readline))][:-1]
 
 
-class TokenStream(PeekableStream):
+class TokenStream(PeekableStream[Token]):
     def __init__(self,
                  iterable: Iterable[Token],
                  max_cache_size: Optional[int] = None,
                  default: Optional[Token] = Token(token.ENDMARKER, '')):
         super().__init__(iterable, max_cache_size=max_cache_size, default=default)
-        self.line_buffer = []
+        self.line_buffer: list[Token] = []
         self.lineno = 1
 
-    def __next__(self):
+    def __next__(self) -> Token:
         next_token: Token = super().__next__()
         if next_token.type in (token.NL, token.NEWLINE):
             # reset line buffer
@@ -390,6 +404,12 @@ class TokenStream(PeekableStream):
         else:
             self.line_buffer.append(next_token)
         return next_token
+
+    def expect(self, expected: TokenQuery | list[TokenQuery]) -> Token:
+        next_item = self.peek()
+        if not next_item or next_item != expected:
+            raise Cancellation
+        return next_item
 
     def consume_if(self, needle: TokenQuery | list[TokenQuery]) -> Token | None:
         next_item = self.peek()
@@ -400,48 +420,58 @@ class TokenStream(PeekableStream):
         self._cursor -= 1  # unpeek
         return None
 
-    @force_conversion(list)
     def consume_while(self, condition: TokenQuery) -> list[Token]:
-        if not condition(self.peek()):
-            return
-
-        for item in self:
-            yield item
-            if item != condition:
+        consumed: list[Token] = []
+        while (current := self.peek()):
+            if current != condition:
+                self.revert()
                 break
+            consumed.append(current)
+            self.commit()
 
-    @force_conversion(list)
+        return consumed
+
     def consume_until(self, condition: TokenQuery) -> list[Token]:
+        consumed: list[Token] = []
         for item in self:
-            yield item
+            consumed.append(item)
             if item == condition:
                 break
+        return consumed
 
-    def consume_line(self) -> list[Token]:
-        return self.consume_until(([token.NL, token.NEWLINE, token.ENDMARKER], ...))
+    def consume_line(self, with_newline=True) -> list[Token]:
+        consumed = []
+        for current in self:
+            if current == ([token.NL, token.NEWLINE], ...):
+                if with_newline:
+                    consumed.append(current)
+                break
 
-    @force_conversion(list)
+            consumed.append(current)
+            # newlines are insignificant in braces, brackets and square brackets
+            if current == (token.OP, '('):
+                consumed.extend(self.consume_balanced((token.OP, '('), (token.OP, ')'), 1))
+            elif current == (token.OP, '{'):
+                consumed.extend(self.consume_balanced((token.OP, '{'), (token.OP, '}'), 1))
+            elif current == (token.OP, '['):
+                consumed.extend(self.consume_balanced((token.OP, '['), (token.OP, ']'), 1))
+
+        return consumed
+
     def consume_balanced(self, increase: TokenQuery, decrease: TokenQuery, level: int = 0):
+        output = []
         for item in self:
-            yield item
-
+            output.append(item)
             if item == increase:
                 level += 1
             elif item == decrease:
                 level -= 1
                 if level <= 0:
                     break
-        else:
-            if level == 0:
-                return
-            raise ParseError(f"Unexpected eof - expected {decrease}", self.error_context())
 
-    @force_conversion(list)
-    def peek_while(self, condition: TokenQuery) -> list[Token]:
-        while (next_item := self.peek()):
-            yield next_item
-            if next_item != condition:
-                break
+        if level == 0:
+            return output
+        raise ParseError(f"Unexpected eof - expected {decrease}", self.error_context())
 
     @force_conversion(list)
     def peek_until(self, condition: TokenQuery) -> list[Token]:
