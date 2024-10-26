@@ -34,7 +34,10 @@ def force_conversion(to: type | Callable | None = None):
     return wrapper(to)
 
 
-def decorated(message: Any, fg: Optional[AnsiFore] = None, bg: Optional[AnsiBack] = None, style: Optional[AnsiStyle] = None,):
+def decorated(message: Any, 
+              fg: Optional[AnsiFore | str] = None, 
+              bg: Optional[AnsiBack | str] = None, 
+              style: Optional[AnsiStyle | str] = None,):
     if not isinstance(message, str):
         message = str(message)
 
@@ -45,7 +48,7 @@ def decorated(message: Any, fg: Optional[AnsiFore] = None, bg: Optional[AnsiBack
         out.append(bg)
     if style:
         out.append(style)
-    out.extend((message, Style.RESET_ALL))
+    out.extend([message, Style.RESET_ALL])
     return "".join(out)
 
 
@@ -53,7 +56,7 @@ class DiagnosticLevel:
     @dataclass
     class Level:
         label: str
-        color: Fore
+        color: str
 
         def format(self, row: int, message: str) -> str:
             return f"line {row}: {self.color}{self.label}:{Fore.RESET} {message}"
@@ -81,158 +84,69 @@ class ParseError(Exception):
 class PeekableStream[T]:
     def __init__(self,
                  iterable: Iterable[T],
-                 max_cache_size: Optional[int] = None,
-                 default: Optional[T] = None):
-
-        # !important: Do not reassign this. PeekableView will only see changes if we do not rebind
-        self._cache: Deque[T] = deque([], maxlen=max_cache_size)
-
+                 default: T = None):
         self.__iterator: Iterator = iter(iterable)
-        self._cursor: int = 0
-        self.max_cache_size: Optional[int] = max_cache_size
-        self.default: Optional[T] = default
+        self._cache: list[T] = []
+        self.cursor: int = 0
+        self.default: T = default
 
     def __iter__(self):
         return self
 
-    def __next__(self):
-        # reset peek cursor
-        self.revert()
-        return self._cache.popleft() if self._cache else next(self.__iterator)
+    def __next__(self) -> T:
+        if self.cursor < len(self._cache):
+            token = self._cache[self.cursor]
+            self.cursor += 1
+            return token
 
-    def next(self) -> Optional[T]:
+        return self.cache_next(advance_cursor=True)
+
+    def next(self) -> T:
         return next(self, self.default)
-        
-    def next_n(self, n: int) -> list[T]:
-        return [next(self, self.default) for _ in range(n or 1)]
-    
+
     def cache_next(self, *, advance_cursor=True) -> T:
         next_item = next(self.__iterator)
         self._cache.append(next_item)
 
         if advance_cursor:
-            self._cursor = len(self._cache)
+            self.cursor = len(self._cache)
         return next_item  # type: ignore
 
-    def cache_n(self, n, *, advance_cursor=True) -> list[T]:
-        next_item = list(itertools.islice(self.__iterator, n))
-        if not next_item:
-            raise StopIteration
-        self._cache.extend(next_item)
-
-        if advance_cursor:
-            self._cursor = len(self._cache)
-        return next_item
-
-    def peek(self) -> Optional[T]:
-        if self._cursor < len(self._cache):
-            item = self._cache[self._cursor]
-            self._cursor += 1
-            return item
+    def peek(self) -> T:
+        if self.cursor < len(self._cache):
+            return self._cache[self.cursor]
 
         with contextlib.suppress(StopIteration):
-            return self.cache_next()
+            return self.cache_next(advance_cursor=False)
 
         return self.default
 
-    def peek_n(self, n: int) -> list[Optional[T]]:
-        needed = n - (len(self._cache) - self._cursor)
-        cursor = self._cursor
-        if needed > 0:
-            with contextlib.suppress(StopIteration):
-                self.cache_n(n=needed)
-
-        items = list(itertools.islice(self._cache, 
-                                      cursor, 
-                                      cursor + n))
-
-        needed = n - len(items)
-        return items + [self.default for _ in range(needed)]
-
-    def commit(self):
-        # !important: this intentionally modifies the existing deque rather than rebinding to a new one
-        remainder = list(itertools.islice(self._cache, self._cursor, None))
-        self._cache.clear()
-        self._cache.extend(remainder)
-        self.revert()
-
-    def revert(self):
-        self._cursor = 0
+    def reset(self, pos: int):
+        self.cursor = pos
 
     @property
-    def rollback(parent):
+    def alt(parent):
         # pylint: disable=E0213
-
-        class PeekableView(type(parent)):
-            def __init__(self, iterable: PeekableStream,
-                         max_cache_size: Optional[int] = None,
-                         default: Optional[T] = None):
-                super().__init__(parent, max_cache_size, default)
-                self.__offset = getattr(parent, 'offset', 0)
-                self._cursor = self.__offset
-                # rebind to (mutable!) parent cache
-                self._cache = parent._cache
-
-            def __call__(self):
-                return self
-
-            def __iter__(self):
-                return self
+        class Guard:
+            __slots__ = ["cursor"]
+            def __init__(self, cursor: int):
+                self.cursor = cursor
 
             def __enter__(self):
                 return self
 
-            def __exit__(self, type_, value, traceback):
-                if type_ in (AssertionError, Cancellation):
-                    # treat failed assertions as cancellations
+            def __exit__(self, exc_type, exc_value, traceback):
+                if exc_type is Cancellation:
+                    parent.reset(self.cursor)
                     return True
-
-                # drop current cursor - use .commit to commit changes instead
-                self.revert()
-                self.commit(upstream=True)
                 return False
 
-            def __next__(self):
-                try:
-                    if self.__offset < len(self._cache):
-                        item = self._cache[self.__offset]
-                    else:
-                        item = parent.cache_next(advance_cursor=False)
-                except StopIteration:
-                    pass
-                else:
-                    self.__offset += 1
-                    self.revert()
-                    return item
+        return Guard(parent.cursor)
 
-                return parent.default
-
-            def cache_next(self, *, advance_cursor=True) -> T:
-                next_item = parent.cache_next(advance_cursor=False)
-                if advance_cursor:
-                    self._cursor = len(self._cache)
-                return next_item
-
-            def cache_n(self, n: int,  *, advance_cursor=True) -> list[T]:
-                next_item = parent.cache_n(n, advance_cursor=False)
-                if advance_cursor:
-                    self._cursor = len(self._cache)
-                return next_item
-
-            def commit(self, *, upstream=False):
-                self.__offset = self._cursor
-                self._cursor = 0
-
-                if upstream:
-                    parent._cursor = self.__offset
-                    parent.commit()
-
-            def revert(self):
-                self._cursor = self.__offset
-
-        return PeekableView(parent,
-                            max_cache_size=parent.max_cache_size,
-                            default=parent.default)
+    def attempt(self, rule: Callable, *args, **kwargs):
+        with self.alt:
+            return rule(self, *args, **kwargs)
+        return None
 
 
 TokenQuery = tuple[int | list[int] | EllipsisType, 
@@ -356,11 +270,15 @@ def untokenize(tokens: Iterable[Token], last_type: Optional[int] = None):
         elif last_type in (token.NL, token.NEWLINE) and indents:
             fragments.append(indents[-1] * ' ')
 
-        if getattr(current, 'offset', 0) == 0 and must_insert_space(last_type, current.type):
+        if getattr(current, 'offset', None) is None and must_insert_space(last_type, current):
             # ensure spacing
             fragments.append(' ')
 
         fragments.append(current.to_code() if hasattr(current, 'to_code') else current.string)
+
+        if current == (token.OP, ','):
+            # append space after ,
+            fragments.append(' ')
         last_type = current.type
     return ''.join(fragments)
 
@@ -372,8 +290,8 @@ def must_insert_space(previous_type: int, current: Token):
     elif previous_type == token.NAME and current.type in (token.NAME, token.NUMBER, token.STRING):
         # ensure a space between names (ie keyword + identifier)
         return True
-    elif previous_type == current.type and current.type in (token.OP, token.NUMBER):
-        # ie > = could be turned into one token >= accidentally. While this isn't valid Python,
+    elif previous_type == current.type == token.NUMBER:
+        # avoid merging number literals. While this isn't valid Python,
         # preprocessors might want to use that.
         return True
     elif previous_type == token.NUMBER and current == (token.OP, '.'):
@@ -389,9 +307,8 @@ def get_tokens(data: str) -> list[Token]:
 class TokenStream(PeekableStream[Token]):
     def __init__(self,
                  iterable: Iterable[Token],
-                 max_cache_size: Optional[int] = None,
-                 default: Optional[Token] = Token(token.ENDMARKER, '')):
-        super().__init__(iterable, max_cache_size=max_cache_size, default=default)
+                 default: Token = Token(token.ENDMARKER, '')):
+        super().__init__(iterable, default=default)
         self.line_buffer: list[Token] = []
         self.lineno = 1
 
@@ -406,28 +323,21 @@ class TokenStream(PeekableStream[Token]):
         return next_token
 
     def expect(self, expected: TokenQuery | list[TokenQuery]) -> Token:
-        next_item = self.peek()
-        if not next_item or next_item != expected:
-            raise Cancellation
-        return next_item
-
-    def consume_if(self, needle: TokenQuery | list[TokenQuery]) -> Token | None:
-        next_item = self.peek()
-        if next_item == needle:
-            self.commit()
-            return next_item
-
-        self._cursor -= 1  # unpeek
-        return None
+        if self.peek() == expected:
+            item = self.next()
+            assert item
+            return item
+        raise Cancellation
 
     def consume_while(self, condition: TokenQuery) -> list[Token]:
         consumed: list[Token] = []
-        while (current := self.peek()):
-            if current != condition:
-                self.revert()
-                break
+        if self.peek() != condition:
+            return []
+
+        for current in self:
             consumed.append(current)
-            self.commit()
+            if self.peek() != condition:
+                break
 
         return consumed
 
@@ -473,46 +383,17 @@ class TokenStream(PeekableStream[Token]):
             return output
         raise ParseError(f"Unexpected eof - expected {decrease}", self.error_context())
 
-    @force_conversion(list)
-    def peek_until(self, condition: TokenQuery) -> list[Token]:
-        while (next_item := self.peek()):
-            yield next_item
-            if next_item == condition:
-                break
-
-    def peek_line(self):
-        return self.peek_until(([token.NL, token.NEWLINE, token.ENDMARKER], ...))
-
-    @force_conversion(list)
-    def peek_balanced(self, increase: TokenQuery, decrease: TokenQuery, level: int = 0) -> list[Token]:
-        peeked = []
-        while (item := self.peek()):
-            peeked.append(item)
-
-            if item == increase:
-                level += 1
-
-            elif item == decrease:
-                level -= 1
-
-                if level == 0:
-                    break
-        else:
-            if level != 0:
-                return []
-            # raise ParseError(f"Unexpected eof - expected {decrease}", self.error_context())
-        return peeked
-
     def error_context(self):
-        if not self.line_buffer and not self._cursor:
+        #TODO rewrite
+        if not self.line_buffer and not self.cursor:
             # token stream hasn't been used yet, cancel
             return ""
 
-        if not self._cursor:
+        if not self.cursor:
             tokens_before = self.line_buffer[:-1]
             current_token = self.line_buffer[-1]
         else:
-            cursor = min(self._cursor - 1, len(self._cache) - 1)
+            cursor = min(self.cursor - 1, len(self._cache) - 1)
             cached_prefix = list(itertools.islice(self._cache, 0, cursor)) if cursor > 0 else []
             tokens_before = [*self.line_buffer, *cached_prefix]
             current_token = self._cache[cursor]
@@ -535,10 +416,10 @@ class TokenStream(PeekableStream[Token]):
         else:
             current = untokenize([current_token], last_type=last_type)
 
-        old_cursor = self._cursor
+        old_cursor = self.cursor
         tokens_after = self.peek_line()
         line_suffix = untokenize(tokens_after, last_type=current_token.type)
-        self._cursor = old_cursor
+        self.cursor = old_cursor
 
         token_str = str(current_token)
         prefix = ' ' * (len(line_prefix) + 1)

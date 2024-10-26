@@ -1,8 +1,10 @@
 # coding: magic.macro
 
-macro PI = 3.14
-
+PI! = 3.14
+def foo!():
+    return 3
 def bar():
-    print(PI)
+    x = foo!()
+    print(PI!, 3)
 
 bar()
