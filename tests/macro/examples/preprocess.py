@@ -1,6 +1,6 @@
 import sys
 from pathlib import Path
-from magic_codec.builtin.macro import MacroProcessor, parse_macro
+from magic_codec.builtin.macro import Context, parse_macro
 from magic_codec.util import TokenStream, get_tokens
 
 if __name__ == "__main__":

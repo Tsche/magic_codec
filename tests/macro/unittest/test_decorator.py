@@ -1,5 +1,5 @@
 import pytest
-from magic_codec.builtin.macro import MacroProcessor, parse_decorators, parse_function
+from magic_codec.builtin.macro import Context, parse_decorators, parse_function
 from magic_codec.util import TokenStream, tokenize
 from tokenize import untokenize
 def test_decorator_simple():

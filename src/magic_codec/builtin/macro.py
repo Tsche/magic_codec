@@ -2,24 +2,20 @@
 
 import ast as _ast
 from dataclasses import dataclass
-from token import DEDENT, ENDMARKER, INDENT, NAME, NEWLINE, NL, NUMBER, OP, STRING
-from tokenize import untokenize
+from importlib.machinery import PathFinder, SourceFileLoader
+import os
+from token import DEDENT, ENDMARKER, INDENT, NAME, NEWLINE, NUMBER, OP, STRING, COMMENT
+from tokenize import detect_encoding, untokenize
 from typing import Any, Generator, Optional
+import re
+import sys
+import traceback
 
-from magic_codec.util import Cancellation, Code, ParseError, Token, TokenStream, force_conversion, get_tokens
-
-
-def macro(fnc):
-    """ This decorator does nothing. It is only used to flag functions and classes as macros. """
-    return fnc
+from magic_codec.util import Cancellation, Code, ParseError, Token, TokenStream, get_tokens
 
 
 class _Code(Code):
     """ Tag type to mark code objects coming from the preprocessor """
-
-
-class UnresolvedSymbol(Exception): 
-    """ Raised when a symbol cannot be resolved in the context of the preprocessor. """
 
 
 class MacroDecorator(type):
@@ -50,54 +46,73 @@ class NodeTransformer(_ast.NodeTransformer, metaclass=MacroDecorator):
         yield Token(NEWLINE, '\n')
 
 
+def macro(fnc=None, /, **kwargs):
+    """ This decorator does nothing. It is only used to flag functions and classes as macros. """
+    class Macro:
+        def __init__(self, func):
+            nonlocal kwargs
+            self.fnc = func
+            self.options = kwargs
+
+        def __call__(self, *args, **kwds):
+            return self.fnc(*args, **kwds)
+
+    return Macro(fnc) if fnc else Macro
+
+
+class MacroFileLoader(SourceFileLoader):
+    def process_macros(self):
+        print(self.path)
+
+    def get_data(self, actual_path):
+        if not os.path.exists(actual_path):
+            return b''
+
+        if not actual_path.endswith(".py"):
+            # module has already been compiled
+            self.process_macros()
+            return super().get_data(actual_path)
+
+        with open(actual_path, 'r', encoding='utf-8') as source:
+            assert self.path == actual_path, "Actual path isn't the expected original module path, but ends in .py"
+            self.process_macros()
+            return source.read()
+
+
+class MacroFinder(PathFinder):
+    @staticmethod
+    def uses_macro_codec(path):
+        with open(path, 'rb') as source:
+            encoding, *_ = detect_encoding(source.readline)
+            return encoding == "magic.macro"
+
+    @classmethod
+    def find_spec(cls, fullname, path=None, target=None):
+        if not (spec := super().find_spec(fullname, path, target)):
+            return
+
+        if not (spec.origin and isinstance(spec.loader, SourceFileLoader)):
+            # we cannot process macros unless we have an origin
+            return
+
+        if cls.uses_macro_codec(spec.origin):
+            spec.loader = MacroFileLoader(fullname, spec.origin)
+            return spec
+
+
+def install_import_hook():
+    # This needs to be called within the macro preprocessor context
+    # to allow importing macros from other modules, even if they
+    # have already been compiled
+    sys.meta_path.insert(0, MacroFinder())
+
+
 MACRO_PREFIX = "__macro__"
 
-class MacroProcessor:
-    __default_globals = {
-        # 'tokenize': tokenize,
-        # 'ast': _ast,
-        'Code': Code,
-        'MacroDecorator': MacroDecorator,
-        'NodeTransformer': NodeTransformer,
-        'macro': macro,
-        'get_tokens': get_tokens
-    }
 
-    def __init__(self):
-        self.globals: dict[str, Any] = self.__default_globals
-        self.locals: dict[str, Any] = {}
+class UnresolvedSymbol(Exception): 
+    """ Raised when a symbol cannot be resolved in the context of the preprocessor. """
 
-    def resolve_symbol(self, name: str, expand=True):
-        if expand and not name.startswith(MACRO_PREFIX):
-            name = MACRO_PREFIX + name
-        try:
-            return self.locals.get(name, self.globals[name])
-        except KeyError as exc:
-            raise UnresolvedSymbol(f"Cannot find {name}") from exc
-
-    def exec(self, code: str, locals: Optional[dict[str, Any]] = None):
-        exec(code, self.globals, locals or self.locals)
-
-    def eval(self, code: str, locals: Optional[dict[str, Any]] = None):
-        return eval(code, self.globals, locals or self.locals)
-
-    def reset(self):
-        self.globals = self.__default_globals
-        self.locals = {}
-
-    def apply_macros(self, code: list[Token], macros: list[list[Token]]):
-        call = synthesize_call_chain(macros, args=[Token(NAME, "__magic_macro_code_object")], convert_to="_Code")
-        call_locals = {**self.locals,
-                       '__magic_macro_code_object': code,
-                       '_Code': _Code}
-
-        # do the actual transformation
-        # TODO force constants to be replaced after applying proc macros
-        return self.eval(untokenize(call), call_locals).tokens
-
-    def replace_constant(self, token: Token):
-        value = self.locals[token.string]
-        yield from synthesize_constant(value)
 
 @dataclass
 class Decorator:
@@ -111,132 +126,124 @@ class Decorator:
         yield from self.named_expression
         yield Token(NEWLINE, '\n')
 
-    def is_macro_introducer(self):
-        assert self.named_expression
-        return self.named_expression[0] == (NAME, "macro")
-    
-    def is_macro(self, context: MacroProcessor):
-        assert self.named_expression
-        name = parse_name(TokenStream(self.named_expression))
-        return name in context.locals
+    @property
+    def name(self):
+        assert self.named_expression, "Invalid decorator"
+        if self.named_expression[0].type != NAME:
+            return None
+
+        if len(self.named_expression) > 1 and self.named_expression[1] == (OP, '!'):
+            return f"{MACRO_PREFIX}{self.named_expression[0].string}"
+
+        return self.named_expression[0].string
 
 
+@dataclass
 class FunctionDefinition:
-    def __init__(self, name: str, decorators: list[Decorator], code: list[Token], macro=False):
-        self.name = name
-        self.decorators = decorators
-        self.code = code
-        self.is_macro = macro
-        self.macro_settings: list[Token] = []
+    name: str
+    decorators: list[Decorator]
+    code: list[Token]
+    is_macro: bool = False
 
-    def eval(self, context: MacroProcessor):
-        # evaluate macros in code
-        # apply macro decorators
-        self.macro_settings = []
-        decorators: list[Token] = []
-        macro_decorators: list[list[Token]] = []
 
-        for decorator in self.decorators:
-            if decorator.is_macro_introducer():
-                if self.macro_settings:
-                    raise ParseError("@macro can only be used once per function/class")
-                self.is_macro = True
-                self.macro_settings = decorator.named_expression
+def parse_import(tokens: TokenStream, require_bang=False):
+    with tokens.alt:
+        first_token = tokens.expect((NAME, ["import!", "from!"] if require_bang else ["import", "from"]))
+        return [first_token, *tokens.consume_line()]
+    return None
 
-            elif decorator.is_macro(context):
-                macro_decorators.append(decorator.named_expression)
-            else:
-                decorators.extend(decorator.to_tokens())
 
-        code: list[Token] = [*decorators, *self.code]
-        code = context.apply_macros(code, macro_decorators)
-        yield from code
+def parse_assignment(tokens: TokenStream, require_bang: bool = False):
+    with tokens.alt:
+        name = tokens.expect((NAME, ...))
+        if tokens.peek() == (OP, '!'):
+            tokens.next()
+            name = Token(NAME, f"{MACRO_PREFIX}{name.string}")
+        elif require_bang:
+            raise Cancellation
 
-def parse_block(tokens: TokenStream):
-    current = tokens.peek()
-    if current and current.type not in (NL, NEWLINE):
-        # simple statement(s) following head - parse until next line, ie:
-        # def foo(): ...
-        # def foo(): x=2;y=3;return x*y;
-        return tokens.consume_line()
-    return tokens.consume_balanced((INDENT, ...), (DEDENT, ...))
+        op = tokens.expect((OP, '='))
+        return [name, op, *transform_bang_names(TokenStream(tokens.consume_line()))]
+    return None
 
-def parse_name(tokens: TokenStream, with_bang=True) -> str:
-    name = tokens.expect((NAME, ...))
-
-    if with_bang and tokens.peek() == (OP, '!'):
-        tokens.next()
-        # transform name directly
-        return f"{MACRO_PREFIX}{name.string}"
-    return name.string
-
-def parse_import(tokens: TokenStream):
-    first_token = tokens.expect((NAME, ["import", "from"]))
-    return [first_token, *tokens.consume_line()]
-
-def parse_definition(tokens: TokenStream, macro: bool=False):
-    name = tokens.expect((NAME, ...))
-    if macro:
-        tokens.expect((OP, '!'))
-        name = (NAME, f"{MACRO_PREFIX}{name.string}")
-    op = tokens.expect((OP, '='))
-
-    return [name, op, *tokens.consume_line()]
 
 def parse_decorator(tokens: TokenStream):
-    tokens.expect((OP, '@'))
-    named_expression = tokens.consume_line(with_newline=False)
-    if not named_expression:
-        raise ParseError("named_expression expected after `@`")
+    with tokens.alt:
+        tokens.expect((OP, '@'))
+        if named_expression := tokens.consume_line(with_newline=False):
+            return Decorator(named_expression)
+        else:
+            raise ParseError("named_expression expected after `@`")
 
-    return Decorator(named_expression)
+    return None
 
-def parse_decorators(tokens: TokenStream):
-    decorators = []
-    while (decorator := tokens.attempt(parse_decorator)):
-        decorators.append(decorator)
-    return decorators
 
 def parse_function(tokens: TokenStream):
-    decorators = parse_decorators(tokens)
+    with tokens.alt:
+        decorators = []
+        while decorator := parse_decorator(tokens):
+            decorators.append(decorator)
 
-    code = []
-    is_macro = any(decorator.is_macro_introducer() for decorator in decorators)
+        code = []
+        is_macro = any(decorator.name == "macro" for decorator in decorators)
 
-    while (next_token := tokens.next()):
-        if next_token.type != NAME:
+        while next_token := tokens.next():
+            if next_token.type != NAME:
+                raise Cancellation
+            if next_token.string == 'macro':
+                is_macro = True
+            elif next_token.string == 'async':
+                code.append(next_token)
+            else:
+                break
+
+        if next_token != (NAME, ["class", "def"]):
             raise Cancellation
-            # raise ParseError(f"Unexpected token type {next_token.type}", tokens.error_context())
-        if next_token.string == 'macro':
+        code.append(next_token)
+
+        name = tokens.expect((NAME, ...)).string
+        if tokens.peek() == (OP, '!'):
+            tokens.next()
             is_macro = True
-        elif next_token.string == 'async':
-            code.append(next_token)
-        else:
-            break
+            name = f"{MACRO_PREFIX}{name}"
 
-    if next_token != (NAME, ["class", "def"]):
-        raise Cancellation
-    code.append(next_token)
+        code.append(Token(NAME, name))
+        line = tokens.consume_line(True)
+        code.extend(line)
+        if len(line) <= 2:
+            raise Cancellation
+        offset = line[-2] == (COMMENT, ...)
+        if len(line) >= 2 + offset and line[-2 - offset] == (OP, ':'):
+            # if the last token before the new line wasn't `:`
+            # we can assume no indented block will follow, ie
+            # def foo(): ...
+            code.extend(tokens.consume_balanced((INDENT, ...), (DEDENT, ...)))
 
-    name = parse_name(tokens)
-    if name.startswith(MACRO_PREFIX):
-        is_macro = True
-    code.append(Token(NAME, name))
+        return FunctionDefinition(name, decorators, code, is_macro)
+    return None
 
-    code.extend(tokens.consume_until((OP, ':')))
-    code.extend(parse_block(tokens))
 
-    return FunctionDefinition(name, decorators, code, macro=is_macro)
+def transform_bang_names(tokens: TokenStream):
+    for token in tokens:
+        if token.type == NAME and tokens.peek() == (OP, '!'):
+            tokens.next()
+            name = MACRO_PREFIX + token.string
+            yield Token(NAME, name)
+            continue
+        yield token
+
 
 def synthesize_call(function: str | list[Token], expression: list[Token]):
     name = [Token(NAME, function)] if isinstance(function, str) else function
     return [*name, Token(OP, '('), *expression, Token(OP, ')')]
+
 
 def synthesize_call_chain(calls: list[list[Token]], args: list[Token], convert_to: Optional[str] = None):
     if not calls:
         return synthesize_call(convert_to, args) if convert_to else args
     call = synthesize_call(calls[0], synthesize_call_chain(calls[1:], args, convert_to))
     return synthesize_call(convert_to, call) if convert_to else call
+
 
 def synthesize_constant(value: Any):
     if value is None:
@@ -262,80 +269,190 @@ def synthesize_constant(value: Any):
         # assume a replacement wasn't desired
         yield from get_tokens(value)[:-1]
 
-def parse_macro(tokens: TokenStream, context):
-    with tokens.alt:
-        return parse_definition(tokens, macro=True)
 
-    with tokens.alt:
-        tokens.expect((NAME, "macro"))
-        with tokens.alt:
-            return parse_definition(tokens)
-        
-        with tokens.alt:
-            return parse_import(tokens)
+def handle_exception(exc_type, exc_value, exc_traceback):
+    def demangle_names(text):
+        return re.sub("__macro__([a-zA-Z_]+)", "\\1!", text)
 
-        with tokens.alt:
-            code = parse_function(tokens)
-            code.is_macro = True
-            return code.eval(context)
+    if exc_type is NameError:
+        for line in traceback.format_exception(exc_value):
+            sys.stderr.write(demangle_names(line))
 
-    return None
 
-def transform(tokens: TokenStream):
-    context = MacroProcessor()
-    while (current := tokens.peek()):
-        if current == ([NL, NEWLINE], ...):
-            # consume newlines
-            yield tokens.next()
-            yield from tokens.consume_while(([NL, NEWLINE], ...))
-            if code := parse_macro(tokens, context):
-                context.exec(untokenize(code), context.locals)
-                tokens.cursor -= 1
+class Interpreter:
+    __default_globals = {
+        # 'tokenize': tokenize,
+        # 'ast': _ast,
+        'Code': Code,
+        'MacroDecorator': MacroDecorator,
+        'NodeTransformer': NodeTransformer,
+        'macro': macro,
+        'get_tokens': get_tokens,
+    }
+
+    def __init__(self):
+        self.globals: dict[str, Any] = self.__default_globals
+        self.macros: dict[str, Any] = {}
+        self.install_excepthook(handle_exception)
+    
+    def install_excepthook(self, hook: callable):
+        exec("import sys; sys.excepthook=__excepthook", {'__excepthook': hook})
+
+    def resolve_symbol(self, name: str):
+        try:
+            return self.macros.get(name, self.globals[name])
+        except KeyError as exc:
+            raise UnresolvedSymbol(f"Cannot find {name}") from exc
+
+    def reset(self):
+        self.globals = self.__default_globals
+        self.macros = {}
+
+    def exec(self, code: list[Token], locals: Optional[dict[str, Any]] = None):
+        exec(untokenize(code), self.globals, locals or self.macros)
+
+    def eval(self, code: list[Token], locals: Optional[dict[str, Any]] = None):
+        return eval(untokenize(code), self.globals, locals or self.macros)
+
+
+class MacroProcessor:
+    __default_globals = {
+        # 'tokenize': tokenize,
+        # 'ast': _ast,
+        'Code': Code,
+        'MacroDecorator': MacroDecorator,
+        'NodeTransformer': NodeTransformer,
+        'macro': macro,
+        'get_tokens': get_tokens,
+    }
+
+    def __init__(self):
+        self.globals: dict[str, Any] = self.__default_globals
+        self.macros: dict[str, Any] = {}
+        self.install_excepthook(handle_exception)
+
+    def install_excepthook(self, hook: callable):
+        exec("import sys; sys.excepthook=__excepthook", {'__excepthook': hook})
+
+    def resolve_symbol(self, name: str):
+        try:
+            return self.macros.get(name, self.globals[name])
+        except KeyError as exc:
+            raise UnresolvedSymbol(f"Cannot find {name}") from exc
+
+    def reset(self):
+        self.globals = self.__default_globals
+        self.macros = {}
+
+    def exec(self, code: list[Token], locals: Optional[dict[str, Any]] = None):
+        exec(untokenize(code), self.globals, locals or self.macros)
+
+    def eval(self, code: list[Token], locals: Optional[dict[str, Any]] = None):
+        return eval(untokenize(code), self.globals, locals or self.macros)
+
+    def apply_macros(self, code: list[Token], macros: list[list[Token]]):
+        call = synthesize_call_chain(macros, args=[Token(NAME, "__magic_macro_code_object")], convert_to="_Code")
+        call_locals = {**self.macros,
+                       '__magic_macro_code_object': code,
+                       '_Code': _Code}
+
+        return self.eval(call, call_locals).tokens
+
+    def transform_function(self, decorated: FunctionDefinition):
+        tokens = TokenStream(decorated.code)
+
+        # evaluate macros in code
+        code = list(self.transform_code(tokens))
+
+        # apply macro decorators
+        decorators: list[Token] = []
+        macro_decorators: list[list[Token]] = []
+
+        for decorator in decorated.decorators:
+            if decorator.name == "macro":
+                decorated.is_macro = True
+            elif decorator.name in self.macros:
+                decorator_code = list(transform_bang_names(TokenStream(decorator.named_expression)))
+                macro_decorators.append(decorator_code)
                 continue
+            else:
+                if len(decorator.named_expression) > 1 and decorator.named_expression[1] == (OP, "!"):
+                    raise UnresolvedSymbol(f"Could not resolve {decorator.name}")
 
-            with tokens.alt:
-                fnc = parse_function(tokens)
-                if fnc.is_macro:
-                    context.exec(untokenize(fnc.eval(context)), context.locals)
-                else:
-                    yield from fnc.eval(context)
-                tokens.cursor -= 1
-                continue
+            decorators.extend(decorator.to_tokens())
 
-            with tokens.alt:
-                current = tokens.expect((NAME, ["import!", "from!"]))
-                code = [(NAME, current.string[:-1]), *tokens.consume_line()]
-                context.exec(untokenize(code))
-                tokens.cursor -= 1
-                continue
+        code = [*decorators, *code]
+        yield from self.apply_macros(code, macro_decorators)
 
-        elif current.type == NAME:
-            with tokens.alt:
-                name = parse_name(tokens)
-                if name not in context.locals:
-                    raise Cancellation
+    def transform_code(self, tokens: TokenStream):
+        for current in tokens:
+            if current.type == NAME:
+                name = current.string
+                diagnose_failure = False
+                if tokens.peek() == (OP, '!'):
+                    tokens.next()
+                    # transform name directly
+                    name = f"{MACRO_PREFIX}{current.string}"
+                    diagnose_failure = True
 
-                if tokens.peek() == (OP, '('):
-                    # function-like macro call
-                    args = tokens.consume_balanced((OP, '('), (OP, ')'))
+                if name in self.macros:
+                    if tokens.peek() == (OP, '('):
+                        # function-like macro call
+                        args = tokens.consume_balanced((OP, '('), (OP, ')'))
 
-                    call = [(NAME, name), *args]
-                    result = context.eval(untokenize(call), context.locals)
-                    yield from synthesize_constant(result)
+                        result = self.eval([(NAME, name), *args])
+                        yield from synthesize_constant(result)
+                    else:
+                        yield from synthesize_constant(self.macros[name])
                     continue
+
+                elif diagnose_failure:
+                    raise UnresolvedSymbol(f"Could not resolve {name}")
+
+            yield current
+
+    def transform(self, tokens: TokenStream):
+        level = 0
+        while (current := tokens.peek()) and current.type != ENDMARKER:
+
+            # track current indentation
+            if current == (INDENT, ...):
+                level += 1
+                yield tokens.next()
+                continue
+            elif current == (DEDENT, ...):
+                level -= 1
+                yield tokens.next()
+                continue
+
+            macro_context = False
+            if level == 0 and current == (NAME, "macro"):
+                tokens.next()
+                macro_context = True
+
+            if level == 0 and (code := parse_assignment(tokens, require_bang=not macro_context)):
+                self.exec(code)
+
+            elif level == 0 and (code := parse_import(tokens, require_bang=not macro_context)):
+                self.exec(code, self.globals)
+
+            elif fnc := parse_function(tokens):
+                code = self.transform_function(fnc)
+                if level == 0 and (fnc.is_macro or macro_context):
+                    self.exec(code)
                 else:
-                    # constant
-                    yield from synthesize_constant(context.locals[name])
-                    continue
+                    yield from code
+            else:
+                # ensure next iteration starts on a new line
+                line = tokens.consume_line(True)
+                yield from self.transform_code(TokenStream(line))
+        yield Token(ENDMARKER, '')
 
-        elif current.type == ENDMARKER:
-            break
-
-        yield tokens.next()
-    yield Token(ENDMARKER, '')
 
 # @cache
 def preprocess(data: str):
+    print("!!!!!!!!!!!")
     tokens    = TokenStream(Code(data).tokens)
-    new_code  = Code(list(transform(tokens)))
+    processor = MacroProcessor()
+    new_code  = Code(list(processor.transform(tokens)))
     return new_code.string

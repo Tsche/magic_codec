@@ -135,7 +135,7 @@ class PeekableStream[T]:
             def __enter__(self):
                 return self
 
-            def __exit__(self, exc_type, exc_value, traceback):
+            def __exit__(self, exc_type, exc_value, traceback) -> bool:
                 if exc_type is Cancellation:
                     parent.reset(self.cursor)
                     return True
@@ -328,6 +328,11 @@ class TokenStream(PeekableStream[Token]):
             assert item
             return item
         raise Cancellation
+
+    def expect_safe(self, expected: TokenQuery | list[TokenQuery]) -> Optional[Token]:
+        if self.peek() == expected:
+            return self.next()
+        return None
 
     def consume_while(self, condition: TokenQuery) -> list[Token]:
         consumed: list[Token] = []

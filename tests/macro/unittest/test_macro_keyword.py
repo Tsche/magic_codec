@@ -1,11 +1,11 @@
 import pytest
-from magic_codec.builtin.macro import MacroProcessor, parse_macro
+from magic_codec.builtin.macro import Context, parse_macro
 
 from magic_codec.util import TokenStream, get_tokens
 
 @pytest.fixture
 def processor():
-    return MacroProcessor()
+    return Context()
 
 
 # def tokens_of(code: str):
@@ -36,6 +36,6 @@ def processor():
 def test_macro_keyword():
     code = "\nmacro x = 3\n"
     tokens = TokenStream(get_tokens(code))
-    context = MacroProcessor()
+    context = Context()
     
     print(parse_macro(tokens, context))
