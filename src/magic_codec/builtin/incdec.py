@@ -64,17 +64,17 @@ def transform(data):
 
     for current in tokens:
         if is_valid_name(current):
-            peek1, peek2 = tokens.peek(2)
+            peek1, peek2 = tokens.peek_n(2)
             if is_valid_unary_operator(peek1) and peek1.string == peek2.string:
                 yield from UnaryExpr.from_tokens((current, peek1, peek2)).to_tokens()
-                tokens.commit()
+                tokens.next_n(2)
                 continue
 
         elif is_valid_unary_operator(current):
-            peek, name = tokens.peek(2)
+            peek, name = tokens.peek_n(2)
             if peek.string == current.string and is_valid_name(name):
                 yield from UnaryExpr.from_tokens((current, peek, name)).to_tokens()
-                tokens.commit()
+                tokens.next_n(2)
                 continue
 
         yield current.type, current.string

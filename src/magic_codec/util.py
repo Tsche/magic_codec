@@ -1,14 +1,13 @@
 from dataclasses import dataclass
-from functools import cache
 import functools
 from io import StringIO
 import itertools
 import contextlib
-from collections import deque, namedtuple
+from collections import namedtuple
 import re
 from tokenize import generate_tokens
 from types import EllipsisType
-from typing import Any, Deque, Iterable, Iterator, Optional, Self, Callable, get_type_hints, Sized
+from typing import Any, Iterable, Iterator, Optional, Self, Callable, get_type_hints, Sized
 import ast as _ast
 import token
 
@@ -105,12 +104,12 @@ class PeekableStream[T]:
         return next(self, self.default)
 
     def cache_next(self, *, advance_cursor=True) -> T:
-        next_item = next(self.__iterator)
+        next_item = next(self.__iterator)  # may raise StopIteration
         self._cache.append(next_item)
 
         if advance_cursor:
             self.cursor = len(self._cache)
-        return next_item  # type: ignore
+        return next_item
 
     def peek(self) -> T:
         if self.cursor < len(self._cache):
@@ -121,6 +120,20 @@ class PeekableStream[T]:
 
         return self.default
 
+    def peek_n(self, n: int) -> list[T]:
+        # cache items if needed
+        end_pos = self.cursor + n
+        self._cache.extend(itertools.islice(self.__iterator, end_pos - len(self._cache)))
+
+        # return exactly n items, extended with `self.default` if the iterable was exhausted
+        return [*self._cache[self.cursor:end_pos], 
+                *itertools.repeat(self.default, max(0, end_pos - len(self._cache)))]
+
+    def next_n(self, n: int) -> list[T]:
+        peeked_items = self.peek_n(n)
+        self.cursor += min(n, len(self._cache) - self.cursor)
+        return peeked_items
+
     def reset(self, pos: int):
         self.cursor = pos
 
@@ -128,18 +141,27 @@ class PeekableStream[T]:
     def alt(parent):
         # pylint: disable=E0213
         class Guard:
-            __slots__ = ["cursor"]
+            __slots__ = ["cursor", "result"]
+
             def __init__(self, cursor: int):
                 self.cursor = cursor
+                self.result = None
 
             def __enter__(self):
+                # defer evaluation of result
                 return self
 
             def __exit__(self, exc_type, exc_value, traceback) -> bool:
                 if exc_type is Cancellation:
                     parent.reset(self.cursor)
                     return True
+
+                # populate result with whatever this guard consumed
+                self.result = parent._cache[self.cursor:parent.cursor]
                 return False
+
+            def __call__(self) -> Optional[list[T]]:
+                return self.result
 
         return Guard(parent.cursor)
 
@@ -148,6 +170,9 @@ class PeekableStream[T]:
             return rule(self, *args, **kwargs)
         return None
 
+    def __repr__(self):
+        return str(list(self))
+
 
 TokenQuery = tuple[int | list[int] | EllipsisType, 
                    str | re.Pattern | list[str | re.Pattern] | EllipsisType]
@@ -155,6 +180,8 @@ TokenNames: dict[int, str] = {value: key for key, value in token.__dict__.items(
 
 
 class Token(namedtuple("Token", ["type", "string"])):
+    # type: int
+    # string: str
     offset: Optional[int]
 
     def __new__(cls, type: int, string: str, offset: Optional[int] = None):
@@ -208,79 +235,94 @@ class Token(namedtuple("Token", ["type", "string"])):
         return not self.__eq__(query)
 
 
-def tokenize(code: str, with_endmarker: bool = False):
-    last_line, last_column = 1, 0
-    remove_indent = False
-    indent: list[str] = []
+class Tokenizer:
+    def __init__(self, indent: Optional[list[str]] = None):
+        self.indents: list[str] = indent or []
+        self.last_line = 1
+        self.last_column = 0
+        self.remove_indent = False
 
-    for current in generate_tokens(StringIO(code).readline):
-        if current.type == token.ENDMARKER and not with_endmarker:
-            break
-        cur_line, cur_column = current.end[0], current.start[1]
+    def tokenize(self, code: str, with_endmarker: bool = False):
+        for current in generate_tokens(StringIO(code).readline):
+            if current.type == token.ENDMARKER and not with_endmarker:
+                break
+            cur_line = current.end[0]
+            cur_column = current.start[1]
 
-        if cur_line != last_line:
-            last_line, last_column = cur_line, 0
+            if cur_line != self.last_line:
+                self.last_line, self.last_column = cur_line, 0
 
-        prepended_spaces = cur_column - last_column
-        if remove_indent and indent:
-            prepended_spaces = max(prepended_spaces - len(indent[-1]), 0)
-            remove_indent = False
+            prepended_spaces = cur_column - self.last_column
+            if self.remove_indent and self.indents:
+                prepended_spaces = max(prepended_spaces - len(self.indents[-1]), 0)
+                self.remove_indent = False
 
-        last_column = cur_column + len(current.string)
-        text = current.string
-        if current.type == token.FSTRING_MIDDLE:
-            # escape {}
-            last_column += current.string.count('{') + current.string.count('}')
-            text = current.string.replace('{', '{{').replace('}', '}}')
+            self.last_column = cur_column + len(current.string)
+            text = current.string
+            if current.type == token.FSTRING_MIDDLE:
+                # escape {}
+                self.last_column += current.string.count('{') + current.string.count('}')
+                text = current.string.replace('{', '{{').replace('}', '}}')
 
-        elif current.type in (token.NL, token.NEWLINE):
-            text = '\n'
-            remove_indent = True
-        elif current.type == token.INDENT:
-            indent.append(current.string)
-        elif current.type == token.DEDENT:
-            with contextlib.suppress(IndexError):
-                indent.pop()
+            elif current.type in (token.NL, token.NEWLINE):
+                text = '\n'
+                self.remove_indent = True
+            elif current.type == token.INDENT:
+                self.indents.append(current.string)
+            elif current.type == token.DEDENT:
+                with contextlib.suppress(IndexError):
+                    self.indents.pop()
 
-        yield Token(current.type, text, offset=prepended_spaces)
+            yield Token(current.type, text, offset=prepended_spaces)
 
 
-def untokenize(tokens: Iterable[Token], last_type: Optional[int] = None):
-    fragments = []
-    indents: list[int] = []
-    last_type = last_type or 0
-    for current in tokens:
-        assert isinstance(last_type, int)
+class Untokenizer:
+    def __init__(self, indent: Optional[list[int]] = None):
+        self.indents: list[int] = indent or []
+        self.last_type = 0
 
-        if current.type == token.ENCODING:
-            continue
-        elif current.type == token.ENDMARKER:
-            break
-        elif current.type == token.INDENT:
-            last_indent = indents[-1] if indents else 0
-            if len(current.string) <= last_indent:
-                # treat the next indent as incremental if it's smaller than the last
-                indents.append(last_indent + len(current.string))
-            indents.append(len(current.string))
-            continue
-        elif current.type == token.DEDENT:
-            with contextlib.suppress(IndexError):
-                indents.pop()
-            continue
-        elif last_type in (token.NL, token.NEWLINE) and indents:
-            fragments.append(indents[-1] * ' ')
+    def untokenize(self, tokens: Iterable[Token]):
+        fragments = []
+        for current in tokens:
+            assert isinstance(self.last_type, int)
 
-        if getattr(current, 'offset', None) is None and must_insert_space(last_type, current):
-            # ensure spacing
-            fragments.append(' ')
+            if current.type == token.ENCODING:
+                continue
+            elif current.type == token.ENDMARKER:
+                break
+            elif current.type == token.INDENT:
+                last_indent = self.indents[-1] if self.indents else 0
+                if len(current.string) <= last_indent:
+                    # treat the next indent as incremental if it's smaller than the last
+                    self.indents.append(last_indent + len(current.string))
+                self.indents.append(len(current.string))
+                continue
+            elif current.type == token.DEDENT:
+                with contextlib.suppress(IndexError):
+                    self.indents.pop()
+                continue
+            elif self.last_type in (token.NL, token.NEWLINE) and self.indents:
+                fragments.append(self.indents[-1] * ' ')
 
-        fragments.append(current.to_code() if hasattr(current, 'to_code') else current.string)
+            if getattr(current, 'offset', None) is None and must_insert_space(self.last_type, current):
+                # ensure spacing
+                fragments.append(' ')
 
-        if current == (token.OP, ','):
-            # append space after ,
-            fragments.append(' ')
-        last_type = current.type
-    return ''.join(fragments)
+            fragments.append(current.to_code() if hasattr(current, 'to_code') else current.string)
+
+            if current == (token.OP, ','):
+                # append space after ,
+                fragments.append(' ')
+            self.last_type = current.type
+        return ''.join(fragments)
+
+
+def tokenize(code: str, with_endmarker: bool = False) -> Iterable[Token]:
+    return Tokenizer().tokenize(code, with_endmarker)
+
+
+def untokenize(tokens: Iterable[Token]) -> str:
+    return Untokenizer().untokenize(tokens)
 
 
 def must_insert_space(previous_type: int, current: Token):
@@ -297,11 +339,6 @@ def must_insert_space(previous_type: int, current: Token):
     elif previous_type == token.NUMBER and current == (token.OP, '.'):
         return True
     return False
-
-
-@cache
-def get_tokens(data: str) -> list[Token]:
-    return [Token(token.type, token.string) for token in list(generate_tokens(StringIO(data).readline))][:-1]
 
 
 class TokenStream(PeekableStream[Token]):
@@ -322,17 +359,13 @@ class TokenStream(PeekableStream[Token]):
             self.line_buffer.append(next_token)
         return next_token
 
-    def expect(self, expected: TokenQuery | list[TokenQuery]) -> Token:
-        if self.peek() == expected:
-            item = self.next()
-            assert item
-            return item
-        raise Cancellation
+    def maybe(self, expected: TokenQuery):
+        return self.next() if self.peek() == expected else None
 
-    def expect_safe(self, expected: TokenQuery | list[TokenQuery]) -> Optional[Token]:
+    def expect(self, expected: TokenQuery) -> Token:
         if self.peek() == expected:
             return self.next()
-        return None
+        raise Cancellation
 
     def consume_while(self, condition: TokenQuery) -> list[Token]:
         consumed: list[Token] = []
@@ -348,10 +381,8 @@ class TokenStream(PeekableStream[Token]):
 
     def consume_until(self, condition: TokenQuery) -> list[Token]:
         consumed: list[Token] = []
-        for item in self:
-            consumed.append(item)
-            if item == condition:
-                break
+        while (item := self.peek()) and item != condition:
+            consumed.append(self.next())
         return consumed
 
     def consume_line(self, with_newline=True) -> list[Token]:
@@ -373,8 +404,8 @@ class TokenStream(PeekableStream[Token]):
 
         return consumed
 
-    def consume_balanced(self, increase: TokenQuery, decrease: TokenQuery, level: int = 0):
-        output = []
+    def consume_balanced(self, increase: TokenQuery, decrease: TokenQuery, level: int = 0) -> list[Token]:
+        output: list[Token] = []
         for item in self:
             output.append(item)
             if item == increase:
@@ -386,56 +417,57 @@ class TokenStream(PeekableStream[Token]):
 
         if level == 0:
             return output
-        raise ParseError(f"Unexpected eof - expected {decrease}", self.error_context())
+        raise ParseError(f"Unexpected eof - expected {decrease}")
 
     def error_context(self):
+        ...
         #TODO rewrite
-        if not self.line_buffer and not self.cursor:
-            # token stream hasn't been used yet, cancel
-            return ""
+        # if not self.line_buffer and not self.cursor:
+        #     # token stream hasn't been used yet, cancel
+        #     return ""
 
-        if not self.cursor:
-            tokens_before = self.line_buffer[:-1]
-            current_token = self.line_buffer[-1]
-        else:
-            cursor = min(self.cursor - 1, len(self._cache) - 1)
-            cached_prefix = list(itertools.islice(self._cache, 0, cursor)) if cursor > 0 else []
-            tokens_before = [*self.line_buffer, *cached_prefix]
-            current_token = self._cache[cursor]
+        # if not self.cursor:
+        #     tokens_before = self.line_buffer[:-1]
+        #     current_token = self.line_buffer[-1]
+        # else:
+        #     cursor = min(self.cursor - 1, len(self._cache) - 1)
+        #     cached_prefix = list(itertools.islice(self._cache, 0, cursor)) if cursor > 0 else []
+        #     tokens_before = [*self.line_buffer, *cached_prefix]
+        #     current_token = self._cache[cursor]
 
-        last_type = None
-        line_prefix = ""
-        if tokens_before:
-            # could pass untokenize last_type=token.NL to attempt indentation
-            # however we do not currently track in this context
-            last_newline = 0
-            with contextlib.suppress(ValueError):
-                last_newline = list(reversed(tokens_before)).index(([token.NL, token.NEWLINE], ...))
+        # last_type = None
+        # line_prefix = ""
+        # if tokens_before:
+        #     # could pass untokenize last_type=token.NL to attempt indentation
+        #     # however we do not currently track in this context
+        #     last_newline = 0
+        #     with contextlib.suppress(ValueError):
+        #         last_newline = list(reversed(tokens_before)).index(([token.NL, token.NEWLINE], ...))
 
-            tokens_before = tokens_before[-last_newline:]
-            line_prefix = untokenize(tokens_before)
-            last_type = tokens_before[-1].type
+        #     tokens_before = tokens_before[-last_newline:]
+        #     line_prefix = untokenize(tokens_before)
+        #     last_type = tokens_before[-1].type
 
-        if current_token == ([token.NL, token.NEWLINE], ...):
-            current = ""
-        else:
-            current = untokenize([current_token], last_type=last_type)
+        # if current_token == ([token.NL, token.NEWLINE], ...):
+        #     current = ""
+        # else:
+        #     current = untokenize([current_token], last_type=last_type)
 
-        old_cursor = self.cursor
-        tokens_after = self.peek_line()
-        line_suffix = untokenize(tokens_after, last_type=current_token.type)
-        self.cursor = old_cursor
+        # old_cursor = self.cursor
+        # tokens_after = self.peek_line()
+        # line_suffix = untokenize(tokens_after, last_type=current_token.type)
+        # self.cursor = old_cursor
 
-        token_str = str(current_token)
-        prefix = ' ' * (len(line_prefix) + 1)
+        # token_str = str(current_token)
+        # prefix = ' ' * (len(line_prefix) + 1)
 
-        style = {'fg': Fore.RED, 'style': Style.BRIGHT}
-        squiggly_line = decorated(f"{prefix}^" + (len(token_str) - 1) * '~', **style)
-        current = decorated(current, **style)
-        token_str = decorated(token_str, **style)
+        # style = {'fg': Fore.RED, 'style': Style.BRIGHT}
+        # squiggly_line = decorated(f"{prefix}^" + (len(token_str) - 1) * '~', **style)
+        # current = decorated(current, **style)
+        # token_str = decorated(token_str, **style)
 
-        indent = 4 * ' '
-        return f"{indent}{line_prefix}{current}{line_suffix}\n{indent}{squiggly_line}\n{indent}{prefix} {token_str}"
+        # indent = 4 * ' '
+        # return f"{indent}{line_prefix}{current}{line_suffix}\n{indent}{squiggly_line}\n{indent}{prefix} {token_str}"
 
 
 class Code:
@@ -468,4 +500,4 @@ class Code:
     def tokens(self):
         if isinstance(self.__current_state, Iterable) and not isinstance(self.__current_state, str):
             return self.__current_state
-        return get_tokens(self.string)
+        return tokenize(self.string, False)

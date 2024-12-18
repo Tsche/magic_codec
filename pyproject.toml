@@ -39,3 +39,14 @@
 
 [tool.isort]
     line_length = 120
+
+[tool.basedpyright]
+include = ["src"]
+exclude = ["**/tests"]
+
+reportMissingImports = "error"
+reportMissingTypeStubs = false
+typeCheckingMode = "standard"
+
+pythonVersion = "3.13"
+pythonPlatform = "Linux"
