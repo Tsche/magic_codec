@@ -134,6 +134,9 @@ class PeekableStream[T]:
         self.cursor += min(n, len(self._cache) - self.cursor)
         return peeked_items
 
+    def mark(self):
+        return self.cursor
+
     def reset(self, pos: int):
         self.cursor = pos
 
@@ -199,7 +202,7 @@ class Token(namedtuple("Token", ["type", "string"])):
 
     def to_code(self):
         prefix = '' if self.offset is None else self.offset * ' '
-        return prefix + self.string
+        return prefix + str(self.string)
 
     def __bool__(self):
         return self.type != token.ENDMARKER

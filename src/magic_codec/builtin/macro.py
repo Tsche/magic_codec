@@ -8,10 +8,11 @@ import os
 from pathlib import Path
 from token import DEDENT, ENDMARKER, INDENT, NAME, NEWLINE, NL, NUMBER, OP, STRING, COMMENT
 from tokenize import detect_encoding
-from typing import Any, Callable, Iterable, Optional
+from typing import Any, Callable, Generator, Iterable, Optional
 import re
 import sys
 import traceback
+from keyword import iskeyword, issoftkeyword
 from magic_codec.util import Cancellation, Code, ParseError, Token, TokenStream, Untokenizer, tokenize, untokenize
 
 
@@ -62,10 +63,19 @@ def macro(fnc=None, /, **kwargs):
 
 
 class MacroFileLoader(SourceFileLoader):
+    def __init__(self, fullname: str, path: str, macro_only: bool = False) -> None:
+        super().__init__(fullname, path)
+        self.macro_only = macro_only
+
     def process_macros(self):
         print(self.path)
 
+    def set_data(self, path: str, data, *, _mode: int = 438) -> None:
+        print("set: ", path)
+        return super().set_data(path, data, _mode=_mode)
+
     def get_data(self, path: str) -> bytes:
+        print("get: ", path)
         if not os.path.exists(path):
             return b''
 
@@ -89,6 +99,15 @@ class MacroFinder(PathFinder):
 
     @classmethod
     def find_spec(cls, fullname, path=None, target=None):
+        macro_only = False
+        parts = fullname.split('.')
+        if parts[-1].startswith(MACRO_PREFIX):
+            # the module was imported via name! bang-name
+            # => we're only interested in this module's macros
+            parts[-1] = parts[-1].removeprefix(MACRO_PREFIX)
+            fullname = '.'.join(parts)
+            macro_only = True
+
         if not (spec := super().find_spec(fullname, path, target)):
             return
 
@@ -97,7 +116,7 @@ class MacroFinder(PathFinder):
             return
 
         if cls.uses_macro_codec(spec.origin):
-            spec.loader = MacroFileLoader(fullname, spec.origin)
+            spec.loader = MacroFileLoader(fullname, spec.origin, macro_only)
             return spec
 
 
@@ -109,6 +128,11 @@ def install_import_hook():
 
 
 MACRO_PREFIX = "__macro__"
+def maybe_mangle(name: str) -> str:
+    # to allow keywords to be used as macro names, they must be mangled
+    if iskeyword(name) or issoftkeyword(name):
+        return f"{MACRO_PREFIX}{name}"
+    return name
 
 
 class UnresolvedSymbol(Exception): 
@@ -119,6 +143,7 @@ class Interpreter:
     __default_globals = {
         # 'tokenize': tokenize,
         # 'ast': _ast,
+        'Token': Token,
         'Code': Code,
         'NodeTransformer': NodeTransformer,
         'macro': macro,
@@ -131,10 +156,16 @@ class Interpreter:
         self.globals: dict[str, Any] = self.__default_globals
         self.macros: dict[str, Any] = {}
         # self.install_excepthook(handle_exception)
+        self.install_importhook()
 
     def install_excepthook(self, hook: Callable):
         code = "import sys; sys.excepthook=__excepthook"
         self.exec(tokenize(code), {'__excepthook': hook})
+
+    def install_importhook(self):
+        code = "from magic_codec.builtin.macro import install_import_hook;"\
+               "install_import_hook()"
+        self.exec(tokenize(code), {})
 
     def reset(self):
         self.globals = self.__default_globals
@@ -221,6 +252,22 @@ class FunctionDefinition(Fragment):
 
         return [*decorators, *head, *body]
 
+def to_token(token: Token):
+    yield Token(NAME, "Token")
+    yield Token(OP, '(')
+    yield Token(NUMBER, str(token.type))
+    yield Token(OP, ',')
+    yield Token(STRING, f"'{token.string}'")
+    yield Token(OP, ")")
+
+def to_token_list(tokens: list[Token]):
+    yield Token(OP, '[')
+    if tokens:
+        yield from to_token(tokens[0])
+    for token in tokens[1:]:
+        yield Token(OP, ',')
+        yield from to_token(token)
+    yield Token(OP, ']')
 
 @dataclass
 class MacroInvocation(Fragment):
@@ -229,7 +276,9 @@ class MacroInvocation(Fragment):
 
     def get_code(self) -> Iterable[Token]:
         yield Token(NAME, self.name)
-        yield from self.args
+        yield Token(OP, '(')
+        yield from to_token_list(self.args[1:-1])
+        yield Token(OP, ')')
 
     def evaluate(self, interpreter: Interpreter) -> Iterable[Token]:
         if self.is_macro:
@@ -274,7 +323,24 @@ class Parser(TokenStream):
             # imports within the preprocessor
             kind = self.expect((NAME, ["import", "from"]))
             self.expect((OP, '!'))
-            # TODO handle bang names
+
+            # module = []
+            # if kind.string == "from":
+            #     module = self.consume_until((NAME, "import"))
+            #     while (current := self.peek()).type not in (NL, NEWLINE):
+            #         if current != (NAME, ...):
+            #             module.append(self.next())
+            #         elif current.string == "import":
+            #             break
+            #         else:
+            #             name = self.next()
+            #             if self.peek() == (OP, '!'):
+            #                 module.append((NAME, maybe_mangle(name.string)))
+            #             else:
+            #                 module.append(name)
+
+                # macro_target |= self.maybe((OP, '!')) is not None
+
             return [CodeFragment(True, [kind, *self.consume_line()])]
 
         with self.alt:
@@ -294,12 +360,18 @@ class Parser(TokenStream):
                 with parser.alt:
                     name = parser.expect((NAME, ...))
                     if name.string == "macro":
+                        # special case `macro` decorator to mark functions as macros
                         is_macro = True
                         is_macro_keyword = True
 
                     with parser.alt:
+                        # could be a macro
                         parser.expect((OP, '!'))
                         is_macro = True
+
+                    #? note that PEP 614 (https://peps.python.org/pep-0614/) significantly lifted the restrictions
+                    #? on what can appear in a decorator expression. In future versions the macro preprocessor
+                    #? could properly parse named expressions to look for macro invocations.
 
                 parser.reset(0)
                 return Decorator(list(parser.parse_line()), is_macro, is_macro_keyword)
@@ -331,8 +403,8 @@ class Parser(TokenStream):
             is_macro = True
 
         if is_macro:
-            # always mangle macro names
-            name = f"{MACRO_PREFIX}{name}"
+            # make sure to only ever mangle macro names
+            name = maybe_mangle(name)
 
         head.append(Token(NAME, name))
         # args
@@ -394,7 +466,7 @@ class Parser(TokenStream):
     def parse_macro_name(self):
         name = self.expect((NAME, ...)).string
         self.expect((OP, "!"))
-        return f"{MACRO_PREFIX}{name}"
+        return maybe_mangle(name)
 
     def parse_macro_invocation(self, is_macro: bool = False):
         name = self.parse_macro_name()
@@ -445,6 +517,12 @@ def synthesize_call_chain(calls: list[Iterable[Token]], args: list[Token], conve
 def synthesize_constant(value: Any):
     if value is None:
         return
+    elif isinstance(value, Token):
+        yield value
+    elif isinstance(value, tuple): 
+        if len(value) != 2:
+            raise SyntaxError("Can only return (str, int) 2-tuples in place of tokens")
+        yield Token(int(value[0]), str(value[1]))
     elif isinstance(value, bool):
         yield Token(NAME, str(value))
     elif isinstance(value, (int, float)):
@@ -461,10 +539,15 @@ def synthesize_constant(value: Any):
                 raise SyntaxError
         except SyntaxError:
             yield from tokenize(value)
+    elif isinstance(value, (list, Generator)):
+        # directly inject tokens into token stream
+        for item in value:
+            if not isinstance(item, (Token, tuple)):
+                raise SyntaxError("Expected list or generator of tokens to directly inject into the token stream")
+            yield from synthesize_constant(item)
     else:
         # couldn't find something to replace the constant with
-        # assume a replacement wasn't desired
-        yield from tokenize(value)
+        raise SyntaxError("Unexpected macro return value")
 
 
 def parse(tokens: TokenStream):
@@ -525,10 +608,11 @@ def print_syntax(tokens: TokenStream):
 
 
 # @cache
-def preprocess(data: str):
-    tokens    = TokenStream(Code(data).tokens)
-    new_code  = Code(list(transform(*parse(tokens))))
-    return new_code.string
+def preprocess(code: str):
+    tokens    = TokenStream(tokenize(code))
+    new_code  = transform(*parse(tokens))
+    # print(list(new_code))
+    return untokenize(new_code)
 
 
 def main():
