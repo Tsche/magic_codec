@@ -1,17 +1,20 @@
 # coding: magic.macro
-@macro(kind="statement")
-def try!(code):
-    yield from tokenize("try:")
-    yield from code.tokens
 
-@macro(kind="statement", after=try!)
+@macro
 def finally!(code):
-    yield from tokenize("catch:raise\n")
+    yield from tokenize("except: raise\n")
     yield from tokenize("finally:")
     yield from code.tokens
 
-try!:
+@macro
+def used_in_macro(code):
+    try:
+        print("zoinks")
+    finally!:
+        yield from code.tokens
+
+try:
     print("x")
-finally!: 
-    ...
+finally!:
+    print("hi")
 print()

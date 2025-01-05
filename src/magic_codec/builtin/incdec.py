@@ -1,9 +1,8 @@
-from io import StringIO
 import keyword
-from tokenize import TokenInfo, generate_tokens
-import tokenize
+import token
+from typing import Generator
 
-from magic_codec.util import TokenStream
+from magic_codec.util import TokenStream, tokenize, untokenize, Token
 
 
 class UnaryExpr:
@@ -13,11 +12,11 @@ class UnaryExpr:
         self.prefix = prefix
 
     @staticmethod
-    def from_tokens(tokens: tuple[TokenInfo, TokenInfo, TokenInfo]):
-        if tokens[0].type == tokens[1].type == tokenize.OP:
+    def from_tokens(tokens: tuple[Token, Token, Token]):
+        if tokens[0].type == tokens[1].type == token.OP:
             return UnaryExpr(name=tokens[2].string, operator=tokens[0].string, prefix=True)
 
-        elif tokens[1].type == tokens[2].type == tokenize.OP:
+        elif tokens[1].type == tokens[2].type == token.OP:
             return UnaryExpr(name=tokens[0].string, operator=tokens[1].string, prefix=False)
 
         else:
@@ -32,35 +31,35 @@ class UnaryExpr:
         target = 0 if self.prefix else 1
         return f"(({self.name}, {self.name} := {self.name}{self.operator}1)[{target}])"
 
-    def to_tokens(self):
+    def to_tokens(self) -> list[Token]:
         return [
-            (tokenize.OP, '('),
-            (tokenize.OP, '('),
-            (tokenize.NAME, self.name),
-            (tokenize.OP, ','),
-            (tokenize.NAME, self.name),
-            (tokenize.OP, ':='),
-            (tokenize.NAME, self.name),
-            (tokenize.OP, self.operator),
-            (tokenize.NUMBER, '1'),
-            (tokenize.OP, ')'),
-            (tokenize.OP, '['),
-            (tokenize.NUMBER, str(int(self.prefix))),
-            (tokenize.OP, ']'),
-            (tokenize.OP, ')')
+            Token(token.OP, '('),
+            Token(token.OP, '('),
+            Token(token.NAME, self.name),
+            Token(token.OP, ','),
+            Token(token.NAME, self.name),
+            Token(token.OP, ':='),
+            Token(token.NAME, self.name),
+            Token(token.OP, self.operator),
+            Token(token.NUMBER, '1'),
+            Token(token.OP, ')'),
+            Token(token.OP, '['),
+            Token(token.NUMBER, str(int(self.prefix))),
+            Token(token.OP, ']'),
+            Token(token.OP, ')')
         ]
 
 
 def is_valid_unary_operator(token):
-    return token.type == tokenize.OP and token.string in ('+', '-')
+    return token.type == token.OP and token.string in ('+', '-')
 
 
 def is_valid_name(token):
-    return token.type == tokenize.NAME and not keyword.iskeyword(token.string)
+    return token.type == token.NAME and not keyword.iskeyword(token.string)
 
 
-def transform(data):
-    tokens = TokenStream(generate_tokens(StringIO(data).readline))
+def transform(data) -> Generator[Token, None, None]:
+    tokens = TokenStream(tokenize(data))
 
     for current in tokens:
         if is_valid_name(current):
@@ -77,8 +76,8 @@ def transform(data):
                 tokens.next_n(2)
                 continue
 
-        yield current.type, current.string
+        yield Token(current.type, current.string)
 
 
 def preprocess(data: str):
-    return tokenize.untokenize(transform(data))
+    return untokenize(transform(data))

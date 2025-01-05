@@ -2,6 +2,7 @@ import codecs
 import importlib
 import traceback
 from typing import Callable, Optional
+from collections.abc import Buffer
 
 
 class CodecError(Exception):
@@ -9,11 +10,13 @@ class CodecError(Exception):
 
 
 def make_decoder(preprocessor: Callable):
-    class Decoder(codecs.BufferedIncrementalDecoder):
-        def _buffer_decode(self, input, errors, final):  """not used"""
+    class Decoder(codecs.IncrementalDecoder):
+        def __init__(self, errors='strict'):
+            super().__init__(errors)
+            self.buffer = b""
 
         @staticmethod
-        def do_decode(data: bytes, errors='strict') -> tuple[str, int] | None:
+        def do_decode(data: Buffer, errors='strict') -> tuple[str, int]:
             decoded, consumed = codecs.utf_8_decode(data, errors, True)
             try:
                 processed = preprocessor(decoded)
@@ -23,8 +26,8 @@ def make_decoder(preprocessor: Callable):
 
             return processed, consumed
 
-        def decode(self, data, final=False) -> str:
-            self.buffer += data
+        def decode(self, input, final=False) -> str:
+            self.buffer += input
 
             if self.buffer and final:
                 buffer = self.buffer
@@ -32,6 +35,16 @@ def make_decoder(preprocessor: Callable):
                 return self.do_decode(buffer, self.errors)[0]
 
             return ""
+
+        def reset(self):
+            super().reset()
+            self.buffer = b""
+
+        def getstate(self):
+            return (self.buffer, 0)
+
+        def setstate(self, state):
+            self.buffer = state[0]
 
     return Decoder
 

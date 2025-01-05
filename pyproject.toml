@@ -8,6 +8,7 @@
 
 [tool.mypy]
     mypy_path              = "src"
+    exclude                = "(tests|example)"
     plugins                = []
     check_untyped_defs     = true
     ignore_missing_imports = true
@@ -20,6 +21,7 @@
     warn_unused_configs    = true
     no_implicit_reexport   = true
     warn_unused_ignores    = true
+    disable_error_code     = ["unreachable"]
 
 [tool.pylint.'MESSAGES CONTROL']
     disable = """

@@ -1,3 +1,5 @@
+# mypy: disable-error-code="unreachable"
+
 from dataclasses import dataclass
 import functools
 from io import StringIO
@@ -33,9 +35,9 @@ def force_conversion(to: type | Callable | None = None):
     return wrapper(to)
 
 
-def decorated(message: Any, 
-              fg: Optional[AnsiFore | str] = None, 
-              bg: Optional[AnsiBack | str] = None, 
+def decorated(message: Any,
+              fg: Optional[AnsiFore | str] = None,
+              bg: Optional[AnsiBack | str] = None,
               style: Optional[AnsiStyle | str] = None,):
     if not isinstance(message, str):
         message = str(message)
@@ -104,7 +106,7 @@ class PeekableStream[T]:
         return next(self, self.default)
 
     def cache_next(self, *, advance_cursor=True) -> T:
-        next_item = next(self.__iterator)  # may raise StopIteration
+        next_item: T = next(self.__iterator)  # may raise StopIteration
         self._cache.append(next_item)
 
         if advance_cursor:
@@ -126,7 +128,7 @@ class PeekableStream[T]:
         self._cache.extend(itertools.islice(self.__iterator, end_pos - len(self._cache)))
 
         # return exactly n items, extended with `self.default` if the iterable was exhausted
-        return [*self._cache[self.cursor:end_pos], 
+        return [*self._cache[self.cursor:end_pos],
                 *itertools.repeat(self.default, max(0, end_pos - len(self._cache)))]
 
     def next_n(self, n: int) -> list[T]:
@@ -141,32 +143,8 @@ class PeekableStream[T]:
         self.cursor = pos
 
     @property
-    def alt(parent):
-        # pylint: disable=E0213
-        class Guard:
-            __slots__ = ["cursor", "result"]
-
-            def __init__(self, cursor: int):
-                self.cursor = cursor
-                self.result = None
-
-            def __enter__(self):
-                # defer evaluation of result
-                return self
-
-            def __exit__(self, exc_type, exc_value, traceback) -> bool:
-                if exc_type is Cancellation:
-                    parent.reset(self.cursor)
-                    return True
-
-                # populate result with whatever this guard consumed
-                self.result = parent._cache[self.cursor:parent.cursor]
-                return False
-
-            def __call__(self) -> Optional[list[T]]:
-                return self.result
-
-        return Guard(parent.cursor)
+    def alt(self):
+        return Guard(self)
 
     def attempt(self, rule: Callable, *args, **kwargs):
         with self.alt:
@@ -177,14 +155,34 @@ class PeekableStream[T]:
         return str(list(self))
 
 
-TokenQuery = tuple[int | list[int] | EllipsisType, 
+class Guard:
+    __slots__ = ["cursor", "result", "parent"]
+
+    def __init__(self, parent):
+        self.parent = parent
+        self.cursor = parent.cursor
+        self.result = None
+
+    def __enter__(self):
+        # defer evaluation of result
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> bool:
+        if exc_type is Cancellation:
+            self.parent.reset(self.cursor)
+            return True
+
+        # populate result with whatever this guard consumed
+        self.result = self.parent._cache[self.parent.cursor:self.cursor]
+        return False
+
+
+TokenQuery = tuple[int | list[int] | EllipsisType,
                    str | re.Pattern | list[str | re.Pattern] | EllipsisType]
 TokenNames: dict[int, str] = {value: key for key, value in token.__dict__.items() if isinstance(value, int)}
 
 
 class Token(namedtuple("Token", ["type", "string"])):
-    # type: int
-    # string: str
     offset: Optional[int]
 
     def __new__(cls, type: int, string: str, offset: Optional[int] = None):
@@ -245,7 +243,7 @@ class Tokenizer:
         self.last_column = 0
         self.remove_indent = False
 
-    def tokenize(self, code: str, with_endmarker: bool = False):
+    def tokenize(self, code: str, with_endmarker: bool = False) -> Iterable[Token]:
         for current in generate_tokens(StringIO(code).readline):
             if current.type == token.ENDMARKER and not with_endmarker:
                 break
@@ -284,7 +282,7 @@ class Untokenizer:
         self.indents: list[int] = indent or []
         self.last_type = 0
 
-    def untokenize(self, tokens: Iterable[Token]):
+    def untokenize(self, tokens: Iterable[Token]) -> str:
         fragments = []
         for current in tokens:
             assert isinstance(self.last_type, int)
@@ -424,7 +422,7 @@ class TokenStream(PeekableStream[Token]):
 
     def error_context(self):
         ...
-        #TODO rewrite
+        # TODO rewrite
         # if not self.line_buffer and not self.cursor:
         #     # token stream hasn't been used yet, cancel
         #     return ""
