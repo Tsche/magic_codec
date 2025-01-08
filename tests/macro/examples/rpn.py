@@ -2,8 +2,8 @@
 from! magic_codec.util import TokenStream, Token, untokenize
 from! token import NUMBER, OP
 
-def rpn!(tokens):
-  stream = TokenStream(tokens)
+def pn!(tokens):
+  stream = TokenStream(tokens.tokens)
   stack = []
 
   def parse_expr():
@@ -20,4 +20,4 @@ def rpn!(tokens):
     parse_expr()
   return stack.pop()
 
-print(rpn!(3 4 + 6 +))
+print(pn!(3 4 + 6 +))

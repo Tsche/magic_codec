@@ -1,35 +1,19 @@
 # coding: magic.macro
 
 
-# def zoinks!(tokens): return "return   42"
-# x = 2
+def zoinks!(tokens): return "return   42"
+x = 2
 
-# def bar!():
-#     return 42
+@macro(eval_args=True)
+def foo(x: int):
+    def bar():
+        return 7
+    return x * bar()
 
-# @macro
-# def foo!(x: int):
-#     def bar():
-#         return 7
-#     return x * bar!() * bar()
-
-# baz! = bar!() * 2
-
-# class Test:
-#     def bar(x):
-#         return baz!
-
-#     @zoinks!
-#     def boings(): ...
-
-# FOO = foo!(42)
-# BAZ = baz!
-
+FOO = foo!(42)
 
 @macro
-def test(tokens):
-    print(tokens)
-    return "2 + 2"
+def bar(x: Code):
+    return foo!(2 - 1) + foo(x)
 
-FOO = test!(42)
-print(FOO)
+BAR = bar!(42)

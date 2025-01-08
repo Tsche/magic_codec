@@ -17,4 +17,5 @@ try:
     print("x")
 finally!:
     print("hi")
-print()
+
+used_in_macro!(print("x"))

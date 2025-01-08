@@ -12,6 +12,7 @@ from typing import Any, Callable, Generator, Iterable, Optional
 import re
 import sys
 import traceback
+import inspect
 from keyword import iskeyword, issoftkeyword
 from magic_codec.util import Cancellation, Code, ParseError, Token, TokenStream, Untokenizer, tokenize, untokenize
 
@@ -48,8 +49,9 @@ class NodeTransformer(_ast.NodeTransformer, metaclass=NodeTransformerMeta):
         yield Token(NEWLINE, '\n')
 
 
-def macro(fnc=None, /, **kwargs):
+def macro(fnc=None, /, eval_args=False, **kwargs):
     """ This decorator does nothing. It is only used to flag functions and classes as macros. """
+
     class Macro:
         def __init__(self, func):
             nonlocal kwargs
@@ -57,6 +59,11 @@ def macro(fnc=None, /, **kwargs):
             self.options = kwargs
 
         def __call__(self, *args, **kwds):
+            if eval_args and not kwargs and len(args) == 1 and isinstance(args[0], Code):
+                code_object: Code = args[0]
+                call = synthesize_call([Token(NAME, "self"), Token(OP, '.'), Token(NAME, 'fnc')], 
+                                       list(code_object.tokens))
+                return eval(untokenize(call), globals(), locals())
             return self.fnc(*args, **kwds)
 
     return Macro(fnc) if fnc else Macro
@@ -131,7 +138,7 @@ def mangle(name: str, force: bool = False) -> str:
 
 
 def demangle(text):
-    return re.sub(f"{MACRO_PREFIX}([a-zA-Z_]+)", "\\1!", text)
+    return re.sub(f"{MACRO_PREFIX}(\\w+)", "\\1!", text)
 
 
 def install_import_hook():
@@ -160,8 +167,7 @@ class Interpreter:
         'NodeTransformer': NodeTransformer,
         'macro': macro,
         'tokenize': tokenize,
-        'untokenize': untokenize,
-        '__magic_macro_state': {}
+        'untokenize': untokenize
     }
 
     def __init__(self):
@@ -181,25 +187,25 @@ class Interpreter:
         self.exec(tokenize(code), {'__excepthook': hook})
 
     def install_importhook(self):
-        code = "from magic_codec.builtin.macro import install_import_hook;"\
-               "install_import_hook()"
-        self.exec(tokenize(code), {})
+        self.exec(tokenize("__install_import_hook()"), {'__install_import_hook': install_import_hook})
 
     def reset(self):
         self.globals = self.__default_globals
         self.macros = {}
 
-    def exec(self, code: Iterable[Token], locals=None):
-        exec(untokenize(code), self.globals, locals or self.globals)
+    def exec(self, tokens: Iterable[Token], locals=None):
+        code = untokenize(tokens)
+        exec(code, self.globals, locals or self.globals)
 
     def eval(self, tokens: Iterable[Token], locals=None):
         code = untokenize(tokens)
+        print("eval: ", code)
         return eval(code, self.globals, locals or self.globals)
 
     def apply_macros(self, code: Iterable[Token], macros: list[Iterable[Token]]):
         call = synthesize_call_chain(macros, args=[Token(NAME, "__magic_macro_code_object")], convert_to="_Code")
-        call_locals = {'__magic_macro_code_object': code,
-                       '_Code': Code}
+        call_locals = {'__magic_macro_code_object': _Code(list(code)),
+                       '_Code': _Code}
         return self.eval(call, call_locals).tokens
 
 
@@ -271,23 +277,10 @@ class FunctionDefinition(Fragment):
         return [*decorators, *head, *body]
 
 
-def to_token(token: Token):
-    yield Token(NAME, "Token")
-    yield Token(OP, '(')
-    yield Token(NUMBER, str(token.type))
-    yield Token(OP, ',')
-    yield Token(STRING, f"'{token.string}'")
-    yield Token(OP, ")")
-
-
 def to_token_list(tokens: list[Token]):
-    yield Token(OP, '[')
-    if tokens:
-        yield from to_token(tokens[0])
-    for token in tokens[1:]:
-        yield Token(OP, ',')
-        yield from to_token(token)
-    yield Token(OP, ']')
+    token_list = ', '.join(f"Token({token.type},{token.string!r})" for token in tokens)
+    code = f"Code([{token_list}])"
+    return list(tokenize(code))[:-1]
 
 @dataclass
 class MacroInvocation(Fragment):
@@ -296,16 +289,17 @@ class MacroInvocation(Fragment):
 
     def get_code(self) -> Iterable[Token]:
         yield Token(NAME, self.name)
-        yield Token(OP, '(')
-        yield from to_token_list(self.args[1:-1])
-        yield Token(OP, ')')
+        if self.args:
+            yield Token(OP, '(')
+            yield from to_token_list(self.args[1:-1])
+            yield Token(OP, ')')
 
     def evaluate(self, interpreter: Interpreter) -> Iterable[Token]:
-        if self.is_macro:
-            yield from self.get_code()
+        if self.args:
+            result = interpreter.apply_macros(self.args[1:-1], [[Token(NAME, self.name)]])
         else:
-            result = interpreter.eval(self.get_code())
-            yield from synthesize_constant(result)
+            result = interpreter.eval([Token(NAME, self.name)])
+        yield from synthesize_constant(result)
 
 
 @dataclass
@@ -508,7 +502,7 @@ class Parser(TokenStream):
             yield CodeFragment(is_macro, fragment)
 
 
-def synthesize_call(function: str | Iterable[Token], expression: list[Token]):
+def synthesize_call(function: str | Iterable[Token], expression: list[Token]) -> list[Token]:
     name = [Token(NAME, function)] if isinstance(function, str) else function
     return [*name, Token(OP, '('), *expression, Token(OP, ')')]
 
@@ -522,10 +516,14 @@ def synthesize_constant(value: Any):
     if value is None:
         return
     elif isinstance(value, Token):
+        if value.string == "None":
+            return
         yield value
-    elif isinstance(value, tuple): 
+    elif isinstance(value, tuple):
         if len(value) != 2:
             raise SyntaxError("Can only return (str, int) 2-tuples in place of tokens")
+        if value[1] == "None":
+            return
         yield Token(int(value[0]), str(value[1]))
     elif isinstance(value, bool):
         yield Token(NAME, str(value))
@@ -551,7 +549,7 @@ def synthesize_constant(value: Any):
             yield from synthesize_constant(item)
     else:
         # couldn't find something to replace the constant with
-        raise SyntaxError("Unexpected macro return value")
+        raise SyntaxError(f"Unexpected macro return value {type(value)}")
 
 
 def transform(source: str, source_path: Optional[Path] = None, macro_only: bool = False):

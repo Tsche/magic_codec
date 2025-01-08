@@ -475,11 +475,14 @@ class Code:
     __current_state: str | list[Token] | _ast.AST
 
     def __init__(self, state: str | list[Token] | _ast.AST | Self):
-        self.__current_state = state.__current_state if isinstance(state, Code) else state
-        if isinstance(self.__current_state, Iterable) and not isinstance(self.__current_state, str):
+        if isinstance(state, Code):
+            self.__current_state = state.__current_state
+        elif isinstance(state, Iterable) and not isinstance(state, str):
             # force conversion to Token in case a proc macro returned a plain tuple
             # also force evaluation of generators at this point
-            self.__current_state = [Token(type_, string) for type_, string in self.__current_state]
+            self.__current_state = [Token(type_, string) for type_, string in state]
+        else:
+            self.__current_state = str(state)
 
     @property
     def string(self):
