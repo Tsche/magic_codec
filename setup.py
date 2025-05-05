@@ -24,5 +24,14 @@ setup(
     package_dir={'': 'src'},
     packages=find_packages(where='src'),
     include_package_data=True,
-    cmdclass={"build_py": BuildPy}
+    cmdclass={"build_py": BuildPy},
+    # TODO: enable, required for declarative macros
+    # extras_require={
+    #     # optional dependency for PEG parsing and declarative macros
+    #     'peg': ["pegen==0.3.0"]
+    # },
+    install_requires = ["colorama==0.4.6"],
+    entry_points = {
+        'console_scripts': ['magic-macro=magic_codec.macro:main'],
+    }
 )

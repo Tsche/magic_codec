@@ -202,11 +202,67 @@ class Interpreter:
         print("eval: ", code)
         return eval(code, self.globals, locals or self.globals)
 
-    def apply_macros(self, code: Iterable[Token], macros: list[Iterable[Token]]):
+    def apply_macros(self, code: Iterable[Token], macros: Iterable[Iterable[Token]]):
         call = synthesize_call_chain(macros, args=[Token(NAME, "__magic_macro_code_object")], convert_to="_Code")
         call_locals = {'__magic_macro_code_object': _Code(list(code)),
                        '_Code': _Code}
         return self.eval(call, call_locals).tokens
+
+
+def synthesize_token_list(tokens: list[Token]):
+    token_list = ', '.join(f"Token({token.type},{token.string!r})" for token in tokens)
+    code = f"Code([{token_list}])"
+    return list(tokenize(code))[:-1]
+
+def synthesize_call(function: str | Iterable[Token], expression: Iterable[Token]) -> list[Token]:
+    name = [Token(NAME, function)] if isinstance(function, str) else function
+    return [*name, Token(OP, '('), *expression, Token(OP, ')')]
+
+
+def synthesize_call_chain(calls: Iterable[Iterable[Token]], args: list[Token], convert_to: Optional[str] = None) -> list[Token]:
+    calls = list(calls)
+    call = synthesize_call(calls[0], synthesize_call_chain(calls[1:], args, convert_to)) if calls else args
+    return synthesize_call(convert_to, call) if convert_to else call
+
+
+def synthesize_constant(value: Any):
+    if value is None:
+        return
+    elif isinstance(value, Token):
+        if value.string == "None":
+            return
+        yield value
+    elif isinstance(value, tuple):
+        if len(value) != 2:
+            raise SyntaxError("Can only return (str, int) 2-tuples in place of tokens")
+        if value[1] == "None":
+            return
+        yield Token(int(value[0]), str(value[1]))
+    elif isinstance(value, bool):
+        yield Token(NAME, str(value))
+    elif isinstance(value, (int, float)):
+        yield Token(NUMBER, str(value))
+    elif isinstance(value, str):
+        try:
+            node = _ast.parse(value, mode="eval")
+            if isinstance(node.body, _ast.Constant):
+                yield Token(STRING, value)
+            elif isinstance(node.body, _ast.Name):
+                yield Token(NAME, value)
+            else:
+                # string contains more than one token - insert all of them into the token stream
+                raise SyntaxError
+        except SyntaxError:
+            yield from tokenize(value)
+    elif isinstance(value, (list, Generator)):
+        # directly inject tokens into token stream
+        for item in value:
+            if not isinstance(item, (Token, tuple)):
+                raise SyntaxError("Expected list or generator of tokens to directly inject into the token stream")
+            yield from synthesize_constant(item)
+    else:
+        # couldn't find something to replace the constant with
+        raise SyntaxError(f"Unexpected macro return value {type(value)}")
 
 
 @dataclass
@@ -214,7 +270,7 @@ class Fragment(ABC):
     is_macro: bool
 
     @abstractmethod
-    def get_code(self) -> Iterable[Token]:
+    def get_code(self, drop_comments=False) -> Iterable[Token]:
         ...
 
     @abstractmethod
@@ -222,12 +278,12 @@ class Fragment(ABC):
         ...
 
 
-def get_code(fragment: Fragment | Iterable[Fragment]) -> Iterable[Token]:
+def get_code(fragment: Fragment | Iterable[Fragment], drop_comments = False) -> Iterable[Token]:
     if isinstance(fragment, Fragment):
-        yield from fragment.get_code()
+        yield from fragment.get_code(drop_comments)
     else:
         for frag in fragment:
-            yield from frag.get_code()
+            yield from frag.get_code(drop_comments)
 
 
 def evaluate(interpreter: Interpreter, fragment: Fragment | Iterable[Fragment]) -> Iterable[Token]:
@@ -239,35 +295,59 @@ def evaluate(interpreter: Interpreter, fragment: Fragment | Iterable[Fragment]) 
 
 
 @dataclass
+class CodeFragment(Fragment):
+    code: list[Token]
+
+    def get_code(self, drop_comments = False) -> Iterable[Token]:
+        for token in self.code:
+            if token.type != COMMENT:
+                # unconditionally yield everything that isn't a comment
+                yield token
+            elif not drop_comments:
+                # only yield comments if instructed to do so
+                yield token
+
+    def evaluate(self, interpreter: Interpreter) -> Iterable[Token]:
+        yield from self.get_code(True)
+
+
+@dataclass
 class Decorator:
-    named_expression: list[Fragment]
+    named_expression: CodeFragment
     is_macro: bool = False
     is_macro_keyword: bool = False
 
-    def get_code(self) -> Iterable[Token]:
+    def get_code(self, drop_comments = False) -> Iterable[Token]:
         yield Token(OP, '@')
-        for fragment in self.named_expression:
-            yield from fragment.get_code()
+        yield from self.named_expression.get_code(drop_comments)
         yield Token(NEWLINE, '\n')
 
 
 @dataclass
 class FunctionDefinition(Fragment):
-    decorators: list[Decorator]
+    decorators: list[Decorator | CodeFragment]
     head: list[Fragment]
     body: list[Fragment]
 
-    def get_code(self) -> Iterable[Token]:
+    def get_code(self, drop_comments = False) -> Iterable[Token]:
         for item in (*self.decorators, *self.head, *self.body):
-            yield from item.get_code()
+            yield from item.get_code(drop_comments)
 
     def evaluate(self, interpreter: Interpreter) -> Iterable[Token]:
-        # assert not self.is_macro, "New macros cannot appear here"
+        assert not self.is_macro, "New macros cannot appear here"
 
-        macro_decorators = [list(get_code(decorator.named_expression))
-                            for decorator in self.decorators if decorator.is_macro]
-        decorators = [token for decorator in self.decorators if not decorator.is_macro
-                      for token in decorator.get_code()]
+        macro_decorators: list[list[Token]] = []
+        decorators: list[Token] = []
+        for decorator in self.decorators:
+            if isinstance(decorator, Decorator) and decorator.is_macro:
+                # make sure to drop comments from macro decorators
+                code = get_code(decorator.named_expression, True)
+                # TODO expand macro names
+                macro_decorators.append(list(code))
+            else:
+                # never treat comments etc as macro code
+                decorators.extend(decorator.get_code())
+
         head = get_code(self.head)
         body = evaluate(interpreter, self.body)
 
@@ -277,21 +357,16 @@ class FunctionDefinition(Fragment):
         return [*decorators, *head, *body]
 
 
-def to_token_list(tokens: list[Token]):
-    token_list = ', '.join(f"Token({token.type},{token.string!r})" for token in tokens)
-    code = f"Code([{token_list}])"
-    return list(tokenize(code))[:-1]
-
 @dataclass
 class MacroInvocation(Fragment):
     name: str
     args: list[Token]
 
-    def get_code(self) -> Iterable[Token]:
+    def get_code(self, drop_comments = False) -> Iterable[Token]:
         yield Token(NAME, self.name)
         if self.args:
             yield Token(OP, '(')
-            yield from to_token_list(self.args[1:-1])
+            yield from synthesize_token_list(self.args[1:-1])
             yield Token(OP, ')')
 
     def evaluate(self, interpreter: Interpreter) -> Iterable[Token]:
@@ -307,25 +382,16 @@ class MacroStatement(Fragment):
     macro: MacroInvocation
     code: list[Fragment]
 
-    def get_code(self) -> Iterable[Token]:
-        yield from get_code(self.macro)
+    def get_code(self, drop_comments = False) -> Iterable[Token]:
+        yield from get_code(self.macro, drop_comments)
         yield Token(OP, ':')
-        yield from get_code(self.code)
+        yield from get_code(self.code, drop_comments)
 
     def evaluate(self, interpreter: Interpreter) -> Iterable[Token]:
         code = evaluate(interpreter, self.code)
-        yield from interpreter.apply_macros(code, [self.macro.get_code()])
+        yield from interpreter.apply_macros(code, [self.macro.get_code(True)])
 
 
-@dataclass
-class CodeFragment(Fragment):
-    code: list[Token]
-
-    def get_code(self) -> Iterable[Token]:
-        yield from self.code
-
-    def evaluate(self, interpreter: Interpreter) -> Iterable[Token]:
-        yield from self.code
 
 
 class Parser(TokenStream):
@@ -348,18 +414,27 @@ class Parser(TokenStream):
             op = self.expect((OP, '='))
             return [CodeFragment(True, [Token(NAME, name), op]), *Parser(self.consume_line()).parse_line(True)]
 
+    def parse_suite(self) -> Iterable[Token]:
+        if self.peek().type in (COMMENT, NL, NEWLINE):
+            yield from self.consume_while(([COMMENT, NL, NEWLINE], ...))
+            yield from self.consume_balanced((INDENT, ...), (DEDENT, ...))
+        else:
+            yield from self.consume_line()
+
     def parse_decorator(self):
         with self.alt:
             self.expect((OP, '@'))
-            if named_expression := self.consume_line(with_newline=False):
-                parser = Parser(named_expression)
+            if raw_expression := self.consume_line(with_newline=True):
+                parser = Parser(raw_expression)
                 is_macro = False
                 is_macro_keyword = False
+
+                expr = []
                 with parser.alt:
                     name = parser.expect((NAME, ...))
                     if name.string == "macro":
                         # special case `macro` decorator to mark functions as macros
-                        is_macro = False
+                        is_macro = True
                         is_macro_keyword = True
 
                     with parser.alt:
@@ -367,22 +442,24 @@ class Parser(TokenStream):
                         parser.expect((OP, '!'))
                         is_macro = True
 
-                    # ? note that PEP 614 (https://peps.python.org/pep-0614/) significantly lifted the restrictions
-                    # ? on what can appear in a decorator expression. In future versions the macro preprocessor
-                    # ? could properly parse named expressions to look for macro invocations.
+                    #? note that PEP 614 (https://peps.python.org/pep-0614/) significantly lifted the restrictions
+                    #? on what can appear in a decorator expression. In future versions the macro preprocessor
+                    #? could properly parse named expressions to look for macro invocations.
+                    expr.append(name)
 
-                parser.reset(0)
-                return Decorator(list(parser.parse_line()), is_macro, is_macro_keyword)
+                # consume the rest of the line
+                # TODO: expand macro invocations in decorator args?
+                expr.extend(parser.consume_line())
+                return Decorator(CodeFragment(is_macro, expr), is_macro, is_macro_keyword)
             raise ParseError("named_expression expected after `@`")
+        
+        with self.alt:
+            # decorators might be interleaved with comments, make sure to parse these as well
+            if self.peek().type == COMMENT:
+                return CodeFragment(False, self.consume_line())
+            return CodeFragment(False, [self.expect((COMMENT, ...))])
 
         return None
-
-    def parse_suite(self) -> Iterable[Token]:
-        if self.peek().type in (COMMENT, NL, NEWLINE):
-            yield from self.consume_while(([COMMENT, NL, NEWLINE], ...))
-            yield from self.consume_balanced((INDENT, ...), (DEDENT, ...))
-        else:
-            yield from self.consume_line()
 
     def parse_decorators(self):
         while decorator := self.parse_decorator():
@@ -407,6 +484,7 @@ class Parser(TokenStream):
         head.append(Token(NAME, name))
         # args
         if self.peek() == (OP, '('):
+            # TODO expand macros in default arguments?
             head.extend(self.consume_balanced((OP, '('), (OP, ')')))
 
         if self.peek() == (OP, '->'):
@@ -453,6 +531,7 @@ class Parser(TokenStream):
             elif fnc := self.parse_function():
                 if self.indent != 0 and fnc.is_macro:
                     # function-like macro only allowed at module scope
+                    # TODO fail
                     fnc.is_macro = False
                 yield fnc
             elif statement := self.parse_macro_statement():
@@ -502,56 +581,6 @@ class Parser(TokenStream):
             yield CodeFragment(is_macro, fragment)
 
 
-def synthesize_call(function: str | Iterable[Token], expression: list[Token]) -> list[Token]:
-    name = [Token(NAME, function)] if isinstance(function, str) else function
-    return [*name, Token(OP, '('), *expression, Token(OP, ')')]
-
-
-def synthesize_call_chain(calls: list[Iterable[Token]], args: list[Token], convert_to: Optional[str] = None) -> list[Token]:
-    call = synthesize_call(calls[0], synthesize_call_chain(calls[1:], args, convert_to)) if calls else args
-    return synthesize_call(convert_to, call) if convert_to else call
-
-
-def synthesize_constant(value: Any):
-    if value is None:
-        return
-    elif isinstance(value, Token):
-        if value.string == "None":
-            return
-        yield value
-    elif isinstance(value, tuple):
-        if len(value) != 2:
-            raise SyntaxError("Can only return (str, int) 2-tuples in place of tokens")
-        if value[1] == "None":
-            return
-        yield Token(int(value[0]), str(value[1]))
-    elif isinstance(value, bool):
-        yield Token(NAME, str(value))
-    elif isinstance(value, (int, float)):
-        yield Token(NUMBER, str(value))
-    elif isinstance(value, str):
-        try:
-            node = _ast.parse(value, mode="eval")
-            if isinstance(node.body, _ast.Constant):
-                yield Token(STRING, value)
-            elif isinstance(node.body, _ast.Name):
-                yield Token(NAME, value)
-            else:
-                # string contains more than one token - insert all of them into the token stream
-                raise SyntaxError
-        except SyntaxError:
-            yield from tokenize(value)
-    elif isinstance(value, (list, Generator)):
-        # directly inject tokens into token stream
-        for item in value:
-            if not isinstance(item, (Token, tuple)):
-                raise SyntaxError("Expected list or generator of tokens to directly inject into the token stream")
-            yield from synthesize_constant(item)
-    else:
-        # couldn't find something to replace the constant with
-        raise SyntaxError(f"Unexpected macro return value {type(value)}")
-
-
 def transform(source: str, source_path: Optional[Path] = None, macro_only: bool = False):
     macro_code = []
     code = []
@@ -563,7 +592,8 @@ def transform(source: str, source_path: Optional[Path] = None, macro_only: bool 
 
     for node in parser.parse():
         if isinstance(node, Fragment) and node.is_macro:
-            fragment = list(node.evaluate(interpreter))
+            # TODO evaluate here?
+            fragment = list(node.get_code(False))
             interpreter.exec(fragment)
             macro_code.extend(fragment)
             continue
@@ -607,6 +637,7 @@ def main():
     args_parser.add_argument("source")
     args_parser.add_argument("--syntax-only", action="store_true")
     args_parser.add_argument("--preprocessor", action="store_true")
+    args_parser.add_argument("--run", action="store_true")
 
     args = args_parser.parse_args()
     source = Path(args.source)
@@ -617,10 +648,14 @@ def main():
         print_syntax(tokens)
         return
 
-    macro_code, code = transform(raw_source, source_path=source)
     if args.preprocessor:
+        macro_code, _ = transform(raw_source, source_path=source, macro_only=True)
         print(untokenize(macro_code))
+    elif args.run:
+        _, code = transform(raw_source, source_path=source)
+        eval(untokenize(code))
     else:
+        _, code = transform(raw_source, source_path=source)
         print(untokenize(code))
 
 
