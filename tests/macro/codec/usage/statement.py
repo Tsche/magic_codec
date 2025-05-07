@@ -17,5 +17,3 @@ try:
     print("x")
 finally!:
     print("hi")
-
-used_in_macro!(print("x"))

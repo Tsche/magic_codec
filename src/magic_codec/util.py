@@ -208,6 +208,9 @@ class Token(namedtuple("Token", ["type", "string"])):
     def __str__(self):
         return f"({TokenNames.get(self.type, self.type)}, {self.string!r})"
 
+    def __repr__(self):
+        return f"Token{str(self)}"
+
     def __eq__(self, other: object | TokenQuery):
         if isinstance(other, Sized) and len(other) == 2 and isinstance(other, Iterable):
             query_type, query_string = other
@@ -244,6 +247,9 @@ class Tokenizer:
         self.remove_indent = False
 
     def tokenize(self, code: str, with_endmarker: bool = False) -> Iterable[Token]:
+        # workaround: don't yield a terminating newline if code contains no newlines
+        no_newlines = '\n' not in code
+
         for current in generate_tokens(StringIO(code).readline):
             if current.type == token.ENDMARKER and not with_endmarker:
                 break
@@ -268,6 +274,8 @@ class Tokenizer:
             elif current.type in (token.NL, token.NEWLINE):
                 text = '\n'
                 self.remove_indent = True
+                if no_newlines:
+                    continue
             elif current.type == token.INDENT:
                 self.indents.append(current.string)
             elif current.type == token.DEDENT:
@@ -280,7 +288,7 @@ class Tokenizer:
 class Untokenizer:
     def __init__(self, indent: Optional[list[int]] = None):
         self.indents: list[int] = indent or []
-        self.last_type = 0
+        self.last_type: int = 0
 
     def untokenize(self, tokens: Iterable[Token]) -> str:
         fragments = []
@@ -305,7 +313,8 @@ class Untokenizer:
             elif self.last_type in (token.NL, token.NEWLINE) and self.indents:
                 fragments.append(self.indents[-1] * ' ')
 
-            if getattr(current, 'offset', None) is None and must_insert_space(self.last_type, current):
+            # if getattr(current, 'offset', None) is None and 
+            if must_insert_space(self.last_type, current) and not getattr(current, 'offset', 0):
                 # ensure spacing
                 fragments.append(' ')
 

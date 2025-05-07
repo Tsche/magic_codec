@@ -5,4 +5,5 @@ def foo!(tokens):
 
 class Bar!: ...
 
-x! = 42
+# error: this is a macro use of x!
+#x! = 42

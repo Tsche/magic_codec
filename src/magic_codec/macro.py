@@ -12,7 +12,6 @@ from typing import Any, Callable, Generator, Iterable, Optional
 import re
 import sys
 import traceback
-import inspect
 from keyword import iskeyword, issoftkeyword
 from magic_codec.util import Cancellation, Code, ParseError, Token, TokenStream, Untokenizer, tokenize, untokenize
 
@@ -47,7 +46,6 @@ class NodeTransformer(_ast.NodeTransformer, metaclass=NodeTransformerMeta):
         # ensure a new line after the new code segment
         # for some reason round-tripping messes with newlines
         yield Token(NEWLINE, '\n')
-
 
 def macro(fnc=None, /, eval_args=False, **kwargs):
     """ This decorator does nothing. It is only used to flag functions and classes as macros. """
@@ -173,8 +171,8 @@ class Interpreter:
     def __init__(self):
         self.globals: dict[str, Any] = self.__default_globals
         self.macros: dict[str, Any] = {}
-        self.install_excepthook(handle_exception)
-        self.install_importhook()
+        # self.install_excepthook(handle_exception)
+        # self.install_importhook()
 
     def setup_imports(self, source_path: Path):
         if not source_path.is_dir():
@@ -199,7 +197,6 @@ class Interpreter:
 
     def eval(self, tokens: Iterable[Token], locals=None):
         code = untokenize(tokens)
-        print("eval: ", code)
         return eval(code, self.globals, locals or self.globals)
 
     def apply_macros(self, code: Iterable[Token], macros: Iterable[Iterable[Token]]):
@@ -308,7 +305,7 @@ class CodeFragment(Fragment):
                 yield token
 
     def evaluate(self, interpreter: Interpreter) -> Iterable[Token]:
-        yield from self.get_code(True)
+        yield from self.get_code()
 
 
 @dataclass
@@ -320,7 +317,6 @@ class Decorator:
     def get_code(self, drop_comments = False) -> Iterable[Token]:
         yield Token(OP, '@')
         yield from self.named_expression.get_code(drop_comments)
-        yield Token(NEWLINE, '\n')
 
 
 @dataclass
@@ -334,8 +330,6 @@ class FunctionDefinition(Fragment):
             yield from item.get_code(drop_comments)
 
     def evaluate(self, interpreter: Interpreter) -> Iterable[Token]:
-        assert not self.is_macro, "New macros cannot appear here"
-
         macro_decorators: list[list[Token]] = []
         decorators: list[Token] = []
         for decorator in self.decorators:
@@ -348,8 +342,8 @@ class FunctionDefinition(Fragment):
                 # never treat comments etc as macro code
                 decorators.extend(decorator.get_code())
 
-        head = get_code(self.head)
-        body = evaluate(interpreter, self.body)
+        head = list(get_code(self.head))
+        body = list(evaluate(interpreter, self.body))
 
         if macro_decorators:
             body = interpreter.apply_macros(body, macro_decorators)
@@ -407,12 +401,12 @@ class Parser(TokenStream):
             # TODO handle bang names
             return [CodeFragment(True, [kind, *self.consume_line()])]
 
-        with self.alt:
-            # object-like macro
-            if not (name := self.parse_macro_name()):
-                raise Cancellation
-            op = self.expect((OP, '='))
-            return [CodeFragment(True, [Token(NAME, name), op]), *Parser(self.consume_line()).parse_line(True)]
+        # with self.alt:
+        #     # object-like macro
+        #     if not (name := self.parse_macro_name()):
+        #         raise Cancellation
+        #     op = self.expect((OP, '='))
+        #     return [CodeFragment(True, [Token(NAME, name), op]), *Parser(self.consume_line()).parse_line(True)]
 
     def parse_suite(self) -> Iterable[Token]:
         if self.peek().type in (COMMENT, NL, NEWLINE):
@@ -434,7 +428,8 @@ class Parser(TokenStream):
                     name = parser.expect((NAME, ...))
                     if name.string == "macro":
                         # special case `macro` decorator to mark functions as macros
-                        is_macro = True
+                        #! do not flag this is_macro, otherwise it will be applied early
+                        is_macro = False
                         is_macro_keyword = True
 
                     with parser.alt:
@@ -497,12 +492,12 @@ class Parser(TokenStream):
         with self.alt:
             decorators = list(self.parse_decorators())
             is_macro, head = self.parse_function_head()
-            is_macro |= any(decorator.is_macro_keyword for decorator in decorators)
+            is_macro |= any(isinstance(decorator, Decorator) and decorator.is_macro_keyword for decorator in decorators)
 
-            body = self.parse_suite()
+            body = list(self.parse_suite())
             # expand macro invocations in the head
             head = list(Parser(head).parse_line())
-            # expand macros
+            # expand macros in the body
             body = list(Parser(body, indent=self.indent).parse())
 
             return FunctionDefinition(is_macro, decorators, head, body)
@@ -510,10 +505,13 @@ class Parser(TokenStream):
 
     def parse_macro_statement(self):
         with self.alt:
-            macro = self.parse_macro_invocation(True)
-            self.expect((OP, ':'))
-            body: list[Fragment] = list(Parser(self.parse_suite(), indent=self.indent).parse())
-            return MacroStatement(False, macro, body)
+            name = self.parse_macro_name()
+            with self.alt: 
+                macro = self.parse_macro_invocation(name, True)
+                self.expect((OP, ':'))
+                body: list[Fragment] = list(Parser(self.parse_suite(), indent=self.indent).parse())
+                return MacroStatement(False, macro, body)
+
         return None
 
     def parse(self):
@@ -545,8 +543,7 @@ class Parser(TokenStream):
         self.expect((OP, "!"))
         return mangle(name)
 
-    def parse_macro_invocation(self, is_macro: bool = False):
-        name = self.parse_macro_name()
+    def parse_macro_invocation(self, name: str, is_macro: bool = False):
         args = []
         if self.peek() == (OP, '('):
             # function-like macro call
@@ -568,7 +565,8 @@ class Parser(TokenStream):
                 continue
 
             with self.alt:
-                invocation = self.parse_macro_invocation(is_macro)
+                name = self.parse_macro_name()
+                invocation = self.parse_macro_invocation(name, is_macro)
                 if fragment:
                     yield CodeFragment(is_macro, fragment)
                     fragment = []
@@ -592,14 +590,19 @@ def transform(source: str, source_path: Optional[Path] = None, macro_only: bool 
 
     for node in parser.parse():
         if isinstance(node, Fragment) and node.is_macro:
-            # TODO evaluate here?
-            fragment = list(node.get_code(False))
+            fragment = node.evaluate(interpreter)
             interpreter.exec(fragment)
             macro_code.extend(fragment)
             continue
 
-        if not macro_only:
-            code.extend(node.evaluate(interpreter))
+        if macro_only:
+            continue
+        
+        code.extend(node.evaluate(interpreter))
+
+    if code and code[0].type == 62:
+        code = code[2:]
+
     return macro_code, code
 
 
@@ -653,7 +656,7 @@ def main():
         print(untokenize(macro_code))
     elif args.run:
         _, code = transform(raw_source, source_path=source)
-        eval(untokenize(code))
+        exec(untokenize(code))
     else:
         _, code = transform(raw_source, source_path=source)
         print(untokenize(code))
