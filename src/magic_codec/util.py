@@ -313,7 +313,6 @@ class Untokenizer:
             elif self.last_type in (token.NL, token.NEWLINE) and self.indents:
                 fragments.append(self.indents[-1] * ' ')
 
-            # if getattr(current, 'offset', None) is None and 
             if must_insert_space(self.last_type, current) and not getattr(current, 'offset', 0):
                 # ensure spacing
                 fragments.append(' ')

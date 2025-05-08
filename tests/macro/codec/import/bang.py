@@ -14,4 +14,5 @@ from! token import! OP
 from token import! NL as N
 from token import! NEWLINE
 
-from! .macro.foo import FOO
+import token
+from token import OP

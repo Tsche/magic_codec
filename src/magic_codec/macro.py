@@ -58,6 +58,7 @@ def macro(fnc=None, /, eval_args=False, **kwargs):
 
         def __call__(self, *args, **kwds):
             if eval_args and not kwargs and len(args) == 1 and isinstance(args[0], Code):
+                # only received a single argument of code type
                 code_object: Code = args[0]
                 call = synthesize_call([Token(NAME, "self"), Token(OP, '.'), Token(NAME, 'fnc')], 
                                        list(code_object.tokens))
@@ -160,6 +161,7 @@ class Interpreter:
     __default_globals = {
         # 'tokenize': tokenize,
         # 'ast': _ast,
+        "__name__": "__main__",
         'Token': Token,
         'Code': Code,
         'NodeTransformer': NodeTransformer,
@@ -172,20 +174,29 @@ class Interpreter:
         self.globals: dict[str, Any] = self.__default_globals
         self.macros: dict[str, Any] = {}
         # self.install_excepthook(handle_exception)
-        # self.install_importhook()
+        self.install_importhook()
+
+
+    def execute_fnc(self, fnc, *args, **kwargs):
+        self.exec(tokenize("__fn(*__args, **__kwargs)"), {'__fn': fnc, '__args': args, '__kwargs': kwargs})
 
     def setup_imports(self, source_path: Path):
-        if not source_path.is_dir():
-            source_path = source_path.parent
-        code = f"import sys; sys.path.insert(0, '{source_path}')"
-        self.exec(tokenize(code))
+        self.globals["__file__"] = source_path
+        
+        # def modify_path(path):
+        #     import sys
+        #     sys.path.insert(0, str(path))
+        
+        # self.execute_fnc(modify_path, source_path.parent.absolute())
 
     def install_excepthook(self, hook: Callable):
-        code = "import sys; sys.excepthook=__excepthook"
-        self.exec(tokenize(code), {'__excepthook': hook})
+        def install_hook(hook_):
+            import sys
+            sys.excepthook = hook_
+        self.execute_fnc(install_hook, hook)
 
     def install_importhook(self):
-        self.exec(tokenize("__install_import_hook()"), {'__install_import_hook': install_import_hook})
+        self.execute_fnc(install_import_hook)
 
     def reset(self):
         self.globals = self.__default_globals
@@ -393,20 +404,10 @@ class Parser(TokenStream):
         super().__init__(iterable)
         self.indent: int = indent
 
-    def parse_macro_fragment(self):
-        with self.alt:
-            # imports within the preprocessor
-            kind = self.expect((NAME, ["import", "from"]))
-            self.expect((OP, '!'))
-            # TODO handle bang names
-            return [CodeFragment(True, [kind, *self.consume_line()])]
-
-        # with self.alt:
-        #     # object-like macro
-        #     if not (name := self.parse_macro_name()):
-        #         raise Cancellation
-        #     op = self.expect((OP, '='))
-        #     return [CodeFragment(True, [Token(NAME, name), op]), *Parser(self.consume_line()).parse_line(True)]
+    def parse_macro_name(self):
+        name = self.expect((NAME, ...)).string
+        self.expect((OP, "!"))
+        return mangle(name)
 
     def parse_suite(self) -> Iterable[Token]:
         if self.peek().type in (COMMENT, NL, NEWLINE):
@@ -502,46 +503,56 @@ class Parser(TokenStream):
 
             return FunctionDefinition(is_macro, decorators, head, body)
         return None
+ 
+    def parse_import(self):
+        with self.alt:
+            # imports within the preprocessor
+            is_macro = False
+            
+            kind = self.expect((NAME, ["import", "from"])).string
+            if self.maybe((OP, '!')):
+                is_macro = True
+            
+            package = []
+            # parse package
+            while current := self.peek():
+                if kind == "from" and current == (NAME, "import"):
+                    # consume "import"
+                    self.next()
+                    if self.maybe((OP, '!')):
+                        is_macro = True
+                    break
+                
+                if current.type in (NL, NEWLINE):
+                    break
+
+                package.append(self.next())
+            
+            symbols = []
+            if kind == "from":
+                # parse symbol list
+                ...
+            # TODO handle bang names, handle `as`, handle comma
+            symbols = self.consume_line()
+
+            code = [Token(NAME, kind)]
+            code.extend(package)
+            if kind == "from":
+                code.append(Token(NAME, "import"))
+            code.extend(symbols)
+
+            return [CodeFragment(is_macro, code)]
+        return None
 
     def parse_macro_statement(self):
         with self.alt:
             name = self.parse_macro_name()
-            with self.alt: 
-                macro = self.parse_macro_invocation(name, True)
-                self.expect((OP, ':'))
-                body: list[Fragment] = list(Parser(self.parse_suite(), indent=self.indent).parse())
-                return MacroStatement(False, macro, body)
+            macro = self.parse_macro_invocation(name, True)
+            self.expect((OP, ':'))
+            body: list[Fragment] = list(Parser(self.parse_suite(), indent=self.indent).parse())
+            return MacroStatement(False, macro, body)
 
         return None
-
-    def parse(self):
-        while (current := self.peek()) and current.type != ENDMARKER:
-            # track current indentation
-            if current.type == INDENT:
-                self.indent += 1
-                yield CodeFragment(False, [self.next()])
-            elif current.type == DEDENT:
-                self.indent -= 1
-                yield CodeFragment(False, [self.next()])
-            elif self.indent == 0 and (code := self.parse_macro_fragment()):
-                # macro import or object-like macro
-                yield from code
-            elif fnc := self.parse_function():
-                if self.indent != 0 and fnc.is_macro:
-                    # function-like macro only allowed at module scope
-                    # TODO fail
-                    fnc.is_macro = False
-                yield fnc
-            elif statement := self.parse_macro_statement():
-                yield statement
-            else:
-                # ensure next iteration starts on a new line
-                yield from self.parse_line()
-
-    def parse_macro_name(self):
-        name = self.expect((NAME, ...)).string
-        self.expect((OP, "!"))
-        return mangle(name)
 
     def parse_macro_invocation(self, name: str, is_macro: bool = False):
         args = []
@@ -577,6 +588,31 @@ class Parser(TokenStream):
 
         if fragment:
             yield CodeFragment(is_macro, fragment)
+
+    def parse(self):
+        while (current := self.peek()) and current.type != ENDMARKER:
+            # track current indentation
+            if current.type == INDENT:
+                self.indent += 1
+                yield CodeFragment(False, [self.next()])
+            elif current.type == DEDENT:
+                self.indent -= 1
+                yield CodeFragment(False, [self.next()])
+            elif self.indent == 0 and (code := self.parse_import()):
+                # macro import or object-like macro
+                yield from code
+            elif fnc := self.parse_function():
+                if self.indent != 0 and fnc.is_macro:
+                    # function-like macro only allowed at module scope
+                    # TODO fail
+                    fnc.is_macro = False
+                yield fnc
+            elif statement := self.parse_macro_statement():
+                yield statement
+            else:
+                # ensure next iteration starts on a new line
+                tokens = list(self.parse_line())
+                yield from tokens
 
 
 def transform(source: str, source_path: Optional[Path] = None, macro_only: bool = False):
