@@ -1,11 +1,7 @@
---- ../src/magic_codec/macros/grammar/python.peg	2025-05-11 01:22:43.210499460 +0200
-+++ ../src/magic_codec/macros/grammar/macro.peg	2025-05-11 07:58:39.209564419 +0200
-@@ -1,56 +1,11 @@
- # PEG grammar for Python
- 
--@class PythonParser
-+@import "python.gram"
-+@class MacroPythonParser
+--- src/magic_codec/grammar/python_orig.peg	2025-05-11 08:33:16.708417144 +0200
++++ src/magic_codec/grammar/python.peg	2025-05-11 23:16:44.422478797 +0200
+@@ -3,561 +3,8 @@
+ @class PythonParser
  
  @subheader'''
 -import enum
@@ -56,28 +52,51 @@
 -    ast.NamedExpr: "named expression",
 -}
 -
-+from magic_codec.macros.parser import *
-+from magic_codec.macros.ast import *
- 
- def parse_file(
-     path: str,
-@@ -68,7 +23,7 @@
-             tokenize.generate_tokens(f.readline)
-         )
-         tokenizer = Tokenizer(tok_stream, verbose=verbose, path=path)
+-
+-def parse_file(
+-    path: str,
+-    py_version: Optional[tuple]=None,
+-    token_stream_factory: Optional[
+-        Callable[[Callable[[], str]], Iterator[tokenize.TokenInfo]]
+-    ] = None,
+-    verbose:bool = False,
+-) -> ast.Module:
+-    """Parse a file."""
+-    with open(path) as f:
+-        tok_stream = (
+-            token_stream_factory(f.readline)
+-            if token_stream_factory else
+-            tokenize.generate_tokens(f.readline)
+-        )
+-        tokenizer = Tokenizer(tok_stream, verbose=verbose, path=path)
 -        parser = PythonParser(
-+        parser = MacroPythonParser(
-             tokenizer,
-             verbose=verbose,
-             filename=os.path.basename(path),
-@@ -93,471 +48,9 @@
-         tokenize.generate_tokens(io.StringIO(source).readline)
-     )
-     tokenizer = Tokenizer(tok_stream, verbose=verbose)
+-            tokenizer,
+-            verbose=verbose,
+-            filename=os.path.basename(path),
+-            py_version=py_version
+-        )
+-        return parser.parse("file")
+-
+-
+-def parse_string(
+-    source: str,
+-    mode: Union[Literal["eval"], Literal["exec"]],
+-    py_version: Optional[tuple]=None,
+-    token_stream_factory: Optional[
+-        Callable[[Callable[[], str]], Iterator[tokenize.TokenInfo]]
+-    ] = None,
+-    verbose:bool = False,
+-) -> Any:
+-    """Parse a string."""
+-    tok_stream = (
+-        token_stream_factory(io.StringIO(source).readline)
+-        if token_stream_factory else
+-        tokenize.generate_tokens(io.StringIO(source).readline)
+-    )
+-    tokenizer = Tokenizer(tok_stream, verbose=verbose)
 -    parser = PythonParser(tokenizer, verbose=verbose, py_version=py_version)
-+    parser = MacroPythonParser(tokenizer, verbose=verbose, py_version=py_version)
-     return parser.parse(mode if mode == "eval" else "file")
- 
+-    return parser.parse(mode if mode == "eval" else "file")
+-
 -
 -class Target(enum.Enum):
 -    FOR_TARGETS = enum.auto()
@@ -540,364 +559,8 @@
 -        next_token = self._tokenizer.peek()
 -        raise self._build_syntax_error(message, next_token.start, next_token.end)
 -
++from magic_codec.macros.parser import *
++from magic_codec.macros.ast import *
  '''
  
  
-@@ -572,6 +65,30 @@
- func_type[ast.FunctionType]: '(' a=[type_expressions] ')' '->' b=expression NEWLINE* ENDMARKER { ast.FunctionType(argtypes=a, returns=b) }
- fstring[ast.Expr]: star_expressions
- 
-+# META RULES
-+# ==========
-+
-+KEYWORD: ~ { 
-+        (self._tokenizer.getnext() 
-+        if (tok := self._tokenizer.peek()).type == token.NAME 
-+        and tok.string in self.KEYWORDS else None)
-+    }
-+# this hack is equivalent to:
-+# KEYWORD:
-+    # | 'False' | 'None' | 'True' | 'and' | 'as' | 'assert' | 'async' | 'await' | 'break' | 'class' | 'continue' 
-+    # | 'def' | 'del' | 'elif' | 'else' | 'except' | 'finally' | 'for' | 'from' | 'global' | 'if' | 'import' 
-+    # | 'in' | 'is' | 'lambda' | 'nonlocal' | 'not' | 'or' | 'pass' | 'raise' | 'return' | 'try' | 'while' 
-+    # | 'with' | 'yield'
-+
-+ANY: ~ { self._tokenizer.getnext() }
-+# this hack is equivalent to:
-+# ANY:
-+    # | OP | NAME | STRING | NUMBER 
-+    # | keyword | SOFT_KEYWORD 
-+    # | NEWLINE 
-+    # | TYPE_COMMENT 
-+    # | FSTRING_START | FSTRING_MIDDLE | FSTRING_END 
-+
- # GENERAL STATEMENTS
- # ==================
- 
-@@ -608,6 +125,7 @@
-     | &'nonlocal' nonlocal_stmt
- 
- compound_stmt:
-+    | macro_stmt
-     | &('def' | '@' | 'async') function_def
-     | &'if' if_stmt
-     | &('class' | '@') class_def
-@@ -745,16 +263,43 @@
- # COMPOUND STATEMENTS
- # ===================
- 
-+# Unparsed elements
-+# -----------------
-+unparsed_atoms[list]:
-+    | a=unparsed_atom b=unparsed_atoms { UnparsedFragment([*a, *b]) }
-+    | a=unparsed_atom { UnparsedFragment([*a])}
-+
-+unparsed_atom:
-+    | a='{' ~atoms=[unparsed_atoms] b='}' { UnparsedFragment([a, *(atoms or []), b])}
-+    | a='[' ~atoms=[unparsed_atoms] b=']' { UnparsedFragment([a, *(atoms or []), b])}
-+    | a='(' ~atoms=[unparsed_atoms] b=')' { UnparsedFragment([a, *(atoms or []), b])}
-+    | a=(NAME | STRING | NUMBER | SOFT_KEYWORD | KEYWORD | NEWLINE | TYPE_COMMENT) { UnparsedFragment([a]) }
-+    | a=FSTRING_START b=unparsed_fstring_middle* c=FSTRING_END { UnparsedFragment([a, *b, c]) }
-+    | !'}' !']' !')' a=OP { UnparsedFragment([a]) }
-+
-+unparsed_fstring_middle:
-+    | a=FSTRING_MIDDLE { UnparsedFragment([a]) }
-+    | a=('{' | '}') { UnparsedFragment([a]) }
-+    | unparsed_atom
-+
-+unparsed_line: a=(!NEWLINE unparsed_atom)* b=NEWLINE { UnparsedFragment([*a, *b]) }
-+
-+unparsed_block[list] (memo):
-+    | a=NEWLINE b=INDENT ~c=unparsed_atoms d=DEDENT { UnparsedFragment([a, b, *c, d]) }
-+    | NEWLINE !INDENT { self.raise_indentation_error("expected an indented block") }
-+    | a=unparsed_atoms { a }
-+
- # Common elements
- # ---------------
--
-+macro_name:
-+    | a=(NAME|KEYWORD) '!' { MacroName(id=a.string, ctx=Load, LOCATIONS) }
- block[list] (memo):
-     | NEWLINE INDENT a=statements DEDENT { a }
-     | simple_stmts
-     | invalid_block
--
- decorators: decorator+
- decorator:
-+    | a=('@' f=dec_macro NEWLINE { f }) { a }
-     | a=('@' f=dec_maybe_call NEWLINE { f }) { a }
-     | a=('@' f=named_expression NEWLINE { f }) {
-         self.check_version((3, 9), "Generic decorator are",  a)
-@@ -767,19 +312,52 @@
- dec_primary:
-     | a=dec_primary '.' b=NAME { ast.Attribute(value=a, attr=b.string, ctx=Load, LOCATIONS) }
-     | a=NAME { ast.Name(id=a.string, ctx=Load, LOCATIONS) }
-+dec_macro:
-+    | a=macro_name '(' args=[unparsed_atoms] ')' {
-+        MacroCall(func=a, args=args or [], keywords=[], LOCATIONS)
-+     }
-+    | macro_name
-+
- 
- # Class definitions
- # -----------------
- 
--class_def[ast.ClassDef]:
--    | a=decorators b=class_def_raw { self.set_decorators(b, a) }
-+class_def[Union[ast.ClassDef, MacroClassDef]]:
-+    | a=decorators &'class' {
-+        self.set_decorators(self.maybe_parse(a, self.unparsed_class_def, self.class_def_raw), a)
-+     }
-     | class_def_raw
- 
--class_def_raw[ast.ClassDef]:
-+class_def_raw[Union[ast.ClassDef, MacroClassDef]]:
-+    | invalid_class_def_raw
-+    | 'class' a=NAME m=['!'] t=[type_params] b=['(' z=[arguments] ')' { z }] &&':' c=block {
-+        (
-+            (MacroClassDef if m else ast.ClassDef)(
-+                a.string,
-+                bases=b[0] if b else [],
-+                keywords=b[1] if b else [],
-+                body=c,
-+                decorator_list=[],
-+                type_params=t or [],
-+                LOCATIONS,
-+            )
-+            if sys.version_info >= (3, 12) else
-+            (MacroClassDef if m else ast.ClassDef)(
-+                a.string,
-+                bases=b[0] if b else [],
-+                keywords=b[1] if b else [],
-+                body=c,
-+                decorator_list=[],
-+                LOCATIONS,
-+            )
-+        )
-+     }
-+
-+unparsed_class_def[Union[ast.ClassDef, MacroClassDef]]:
-     | invalid_class_def_raw
--    | 'class' a=NAME t=[type_params] b=['(' z=[arguments] ')' { z }] &&':' c=block {
-+    | 'class' a=NAME m=['!'] t=[type_params] b=['(' z=[arguments] ')' { z }] &&':' c=unparsed_block {
-         (
--            ast.ClassDef(
-+            (MacroClassDef if m else ast.ClassDef)(
-                 a.string,
-                 bases=b[0] if b else [],
-                 keywords=b[1] if b else [],
-@@ -789,7 +367,7 @@
-                 LOCATIONS,
-             )
-             if sys.version_info >= (3, 12) else
--            ast.ClassDef(
-+            (MacroClassDef if m else ast.ClassDef)(
-                 a.string,
-                 bases=b[0] if b else [],
-                 keywords=b[1] if b else [],
-@@ -803,15 +381,68 @@
- # Function definitions
- # --------------------
- 
--function_def[Union[ast.FunctionDef, ast.AsyncFunctionDef]]:
--    | d=decorators f=function_def_raw { self.set_decorators(f, d) }
-+function_def[Union[ast.FunctionDef, ast.AsyncFunctionDef, MacroFunctionDef, MacroAsyncFunctionDef]]:
-+    | d=decorators &('def'|'async') { self.set_decorators(self.set_decorators(self.maybe_parse(a, self.unparsed_function_def, self.function_def_raw), a), d) }
-     | f=function_def_raw {self.set_decorators(f, [])}
- 
--function_def_raw[Union[ast.FunctionDef, ast.AsyncFunctionDef]]:
-+function_def_raw[Union[ast.FunctionDef, ast.AsyncFunctionDef, MacroFunctionDef, MacroAsyncFunctionDef]]:
-+    | invalid_def_raw
-+    | 'def' n=NAME m=['!'] t=[type_params] &&'(' params=[params] ')' a=['->' z=expression { z }] &&':' tc=[func_type_comment] b=block {
-+        (
-+            (MacroFunctionDef if m else ast.FunctionDef)(
-+                name=n.string,
-+                args=params or self.make_arguments(None, [], None, [], None),
-+                returns=a,
-+                body=b,
-+                type_comment=tc,
-+                type_params=t or [],
-+                LOCATIONS,
-+            ) if sys.version_info >= (3, 12) else
-+            (MacroFunctionDef if m else ast.FunctionDef)(
-+                name=n.string,
-+                args=params or self.make_arguments(None, [], None, [], None),
-+                returns=a,
-+                body=b,
-+                type_comment=tc,
-+                LOCATIONS,
-+            )
-+        )
-+     }
-+    | 'async' 'def' n=NAME m=['!'] t=[type_params] &&'(' params=[params] ')' a=['->' z=expression { z }] &&':' tc=[func_type_comment] b=block {
-+       (
-+            self.check_version(
-+                (3, 5),
-+                "Async functions are",
-+                (MacroAsyncFunctionDef if m else ast.AsyncFunctionDef)(
-+                    name=n.string,
-+                    args=params or self.make_arguments(None, [], None, [], None),
-+                    returns=a,
-+                    body=b,
-+                    type_comment=tc,
-+                    type_params=t or [],
-+                    LOCATIONS,
-+                )
-+            ) if sys.version_info >= (3, 12) else
-+            self.check_version(
-+                (3, 5),
-+                "Async functions are",
-+                (MacroAsyncFunctionDef if m else ast.AsyncFunctionDef)(
-+                    name=n.string,
-+                    args=params or self.make_arguments(None, [], None, [], None),
-+                    returns=a,
-+                    body=b,
-+                    type_comment=tc,
-+                    LOCATIONS,
-+                )
-+            )
-+       )
-+     }
-+
-+unparsed_function_def[Union[ast.FunctionDef, ast.AsyncFunctionDef, MacroFunctionDef, MacroAsyncFunctionDef]]:
-     | invalid_def_raw
--    | 'def' n=NAME t=[type_params] &&'(' params=[params] ')' a=['->' z=expression { z }] &&':' tc=[func_type_comment] b=block {
-+    | 'def' n=NAME m=['!'] t=[type_params] &&'(' params=[params] ')' a=['->' z=expression { z }] &&':' tc=[func_type_comment] b=unparsed_block {
-         (
--            ast.FunctionDef(
-+            (MacroFunctionDef if m else ast.FunctionDef)(
-                 name=n.string,
-                 args=params or self.make_arguments(None, [], None, [], None),
-                 returns=a,
-@@ -820,7 +451,7 @@
-                 type_params=t or [],
-                 LOCATIONS,
-             ) if sys.version_info >= (3, 12) else
--            ast.FunctionDef(
-+            (MacroFunctionDef if m else ast.FunctionDef)(
-                 name=n.string,
-                 args=params or self.make_arguments(None, [], None, [], None),
-                 returns=a,
-@@ -830,12 +461,12 @@
-             )
-         )
-      }
--    | 'async' 'def' n=NAME t=[type_params] &&'(' params=[params] ')' a=['->' z=expression { z }] &&':' tc=[func_type_comment] b=block {
-+    | 'async' 'def' n=NAME m=['!'] t=[type_params] &&'(' params=[params] ')' a=['->' z=expression { z }] &&':' tc=[func_type_comment] b=unparsed_block {
-        (
-             self.check_version(
-                 (3, 5),
-                 "Async functions are",
--                ast.AsyncFunctionDef(
-+                (MacroAsyncFunctionDef if m else ast.AsyncFunctionDef)(
-                     name=n.string,
-                     args=params or self.make_arguments(None, [], None, [], None),
-                     returns=a,
-@@ -848,7 +479,7 @@
-             self.check_version(
-                 (3, 5),
-                 "Async functions are",
--                ast.AsyncFunctionDef(
-+                (MacroAsyncFunctionDef if m else ast.AsyncFunctionDef)(
-                     name=n.string,
-                     args=params or self.make_arguments(None, [], None, [], None),
-                     returns=a,
-@@ -956,6 +587,7 @@
-     | 'elif' a=named_expression ':' b=block c=[else_block] { [ast.If(test=a, body=b, orelse=c or [], LOCATIONS)] }
- else_block[list]:
-     | invalid_else_stmt
-+    | &'else' a=macro_stmt { a }
-     | 'else' &&':' b=block { b }
- 
- # While statement
-@@ -1024,7 +656,8 @@
- 
- try_stmt[ast.Try]:
-     | invalid_try_stmt
--    | 'try' &&':' b=block f=finally_block {
-+    | &'try' a=macro_stmt { a }
-+    | 'try' &&':' b=block f=finally_block{
-         ast.Try(body=b, handlers=[], orelse=[], finalbody=f, LOCATIONS)
-      }
-     | 'try' &&':' b=block ex=except_block+ el=[else_block] f=[finally_block] {
-@@ -1059,8 +692,24 @@
-     | invalid_except_stmt
- finally_block[list]:
-     | invalid_finally_stmt
-+    | &'finally' a=macro_stmt { a }
-     | 'finally' &&':' a=block { a }
- 
-+# Macro statement
-+# ---------------
-+
-+macro_stmt_expr:
-+    | a=unparsed_atom b=macro_stmt_expr { UnparsedFragment([*a, *b]) }
-+    | !NEWLINE !':' unparsed_atom
-+
-+macro_stmt[MacroStmt]:
-+    | a=macro_name ':' b=unparsed_block { MacroStmt(expr=a, body=b) }
-+    | a=macro_name h=macro_stmt_expr ':' b=block {
-+        MacroStmt(expr=MacroCall(a, args=h, kwargs=[], LOCATIONS),
-+                  body=b)
-+     }
-+
-+
- # Match statement
- # ---------------
- 
-@@ -1529,7 +1178,16 @@
-     | 'await' a=primary { self.check_version((3, 5), "Await expressions are", ast.Await(a, LOCATIONS)) }
-     | primary
- 
-+# TODO
- primary:
-+    | a=macro_name '(' ~args=[unparsed_atoms] ')' {
-+        MacroCall(
-+            func=a,
-+            args=args or [],
-+            keywords=[],
-+            LOCATIONS,
-+        )
-+     }
-     | a=primary '.' b=NAME { ast.Attribute(value=a, attr=b.string, ctx=Load, LOCATIONS) }
-     | a=primary b=genexp { ast.Call(func=a, args=[b], keywords=[], LOCATIONS) }
-     | a=primary '(' b=[arguments] ')' {
-@@ -1602,6 +1260,7 @@
-         if sys.version_info >= (3, 9) else
-         ast.Constant(value=Ellipsis, kind=None, LOCATIONS)
-      }
-+    | token_literal
- 
- group:
-     | '(' a=(yield_expr | named_expression) ')' { a }
-@@ -1726,6 +1385,12 @@
- 
- set[ast.Set]: '{' a=star_named_expressions '}' { ast.Set(elts=a, LOCATIONS) }
- 
-+any_except_backtick: !'`' ANY
-+
-+token_literal:
-+    | '`' '`' '`' tokens=any_except_backtick* '`' '`' '`' { TokenLiteral(tokens) }
-+    | '`' tokens=any_except_backtick* '`' { TokenLiteral(tokens) }
-+
- # Dicts
- # -----
- 
-@@ -2361,14 +2026,14 @@
-         )
-      }
- invalid_def_raw[NoReturn]:
--    | ['async'] a='def' NAME  [type_params] '(' [params] ')' ['->' expression] ':' NEWLINE !INDENT {
-+    | ['async'] a='def' NAME ['!'] [type_params] '(' [params] ')' ['->' expression] ':' NEWLINE !INDENT {
-         self.raise_indentation_error(
-             f"expected an indented block after function definition on line {a.start[0]}"
-         )
-      }
- invalid_class_def_raw[NoReturn]:
--    | 'class' NAME [type_params] ['(' [arguments] ')'] NEWLINE { self.raise_syntax_error("expected ':'") }
--    | a='class' NAME  [type_params] ['(' [arguments] ')'] ':' NEWLINE !INDENT {
-+    | 'class' NAME ['!'] [type_params] ['(' [arguments] ')'] NEWLINE { self.raise_syntax_error("expected ':'") }
-+    | a='class' NAME  ['!'] [type_params] ['(' [arguments] ')'] ':' NEWLINE !INDENT {
-         self.raise_indentation_error(
-             f"expected an indented block after class definition on line {a.start[0]}"
-         )

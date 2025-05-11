@@ -13,7 +13,6 @@ def fetch_grammar():
 
 def patch_grammar():
     print("patching python grammar")
-    shutil.copy(GRAMMAR_PATH, GRAMMAR_PATH)
     subprocess.check_call(["patch", str(GRAMMAR_PATH), str(GRAMMAR_PATCH)])
 
 
