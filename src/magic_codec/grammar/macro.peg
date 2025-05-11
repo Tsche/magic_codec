@@ -1,0 +1,423 @@
+# Patch grammar for macro support
+
+@import "python.peg"
+@class MacroPythonParser
+
+@subheader'''
+from magic_codec.macros.parser import *
+from magic_codec.macros.ast import *
+'''
+
+# META RULES
+# ==========
+
+KEYWORD: ~ { 
+        (self._tokenizer.getnext() 
+        if (tok := self._tokenizer.peek()).type == token.NAME 
+        and tok.string in self.KEYWORDS else None)
+    }
+# this hack is equivalent to:
+# KEYWORD:
+    # | 'False' | 'None' | 'True' | 'and' | 'as' | 'assert' | 'async' | 'await' | 'break' | 'class' | 'continue' 
+    # | 'def' | 'del' | 'elif' | 'else' | 'except' | 'finally' | 'for' | 'from' | 'global' | 'if' | 'import' 
+    # | 'in' | 'is' | 'lambda' | 'nonlocal' | 'not' | 'or' | 'pass' | 'raise' | 'return' | 'try' | 'while' 
+    # | 'with' | 'yield'
+
+ANY: ~ { self._tokenizer.getnext() }
+# this hack is equivalent to:
+# ANY:
+    # | OP | NAME | STRING | NUMBER 
+    # | keyword | SOFT_KEYWORD 
+    # | NEWLINE 
+    # | TYPE_COMMENT 
+    # | FSTRING_START | FSTRING_MIDDLE | FSTRING_END 
+
+
+# GENERAL STATEMENTS
+# ==================
+
+compound_stmt:
+    | macro_stmt
+    | &('def' | '@' | 'async') function_def
+    | &'if' if_stmt
+    | &('class' | '@') class_def
+    | &('with' | 'async') with_stmt
+    | &('for' | 'async') for_stmt
+    | &'try' try_stmt
+    | &'while' while_stmt
+    | match_stmt
+
+# Unparsed elements
+# -----------------
+unparsed_atoms[list]:
+    | a=unparsed_atom b=unparsed_atoms { UnparsedFragment([*a, *b]) }
+    | a=unparsed_atom { UnparsedFragment([*a])}
+
+unparsed_atom:
+    | a='{' ~atoms=[unparsed_atoms] b='}' { UnparsedFragment([a, *(atoms or []), b])}
+    | a='[' ~atoms=[unparsed_atoms] b=']' { UnparsedFragment([a, *(atoms or []), b])}
+    | a='(' ~atoms=[unparsed_atoms] b=')' { UnparsedFragment([a, *(atoms or []), b])}
+    | a=(NAME | STRING | NUMBER | SOFT_KEYWORD | KEYWORD | NEWLINE | TYPE_COMMENT) { UnparsedFragment([a]) }
+    | a=FSTRING_START b=unparsed_fstring_middle* c=FSTRING_END { UnparsedFragment([a, *b, c]) }
+    | !'}' !']' !')' a=OP { UnparsedFragment([a]) }
+
+unparsed_fstring_middle:
+    | a=FSTRING_MIDDLE { UnparsedFragment([a]) }
+    | a=('{' | '}') { UnparsedFragment([a]) }
+    | unparsed_atom
+
+unparsed_line: a=(!NEWLINE unparsed_atom)* b=NEWLINE { UnparsedFragment([*a, *b]) }
+
+unparsed_block[list] (memo):
+    | a=NEWLINE b=INDENT ~c=unparsed_atoms d=DEDENT { UnparsedFragment([a, b, *c, d]) }
+    | NEWLINE !INDENT { self.raise_indentation_error("expected an indented block") }
+    | a=unparsed_atoms NEWLINE { a }
+
+ # Common elements
+ # ---------------
+
+macro_name:
+    | a=(NAME|KEYWORD) '!' { MacroName(id=a.string, ctx=Load, LOCATIONS) }
+
+maybe_macro:
+    | macro_name
+    | NAME
+
+decorator:
+    | a=('@' f=dec_macro NEWLINE { f }) { a }
+    | a=('@' f=dec_maybe_call NEWLINE { f }) { a }
+    | a=('@' f=named_expression NEWLINE { f }) {
+        self.check_version((3, 9), "Generic decorator are",  a)
+     }
+dec_macro:
+    | a=macro_name '(' args=[unparsed_atoms] ')' {
+        MacroCall(func=a.id, args=args or [], keywords=[], LOCATIONS)
+     }
+    | macro_name
+
+
+# Class definitions
+# -----------------
+
+class_def[Union[ClassDef]]:
+    | a=decorators &'class' {
+        self.set_decorators(a, self.unparsed_class_def, self.class_def_raw)
+     }
+    | class_def_raw
+
+class_def_raw[Union[ClassDef]]:
+    | invalid_class_def_raw
+    | 'class' a=maybe_macro t=[type_params] b=['(' z=[arguments] ')' { z }] &&':' c=block {
+        (
+            ClassDef(
+                a.string,
+                bases=b[0] if b else [],
+                keywords=b[1] if b else [],
+                body=c,
+                decorator_list=[],
+                type_params=t or [],
+                is_macro=isinstance(a, MacroName),
+                LOCATIONS,
+            )
+            if sys.version_info >= (3, 12) else
+            ClassDef(
+                a.string,
+                bases=b[0] if b else [],
+                keywords=b[1] if b else [],
+                body=c,
+                decorator_list=[],
+                is_macro=isinstance(a, MacroName),
+                LOCATIONS,
+            )
+        )
+     }
+
+unparsed_class_def[Union[ClassDef]]:
+    | invalid_class_def_raw
+    | 'class' a=maybe_macro t=[type_params] b=['(' z=[arguments] ')' { z }] &&':' c=unparsed_block {
+        (
+            ClassDef(
+                a.string,
+                bases=b[0] if b else [],
+                keywords=b[1] if b else [],
+                body=c,
+                decorator_list=[],
+                type_params=t or [],
+                is_macro=isinstance(a, MacroName),
+                LOCATIONS,
+            )
+            if sys.version_info >= (3, 12) else
+            ClassDef(
+                a.string,
+                bases=b[0] if b else [],
+                keywords=b[1] if b else [],
+                body=c,
+                decorator_list=[],
+                is_macro=isinstance(a, MacroName),
+                LOCATIONS,
+            )
+        )
+     }
+
+# Function definitions
+# --------------------
+
+function_def[Union[FunctionDef, AsyncFunctionDef]]:
+    | d=decorators &('def'|'async') { self.set_decorators(d, self.unparsed_function_def, self.function_def_raw) }
+    | function_def_raw
+
+function_def_raw[Union[FunctionDef, AsyncFunctionDef]]:
+    | invalid_def_raw
+    | 'def' n=maybe_macro t=[type_params] &&'(' params=[params] ')' a=['->' z=expression { z }] &&':' tc=[func_type_comment] b=block {
+        (
+            FunctionDef(
+                name=n.string,
+                args=params or self.make_arguments(None, [], None, [], None),
+                returns=a,
+                body=b,
+                type_comment=tc,
+                type_params=t or [],
+                decorator_list=[],
+                is_macro=isinstance(n, MacroName),
+                LOCATIONS,
+            ) if sys.version_info >= (3, 12) else
+            FunctionDef(
+                name=n.string,
+                args=params or self.make_arguments(None, [], None, [], None),
+                returns=a,
+                body=b,
+                type_comment=tc,
+                decorator_list=[],
+                is_macro=isinstance(n, MacroName),
+                LOCATIONS,
+            )
+        )
+     }
+    | 'async' 'def' n=maybe_macro t=[type_params] &&'(' params=[params] ')' a=['->' z=expression { z }] &&':' tc=[func_type_comment] b=block {
+       (
+            self.check_version(
+                (3, 5),
+                "Async functions are",
+                AsyncFunctionDef(
+                    name=n.string,
+                    args=params or self.make_arguments(None, [], None, [], None),
+                    returns=a,
+                    body=b,
+                    type_comment=tc,
+                    type_params=t or [],
+                    decorator_list=[],
+                    is_macro=isinstance(n, MacroName),
+                    LOCATIONS,
+                )
+            ) if sys.version_info >= (3, 12) else
+            self.check_version(
+                (3, 5),
+                "Async functions are",
+                AsyncFunctionDef(
+                    name=n.string,
+                    args=params or self.make_arguments(None, [], None, [], None),
+                    returns=a,
+                    body=b,
+                    type_comment=tc,
+                    decorator_list=[],
+                    is_macro=isinstance(n, MacroName),
+                    LOCATIONS,
+                )
+            )
+       )
+     }
+
+unparsed_function_def[Union[FunctionDef, AsyncFunctionDef]]:
+    | invalid_def_raw
+    | 'def' n=maybe_macro t=[type_params] &&'(' params=[params] ')' a=['->' z=expression { z }] &&':' tc=[func_type_comment] b=unparsed_block {
+        (
+            FunctionDef(
+                name=n.string,
+                args=params or self.make_arguments(None, [], None, [], None),
+                returns=a,
+                body=b,
+                type_comment=tc,
+                type_params=t or [],
+                decorator_list=[],
+                is_macro=isinstance(n, MacroName),
+                LOCATIONS,
+            ) if sys.version_info >= (3, 12) else
+            FunctionDef(
+                name=n.string,
+                args=params or self.make_arguments(None, [], None, [], None),
+                returns=a,
+                body=b,
+                type_comment=tc,
+                is_macro=isinstance(n, MacroName),
+                LOCATIONS,
+            )
+        )
+     }
+    | 'async' 'def' n=maybe_macro t=[type_params] &&'(' params=[params] ')' a=['->' z=expression { z }] &&':' tc=[func_type_comment] b=unparsed_block {
+       (
+            self.check_version(
+                (3, 5),
+                "Async functions are",
+                AsyncFunctionDef(
+                    name=n.string,
+                    args=params or self.make_arguments(None, [], None, [], None),
+                    returns=a,
+                    body=b,
+                    type_comment=tc,
+                    type_params=t or [],
+                    decorator_list=[],
+                    is_macro=isinstance(n, MacroName),
+                    LOCATIONS,
+                )
+            ) if sys.version_info >= (3, 12) else
+            self.check_version(
+                (3, 5),
+                "Async functions are",
+                AsyncFunctionDef(
+                    name=n.string,
+                    args=params or self.make_arguments(None, [], None, [], None),
+                    returns=a,
+                    body=b,
+                    type_comment=tc,
+                    decorator_list=[],
+                    is_macro=isinstance(n, MacroName),
+                    LOCATIONS,
+                )
+            )
+       )
+     }
+
+# Macro statement
+# ---------------
+
+macro_stmt_expr:
+    | a=unparsed_atom b=macro_stmt_expr { UnparsedFragment([*a, *b]) }
+    | !NEWLINE !':' unparsed_atom
+
+macro_stmt[MacroStmt]:
+    | a=macro_name ':' b=unparsed_block { MacroStmt(expr=a, body=b) }
+    | a=macro_name h=macro_stmt_expr ':' b=block {
+        MacroStmt(expr=MacroCall(a.id, args=h, kwargs=[], LOCATIONS),
+                  body=b)
+     }
+
+# If statement
+# ------------
+
+else_block[list]:
+    | invalid_else_stmt
+    | &'else' a=macro_stmt { a }
+    | 'else' &&':' b=block { b }
+
+# Try statement
+# -------------
+try_stmt[ast.Try]:
+    | invalid_try_stmt
+    | &'try' a=macro_stmt { a }
+    | 'try' &&':' b=block f=finally_block{
+        ast.Try(body=b, handlers=[], orelse=[], finalbody=f, LOCATIONS)
+     }
+    | 'try' &&':' b=block ex=except_block+ el=[else_block] f=[finally_block] {
+        ast.Try(body=b, handlers=ex, orelse=el or [], finalbody=f or [], LOCATIONS)
+     }
+    | 'try' &&':' b=block ex=except_star_block+ el=[else_block] f=[finally_block] {
+        self.check_version(
+            (3, 11),
+            "Exception groups are",
+            (
+                ast.TryStar(body=b, handlers=ex, orelse=el or [], finalbody=f or [], LOCATIONS)
+                if sys.version_info >= (3, 11)
+                else None
+            )
+        )
+     }
+
+# Except statement
+# ----------------
+finally_block[list]:
+    | invalid_finally_stmt
+    | &'finally' a=macro_stmt { a }
+    | 'finally' &&':' a=block { a }
+
+
+primary:
+    | a=macro_name '(' ~args=[unparsed_atoms] ')' {
+        MacroCall(
+            func=a.id,
+            args=args or [],
+            keywords=[],
+            LOCATIONS,
+        )
+     }
+    | a=primary '.' b=NAME { ast.Attribute(value=a, attr=b.string, ctx=Load, LOCATIONS) }
+    | a=primary b=genexp { ast.Call(func=a, args=[b], keywords=[], LOCATIONS) }
+    | a=primary '(' b=[arguments] ')' {
+        ast.Call(
+            func=a,
+            args=b[0] if b else [],
+            keywords=b[1] if b else [],
+            LOCATIONS,
+        )
+     }
+    | a=primary '[' b=slices ']' { ast.Subscript(value=a, slice=b, ctx=Load, LOCATIONS) }
+    | atom
+
+atom:
+    | a=NAME { ast.Name(id=a.string, ctx=Load, LOCATIONS) }
+    | 'True' {
+        ast.Constant(value=True, LOCATIONS)
+        if sys.version_info >= (3, 9) else
+        ast.Constant(value=True, kind=None, LOCATIONS)
+     }
+    | 'False' {
+        ast.Constant(value=False, LOCATIONS)
+        if sys.version_info >= (3, 9) else
+        ast.Constant(value=False, kind=None, LOCATIONS)
+     }
+    | 'None' {
+        ast.Constant(value=None, LOCATIONS)
+        if sys.version_info >= (3, 9) else
+        ast.Constant(value=None, kind=None, LOCATIONS)
+     }
+    | &(STRING|FSTRING_START) strings
+    | a=NUMBER {
+        ast.Constant(value=ast.literal_eval(a.string), LOCATIONS)
+        if sys.version_info >= (3, 9) else
+        ast.Constant(value=ast.literal_eval(a.string), kind=None, LOCATIONS)
+     }
+    | &'(' (tuple | group | genexp)
+    | &'[' (list | listcomp)
+    | &'{' (dict | set | dictcomp | setcomp)
+    | '...' {
+        ast.Constant(value=Ellipsis, LOCATIONS)
+        if sys.version_info >= (3, 9) else
+        ast.Constant(value=Ellipsis, kind=None, LOCATIONS)
+     }
+    | token_literal
+
+# Token Literal
+# -------------
+
+any_except_backtick: !'`' ANY
+
+token_literal:
+    | '`' '`' '`' tokens=any_except_backtick* '`' '`' '`' { TokenLiteral(tokens) }
+    | '`' tokens=any_except_backtick* '`' { TokenLiteral(tokens) }
+
+
+# Invalid Rules
+# -------------
+
+invalid_def_raw[NoReturn]:
+    | ['async'] a='def' NAME ['!'] [type_params] '(' [params] ')' ['->' expression] ':' NEWLINE !INDENT {
+        self.raise_indentation_error(
+            f"expected an indented block after function definition on line {a.start[0]}"
+        )
+     }
+invalid_class_def_raw[NoReturn]:
+    | 'class' NAME ['!'] [type_params] ['(' [arguments] ')'] NEWLINE { self.raise_syntax_error("expected ':'") }
+    | a='class' NAME  ['!'] [type_params] ['(' [arguments] ')'] ':' NEWLINE !INDENT {
+        self.raise_indentation_error(
+            f"expected an indented block after class definition on line {a.start[0]}"
+        )
+     }

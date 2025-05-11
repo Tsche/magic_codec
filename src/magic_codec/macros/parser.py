@@ -15,7 +15,7 @@ from typing import (
 )
 
 from magic_codec.macros.ast import (
-    MacroFunctionDef, MacroAsyncFunctionDef, MacroClassDef, MacroCall, FC, MacroName
+   MacroCall, FC, MacroName
 )
 
 from pegen.tokenizer import Tokenizer
@@ -334,27 +334,31 @@ class Parser(ParserBase):
                 level += 3
         return level
 
-    def set_fnc_macro(self, target: FC, decorators: list) -> FC:
-        is_macro = isinstance(target, (MacroFunctionDef, MacroAsyncFunctionDef))
+    def set_is_macro(self, target: FC, decorators: list) -> FC:
         for decorator in decorators:
             if ((isinstance(decorator, ast.Name) and decorator.id == "macro") or
                 (isinstance(decorator, ast.Call) and isinstance(decorator.func, ast.Name) and decorator.func.id == "macro")):
-                is_macro = True
+                target.is_macro = True
                 break
-        if is_macro:
-            is_async = isinstance(target, (ast.AsyncFunctionDef, MacroAsyncFunctionDef))
-            target.__class__ = MacroAsyncFunctionDef if is_async else MacroFunctionDef
-        return target
+        return target      
 
     def set_decorators(self,
-        target: FC,
-        decorators: list
+        decorators: list,
+        unparsed,
+        parsed
     ) -> FC:
         """Set the decorators on a function or class definition."""
+        def get_target():
+            if any(isinstance(e, (MacroName, MacroCall)) for e in decorators):
+                return unparsed()
+            return parsed()
+        
+        target = get_target()
         if target is None:
             return None
+        
         target.decorator_list = decorators
-        return self.set_fnc_macro(target, decorators)
+        return self.set_is_macro(target, decorators)
 
     def get_comparison_ops(self, pairs):
         return [op for op, _ in pairs]
@@ -535,7 +539,3 @@ class Parser(ParserBase):
         next_token = self._tokenizer.peek()
         raise self._build_syntax_error(message, next_token.start, next_token.end)
     
-    def maybe_parse(self, decorators: list, unparsed, parsed):
-        if any(isinstance(e, (MacroName, MacroCall)) for e in decorators):
-            return unparsed()
-        return parsed()
