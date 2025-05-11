@@ -1,0 +1,246 @@
+--- python.gram	2025-05-09 05:18:06.438635968 +0200
++++ macro.gram	2025-05-09 07:37:10.003972068 +0200
+@@ -21,7 +21,31 @@
+ Del = ast.Del()
+ 
+ Node = TypeVar("Node")
+-FC = TypeVar("FC", ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
++
++class MacroFunctionDef(ast.FunctionDef): ...
++class MacroAsyncFunctionDef(ast.AsyncFunctionDef): ...
++class MacroClassDef(ast.ClassDef): ...
++class MacroCall(ast.Call): ...
++class MacroDecorator(ast.expr):
++    if sys.version_info >= (3, 10):
++        __match_args__ = ("decorator",)
++    _fields = ("decorator",)
++    decorator: Union[ast.Name, ast.Call]
++
++    def __init__(self, decorator: Union[ast.Name, ast.Call]):
++        self.decorator = decorator
++class MacroStmt(ast.stmt):
++    if sys.version_info >= (3, 10):
++        __match_args__ = ("expr", "body")
++    _fields = ("expr", "body")
++    expr: Union[ast.Name, ast.Call]
++    body: list
++
++    def __init__(self, expr: Union[ast.Name, ast.Call], body: list):
++        self.expr = expr
++        self.body = body
++
++FC = TypeVar("FC", ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, MacroFunctionDef, MacroAsyncFunctionDef)
+ 
+ EXPR_NAME_MAPPING = {
+     ast.Attribute: "attribute",
+@@ -371,13 +395,25 @@
+                 level += 3
+         return level
+ 
++    def set_macro(self, target: FC, decorators: list) -> FC:
++        is_macro = isinstance(target, (MacroFunctionDef, MacroAsyncFunctionDef))
++        for decorator in decorators:
++            if ((isinstance(decorator, ast.Name) and decorator.id == "macro") or
++                (isinstance(decorator, ast.Call) and isinstance(decorator.func, ast.Name) and decorator.func.id == "macro")):
++                is_macro = True
++                break
++        if is_macro:
++            is_async = isinstance(target, (ast.AsyncFunctionDef, MacroAsyncFunctionDef))
++            target.__class__ = MacroAsyncFunctionDef if is_async else MacroFunctionDef
++        return target
++
+     def set_decorators(self,
+         target: FC,
+         decorators: list
+     ) -> FC:
+         """Set the decorators on a function or class definition."""
+         target.decorator_list = decorators
+-        return target
++        return self.set_macro(target, decorators)
+ 
+     def get_comparison_ops(self, pairs):
+         return [op for op, _ in pairs]
+@@ -558,6 +594,7 @@
+         next_token = self._tokenizer.peek()
+         raise self._build_syntax_error(message, next_token.start, next_token.end)
+ 
++
+ '''
+ 
+ 
+@@ -608,6 +645,7 @@
+     | &'nonlocal' nonlocal_stmt
+ 
+ compound_stmt:
++    | macro_stmt
+     | &('def' | '@' | 'async') function_def
+     | &'if' if_stmt
+     | &('class' | '@') class_def
+@@ -753,6 +791,9 @@
+     | simple_stmts
+     | invalid_block
+ 
++macro_name:
++    | a=NAME '!' { a }
++
+ decorators: decorator+
+ decorator:
+     | a=('@' f=dec_maybe_call NEWLINE { f }) { a }
+@@ -760,9 +801,13 @@
+         self.check_version((3, 9), "Generic decorator are",  a)
+      }
+ dec_maybe_call:
++    | a=NAME '!' '(' z=[arguments] ')' {
++        MacroDecorator(ast.Call(func=a, args=z[0] if z else [], keywords=z[1] if z else [], LOCATIONS))
++     }
+     | dn=dec_primary '(' z=[arguments] ')' {
+         ast.Call(func=dn, args=z[0] if z else [], keywords=z[1] if z else [], LOCATIONS)
+      }
++    | a=NAME '!' { MacroDecorator(a) }
+     | dec_primary
+ dec_primary:
+     | a=dec_primary '.' b=NAME { ast.Attribute(value=a, attr=b.string, ctx=Load, LOCATIONS) }
+@@ -771,15 +816,15 @@
+ # Class definitions
+ # -----------------
+ 
+-class_def[ast.ClassDef]:
++class_def[Union[ast.ClassDef, MacroClassDef]]:
+     | a=decorators b=class_def_raw { self.set_decorators(b, a) }
+     | class_def_raw
+ 
+-class_def_raw[ast.ClassDef]:
++class_def_raw[Union[ast.ClassDef, MacroClassDef]]:
+     | invalid_class_def_raw
+-    | 'class' a=NAME t=[type_params] b=['(' z=[arguments] ')' { z }] &&':' c=block {
++    | 'class' a=NAME m=['!'] t=[type_params] b=['(' z=[arguments] ')' { z }] &&':' c=block {
+         (
+-            ast.ClassDef(
++            (MacroClassDef if m else ast.ClassDef)(
+                 a.string,
+                 bases=b[0] if b else [],
+                 keywords=b[1] if b else [],
+@@ -789,7 +834,7 @@
+                 LOCATIONS,
+             )
+             if sys.version_info >= (3, 12) else
+-            ast.ClassDef(
++            (MacroClassDef if m else ast.ClassDef)(
+                 a.string,
+                 bases=b[0] if b else [],
+                 keywords=b[1] if b else [],
+@@ -803,15 +848,15 @@
+ # Function definitions
+ # --------------------
+ 
+-function_def[Union[ast.FunctionDef, ast.AsyncFunctionDef]]:
++function_def[Union[ast.FunctionDef, ast.AsyncFunctionDef, MacroFunctionDef, MacroAsyncFunctionDef]]:
+     | d=decorators f=function_def_raw { self.set_decorators(f, d) }
+     | f=function_def_raw {self.set_decorators(f, [])}
+ 
+-function_def_raw[Union[ast.FunctionDef, ast.AsyncFunctionDef]]:
++function_def_raw[Union[ast.FunctionDef, ast.AsyncFunctionDef, MacroFunctionDef, MacroAsyncFunctionDef]]:
+     | invalid_def_raw
+-    | 'def' n=NAME t=[type_params] &&'(' params=[params] ')' a=['->' z=expression { z }] &&':' tc=[func_type_comment] b=block {
++    | 'def' n=NAME m=['!'] t=[type_params] &&'(' params=[params] ')' a=['->' z=expression { z }] &&':' tc=[func_type_comment] b=block {
+         (
+-            ast.FunctionDef(
++            (MacroFunctionDef if m else ast.FunctionDef)(
+                 name=n.string,
+                 args=params or self.make_arguments(None, [], None, [], None),
+                 returns=a,
+@@ -820,7 +865,7 @@
+                 type_params=t or [],
+                 LOCATIONS,
+             ) if sys.version_info >= (3, 12) else
+-            ast.FunctionDef(
++            (MacroFunctionDef if m else ast.FunctionDef)(
+                 name=n.string,
+                 args=params or self.make_arguments(None, [], None, [], None),
+                 returns=a,
+@@ -830,12 +875,12 @@
+             )
+         )
+      }
+-    | 'async' 'def' n=NAME t=[type_params] &&'(' params=[params] ')' a=['->' z=expression { z }] &&':' tc=[func_type_comment] b=block {
++    | 'async' 'def' n=NAME m=['!'] t=[type_params] &&'(' params=[params] ')' a=['->' z=expression { z }] &&':' tc=[func_type_comment] b=block {
+        (
+             self.check_version(
+                 (3, 5),
+                 "Async functions are",
+-                ast.AsyncFunctionDef(
++                (MacroAsyncFunctionDef if m else ast.AsyncFunctionDef)(
+                     name=n.string,
+                     args=params or self.make_arguments(None, [], None, [], None),
+                     returns=a,
+@@ -848,7 +893,7 @@
+             self.check_version(
+                 (3, 5),
+                 "Async functions are",
+-                ast.AsyncFunctionDef(
++                (MacroAsyncFunctionDef if m else ast.AsyncFunctionDef)(
+                     name=n.string,
+                     args=params or self.make_arguments(None, [], None, [], None),
+                     returns=a,
+@@ -1024,7 +1069,7 @@
+ 
+ try_stmt[ast.Try]:
+     | invalid_try_stmt
+-    | 'try' &&':' b=block f=finally_block {
++    | 'try' &&':' b=block f=finally_block{
+         ast.Try(body=b, handlers=[], orelse=[], finalbody=f, LOCATIONS)
+      }
+     | 'try' &&':' b=block ex=except_block+ el=[else_block] f=[finally_block] {
+@@ -1061,6 +1106,17 @@
+     | invalid_finally_stmt
+     | 'finally' &&':' a=block { a }
+ 
++# Macro statement
++# ---------------
++
++macro_stmt[MacroStmt]:
++    | a=NAME '!' ':' b=block { MacroStmt(expr=a, body=b) }
++    | a=NAME '!' '(' z=[arguments] ')' ':' b=block {
++        MacroStmt(expr=ast.Call(func=a, args=z[0] if z else [], keywords=z[1] if z else [], LOCATIONS),
++                  body=b)
++     }
++
++
+ # Match statement
+ # ---------------
+ 
+@@ -1529,7 +1585,16 @@
+     | 'await' a=primary { self.check_version((3, 5), "Await expressions are", ast.Await(a, LOCATIONS)) }
+     | primary
+ 
++# TODO
+ primary:
++    | a=NAME '!' '(' b=[arguments] ')' {
++        MacroCall(
++            func=a,
++            args=b[0] if b else [],
++            keywords=b[1] if b else [],
++            LOCATIONS,
++        )
++     }
+     | a=primary '.' b=NAME { ast.Attribute(value=a, attr=b.string, ctx=Load, LOCATIONS) }
+     | a=primary b=genexp { ast.Call(func=a, args=[b], keywords=[], LOCATIONS) }
+     | a=primary '(' b=[arguments] ')' {
+@@ -2361,14 +2426,14 @@
+         )
+      }
+ invalid_def_raw[NoReturn]:
+-    | ['async'] a='def' NAME  [type_params] '(' [params] ')' ['->' expression] ':' NEWLINE !INDENT {
++    | ['async'] a='def' NAME ['!'] [type_params] '(' [params] ')' ['->' expression] ':' NEWLINE !INDENT {
+         self.raise_indentation_error(
+             f"expected an indented block after function definition on line {a.start[0]}"
+         )
+      }
+ invalid_class_def_raw[NoReturn]:
+-    | 'class' NAME [type_params] ['(' [arguments] ')'] NEWLINE { self.raise_syntax_error("expected ':'") }
+-    | a='class' NAME  [type_params] ['(' [arguments] ')'] ':' NEWLINE !INDENT {
++    | 'class' NAME ['!'] [type_params] ['(' [arguments] ')'] NEWLINE { self.raise_syntax_error("expected ':'") }
++    | a='class' NAME  ['!'] [type_params] ['(' [arguments] ')'] ':' NEWLINE !INDENT {
+         self.raise_indentation_error(
+             f"expected an indented block after class definition on line {a.start[0]}"
+         )

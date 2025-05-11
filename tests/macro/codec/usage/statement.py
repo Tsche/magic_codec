@@ -2,8 +2,9 @@
 
 @macro
 def finally!(code):
-    yield from tokenize("except: raise\n")
-    yield from tokenize("finally:")
+    yield from `except: raise`
+    yield Token(4, '\n')
+    yield from `finally:`
     yield from code.tokens
 
 @macro

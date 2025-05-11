@@ -166,8 +166,8 @@ class Interpreter:
         'Code': Code,
         'NodeTransformer': NodeTransformer,
         'macro': macro,
-        'tokenize': tokenize,
-        'untokenize': untokenize
+        'tokenize': macro(tokenize, eval_args=True),
+        'untokenize': macro(untokenize, eval_args=True)
     }
 
     def __init__(self):
@@ -217,10 +217,11 @@ class Interpreter:
         return self.eval(call, call_locals).tokens
 
 
-def synthesize_token_list(tokens: list[Token]):
-    token_list = ', '.join(f"Token({token.type},{token.string!r})" for token in tokens)
-    code = f"Code([{token_list}])"
-    return list(tokenize(code))[:-1]
+def synthesize_token_list(tokens: list[Token], raw = False):
+    cast_to = "" if raw else "Token"
+    token_list = ', '.join(f"{cast_to}({token.type},{token.string!r})" for token in tokens)
+    code = f"[{token_list}]" if raw else f"Code([{token_list}])"
+    return list(tokenize(code))
 
 def synthesize_call(function: str | Iterable[Token], expression: Iterable[Token]) -> list[Token]:
     name = [Token(NAME, function)] if isinstance(function, str) else function
@@ -564,12 +565,54 @@ class Parser(TokenStream):
             # and we don't yet know whether it exists or not
         return MacroInvocation(is_macro, name, args)
 
+    def parse_token_literal(self):
+        with self.alt:
+            self.expect((OP, '`'))
+            multiline = False
+
+            code = []
+            first = self.next()
+            if first == (OP, '`'):
+                if self.peek() == (OP, '`'):
+                    self.next()
+                    self.next()
+                    multiline = True
+                else:
+                    return CodeFragment(False, synthesize_token_list([], True))
+                    # return CodeFragment(False, [Token(NAME, "tokenize"), Token(OP, '('), Token(OP, '"'), Token(OP, '"'), Token(OP, ')')])
+            else:
+                code.append(first)
+            
+            while current := self.next():
+                if current == (OP, '`'):
+                    if multiline:
+                        self.expect((OP, '`'))
+                        self.expect((OP, '`'))
+                    return CodeFragment(False, synthesize_token_list(code, True))
+                    # return CodeFragment(False, [Token(NAME, "tokenize"), Token(OP, '('), Token(STRING, f'"""{untokenize(code)}"""'), Token(OP, ')')])
+                elif not multiline and current.type in (NEWLINE, NL):
+                    # unexpected newline
+                    raise Cancellation
+                else:
+                    code.append(current)
+        return None
+
     def parse_line(self, is_macro=False):
         fragment = []
+        def push_partial():
+            nonlocal fragment, is_macro
+            if fragment:
+                yield CodeFragment(is_macro, fragment)
+                fragment = []
+
         while current := self.peek():
             if current.type in (NL, NEWLINE):
                 fragment.append(self.next())
                 break
+
+            if token_lit := self.parse_token_literal():
+                yield from push_partial()
+                yield token_lit
 
             if current.type != NAME:
                 fragment.append(self.next())
@@ -578,9 +621,7 @@ class Parser(TokenStream):
             with self.alt:
                 name = self.parse_macro_name()
                 invocation = self.parse_macro_invocation(name, is_macro)
-                if fragment:
-                    yield CodeFragment(is_macro, fragment)
-                    fragment = []
+                yield from push_partial()
                 yield invocation
                 continue
 
@@ -633,8 +674,8 @@ def transform(source: str, source_path: Optional[Path] = None, macro_only: bool 
 
         if macro_only:
             continue
-        
-        code.extend(node.evaluate(interpreter))
+        evaluated = list(node.evaluate(interpreter))
+        code.extend(evaluated)
 
     if code and code[0].type == 62:
         code = code[2:]
