@@ -21,7 +21,7 @@ KEYWORD: ~ {
     # | 'False' | 'None' | 'True' | 'and' | 'as' | 'assert' | 'async' | 'await' | 'break' | 'class' | 'continue' 
     # | 'def' | 'del' | 'elif' | 'else' | 'except' | 'finally' | 'for' | 'from' | 'global' | 'if' | 'import' 
     # | 'in' | 'is' | 'lambda' | 'nonlocal' | 'not' | 'or' | 'pass' | 'raise' | 'return' | 'try' | 'while' 
-    # | 'with' | 'yield'
+    # | 'with' | 'yield' | 'macro'
 
 ANY: ~ { self._tokenizer.getnext() }
 # this hack is equivalent to:
@@ -76,8 +76,10 @@ unparsed_block[list] (memo):
  # Common elements
  # ---------------
 
+# macros may not redefine `import!` or `from!` - these have meaning to the preprocessor
+forbidden_macro_keywords: 'import' | 'from'
 macro_name:
-    | a=(NAME|KEYWORD) '!' { MacroName(id=a.string, ctx=Load, LOCATIONS) }
+    | a=(NAME| !forbidden_macro_keywords KEYWORD) '!' { MacroName(id=a.string, ctx=Load, LOCATIONS) }
 
 maybe_macro:
     | macro_name
@@ -94,6 +96,11 @@ dec_macro:
         MacroCall(func=a.id, args=args or [], keywords=[], LOCATIONS)
      }
     | macro_name
+    # this makes `macro` a keyword that's only usable in decorators
+    | a='macro' '(' z=[arguments] ')' {
+        ast.Call(func=a, args=z[0] if z else [], keywords=z[1] if z else [], LOCATIONS)
+     }
+    | a='macro' { ast.Name(id=a.string, ctx=Load, LOCATIONS) }
 
 
 # Class definitions
@@ -339,6 +346,34 @@ finally_block[list]:
     | &'finally' a=macro_stmt { a }
     | 'finally' &&':' a=block { a }
 
+
+# Import statements
+# -----------------
+import_name[Import]: 'import' m=['!'] a=dotted_as_names { Import(names=a, is_macro=bool(m), LOCATIONS) }
+
+# note below: the ('.' | '...') is necessary because '...' is tokenized as ELLIPSIS
+import_from[ImportFrom]:
+    | 'from' f=['!'] a=('.' | '...')* b=dotted_name mb=['!'] 'import' i=['!'] c=import_from_targets {
+        ImportFrom(module=maybe_macro(mb, b), names=c, level=self.extract_import_level(a), is_macro=bool(f or i), LOCATIONS)
+     }
+    | 'from' f=['!'] a=('.' | '...')+ 'import' i=['!'] b=import_from_targets {
+        ImportFrom(names=b, level=self.extract_import_level(a), is_macro=bool(f or i), LOCATIONS)
+        if sys.version_info >= (3, 9) else
+        ImportFrom(module=None, names=b, level=self.extract_import_level(a), is_macro=bool(f or i), LOCATIONS)
+     }
+
+import_from_as_name[ast.alias]:
+    | a=NAME m=['!'] b=['as' z=NAME n=['!'] { maybe_macro(n, z.string) }] { 
+        ast.alias(name=maybe_macro(m, a.string), asname=b, LOCATIONS) 
+     }
+
+dotted_as_name[ast.alias]:
+    | a=dotted_name m=['!'] b=['as' z=NAME n=['!'] { maybe_macro(n, z.string) }] { 
+        ast.alias(name=maybe_macro(m, a), asname=b, LOCATIONS) 
+     }
+
+# Primary elements
+# ----------------
 
 primary:
     | a=macro_name '(' ~args=[unparsed_atoms] ')' {

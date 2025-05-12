@@ -677,55 +677,67 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def import_name(self) -> Optional[ast . Import]:
-        # import_name: 'import' dotted_as_names
+    def import_name(self) -> Optional[Import]:
+        # import_name: 'import' '!'? dotted_as_names
         mark = self._mark()
         tok = self._tokenizer.peek()
         start_lineno, start_col_offset = tok.start
         if (
             (self.expect('import'))
+            and
+            (m := self.expect('!'),)
             and
             (a := self.dotted_as_names())
         ):
             tok = self._tokenizer.get_last_non_whitespace_token()
             end_lineno, end_col_offset = tok.end
-            return ast . Import ( names = a , lineno=start_lineno, col_offset=start_col_offset, end_lineno=end_lineno, end_col_offset=end_col_offset );
+            return Import ( names = a , is_macro = bool ( m ) , lineno=start_lineno, col_offset=start_col_offset, end_lineno=end_lineno, end_col_offset=end_col_offset );
         self._reset(mark)
         return None;
 
     @memoize
-    def import_from(self) -> Optional[ast . ImportFrom]:
-        # import_from: 'from' (('.' | '...'))* dotted_name 'import' import_from_targets | 'from' (('.' | '...'))+ 'import' import_from_targets
+    def import_from(self) -> Optional[ImportFrom]:
+        # import_from: 'from' '!'? (('.' | '...'))* dotted_name '!'? 'import' '!'? import_from_targets | 'from' '!'? (('.' | '...'))+ 'import' '!'? import_from_targets
         mark = self._mark()
         tok = self._tokenizer.peek()
         start_lineno, start_col_offset = tok.start
         if (
             (self.expect('from'))
             and
+            (f := self.expect('!'),)
+            and
             (a := self._loop0_25(),)
             and
             (b := self.dotted_name())
             and
+            (mb := self.expect('!'),)
+            and
             (self.expect('import'))
+            and
+            (i := self.expect('!'),)
             and
             (c := self.import_from_targets())
         ):
             tok = self._tokenizer.get_last_non_whitespace_token()
             end_lineno, end_col_offset = tok.end
-            return ast . ImportFrom ( module = b , names = c , level = self . extract_import_level ( a ) , lineno=start_lineno, col_offset=start_col_offset, end_lineno=end_lineno, end_col_offset=end_col_offset );
+            return ImportFrom ( module = maybe_macro ( mb , b ) , names = c , level = self . extract_import_level ( a ) , is_macro = bool ( f or i ) , lineno=start_lineno, col_offset=start_col_offset, end_lineno=end_lineno, end_col_offset=end_col_offset );
         self._reset(mark)
         if (
             (self.expect('from'))
+            and
+            (f := self.expect('!'),)
             and
             (a := self._loop1_26())
             and
             (self.expect('import'))
             and
+            (i := self.expect('!'),)
+            and
             (b := self.import_from_targets())
         ):
             tok = self._tokenizer.get_last_non_whitespace_token()
             end_lineno, end_col_offset = tok.end
-            return ast . ImportFrom ( names = b , level = self . extract_import_level ( a ) , lineno=start_lineno, col_offset=start_col_offset, end_lineno=end_lineno, end_col_offset=end_col_offset ) if sys . version_info >= ( 3 , 9 ) else ast . ImportFrom ( module = None , names = b , level = self . extract_import_level ( a ) , lineno=start_lineno, col_offset=start_col_offset, end_lineno=end_lineno, end_col_offset=end_col_offset );
+            return ImportFrom ( names = b , level = self . extract_import_level ( a ) , is_macro = bool ( f or i ) , lineno=start_lineno, col_offset=start_col_offset, end_lineno=end_lineno, end_col_offset=end_col_offset ) if sys . version_info >= ( 3 , 9 ) else ImportFrom ( module = None , names = b , level = self . extract_import_level ( a ) , is_macro = bool ( f or i ) , lineno=start_lineno, col_offset=start_col_offset, end_lineno=end_lineno, end_col_offset=end_col_offset );
         self._reset(mark)
         return None;
 
@@ -782,18 +794,20 @@ class MacroPythonParser(Parser):
 
     @memoize
     def import_from_as_name(self) -> Optional[ast . alias]:
-        # import_from_as_name: NAME ['as' NAME]
+        # import_from_as_name: NAME '!'? ['as' NAME '!'?]
         mark = self._mark()
         tok = self._tokenizer.peek()
         start_lineno, start_col_offset = tok.start
         if (
             (a := self.name())
             and
+            (m := self.expect('!'),)
+            and
             (b := self._tmp_29(),)
         ):
             tok = self._tokenizer.get_last_non_whitespace_token()
             end_lineno, end_col_offset = tok.end
-            return ast . alias ( name = a . string , asname = b , lineno=start_lineno, col_offset=start_col_offset, end_lineno=end_lineno, end_col_offset=end_col_offset );
+            return ast . alias ( name = maybe_macro ( m , a . string ) , asname = b , lineno=start_lineno, col_offset=start_col_offset, end_lineno=end_lineno, end_col_offset=end_col_offset );
         self._reset(mark)
         return None;
 
@@ -810,18 +824,20 @@ class MacroPythonParser(Parser):
 
     @memoize
     def dotted_as_name(self) -> Optional[ast . alias]:
-        # dotted_as_name: dotted_name ['as' NAME]
+        # dotted_as_name: dotted_name '!'? ['as' NAME '!'?]
         mark = self._mark()
         tok = self._tokenizer.peek()
         start_lineno, start_col_offset = tok.start
         if (
             (a := self.dotted_name())
             and
+            (m := self.expect('!'),)
+            and
             (b := self._tmp_32(),)
         ):
             tok = self._tokenizer.get_last_non_whitespace_token()
             end_lineno, end_col_offset = tok.end
-            return ast . alias ( name = a , asname = b , lineno=start_lineno, col_offset=start_col_offset, end_lineno=end_lineno, end_col_offset=end_col_offset );
+            return ast . alias ( name = maybe_macro ( m , a ) , asname = b , lineno=start_lineno, col_offset=start_col_offset, end_lineno=end_lineno, end_col_offset=end_col_offset );
         self._reset(mark)
         return None;
 
@@ -7313,8 +7329,24 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
+    def forbidden_macro_keywords(self) -> Optional[Any]:
+        # forbidden_macro_keywords: 'import' | 'from'
+        mark = self._mark()
+        if (
+            (literal := self.expect('import'))
+        ):
+            return literal;
+        self._reset(mark)
+        if (
+            (literal := self.expect('from'))
+        ):
+            return literal;
+        self._reset(mark)
+        return None;
+
+    @memoize
     def macro_name(self) -> Optional[Any]:
-        # macro_name: (NAME | KEYWORD) '!'
+        # macro_name: (NAME | !forbidden_macro_keywords KEYWORD) '!'
         mark = self._mark()
         tok = self._tokenizer.peek()
         start_lineno, start_col_offset = tok.start
@@ -7347,7 +7379,7 @@ class MacroPythonParser(Parser):
 
     @memoize
     def dec_macro(self) -> Optional[Any]:
-        # dec_macro: macro_name '(' unparsed_atoms? ')' | macro_name
+        # dec_macro: macro_name '(' unparsed_atoms? ')' | macro_name | 'macro' '(' arguments? ')' | 'macro'
         mark = self._mark()
         tok = self._tokenizer.peek()
         start_lineno, start_col_offset = tok.start
@@ -7368,6 +7400,26 @@ class MacroPythonParser(Parser):
             (macro_name := self.macro_name())
         ):
             return macro_name;
+        self._reset(mark)
+        if (
+            (a := self.expect('macro'))
+            and
+            (self.expect('('))
+            and
+            (z := self.arguments(),)
+            and
+            (self.expect(')'))
+        ):
+            tok = self._tokenizer.get_last_non_whitespace_token()
+            end_lineno, end_col_offset = tok.end
+            return ast . Call ( func = a , args = z [0] if z else [] , keywords = z [1] if z else [] , lineno=start_lineno, col_offset=start_col_offset, end_lineno=end_lineno, end_col_offset=end_col_offset );
+        self._reset(mark)
+        if (
+            (a := self.expect('macro'))
+        ):
+            tok = self._tokenizer.get_last_non_whitespace_token()
+            end_lineno, end_col_offset = tok.end
+            return ast . Name ( id = a . string , ctx = Load , lineno=start_lineno, col_offset=start_col_offset, end_lineno=end_lineno, end_col_offset=end_col_offset );
         self._reset(mark)
         return None;
 
@@ -7985,14 +8037,16 @@ class MacroPythonParser(Parser):
 
     @memoize
     def _tmp_29(self) -> Optional[Any]:
-        # _tmp_29: 'as' NAME
+        # _tmp_29: 'as' NAME '!'?
         mark = self._mark()
         if (
             (self.expect('as'))
             and
             (z := self.name())
+            and
+            (n := self.expect('!'),)
         ):
-            return z . string;
+            return maybe_macro ( n , z . string );
         self._reset(mark)
         return None;
 
@@ -8028,14 +8082,16 @@ class MacroPythonParser(Parser):
 
     @memoize
     def _tmp_32(self) -> Optional[Any]:
-        # _tmp_32: 'as' NAME
+        # _tmp_32: 'as' NAME '!'?
         mark = self._mark()
         if (
             (self.expect('as'))
             and
             (z := self.name())
+            and
+            (n := self.expect('!'),)
         ):
-            return z . string;
+            return maybe_macro ( n , z . string );
         self._reset(mark)
         return None;
 
@@ -11416,7 +11472,7 @@ class MacroPythonParser(Parser):
 
     @memoize
     def _tmp_258(self) -> Optional[Any]:
-        # _tmp_258: NAME | KEYWORD
+        # _tmp_258: NAME | !forbidden_macro_keywords KEYWORD
         mark = self._mark()
         if (
             (name := self.name())
@@ -11424,6 +11480,8 @@ class MacroPythonParser(Parser):
             return name;
         self._reset(mark)
         if (
+            (self.negative_lookahead(self.forbidden_macro_keywords, ))
+            and
             (KEYWORD := self.KEYWORD())
         ):
             return KEYWORD;
@@ -11996,7 +12054,7 @@ class MacroPythonParser(Parser):
         self._reset(mark)
         return None;
 
-    KEYWORDS = ('False', 'None', 'True', 'and', 'as', 'assert', 'async', 'await', 'break', 'class', 'continue', 'def', 'del', 'elif', 'else', 'except', 'finally', 'for', 'from', 'global', 'if', 'import', 'in', 'is', 'lambda', 'nonlocal', 'not', 'or', 'pass', 'raise', 'return', 'try', 'while', 'with', 'yield')
+    KEYWORDS = ('False', 'None', 'True', 'and', 'as', 'assert', 'async', 'await', 'break', 'class', 'continue', 'def', 'del', 'elif', 'else', 'except', 'finally', 'for', 'from', 'global', 'if', 'import', 'in', 'is', 'lambda', 'macro', 'nonlocal', 'not', 'or', 'pass', 'raise', 'return', 'try', 'while', 'with', 'yield')
     SOFT_KEYWORDS = ('_', 'case', 'match', 'type')
 
 

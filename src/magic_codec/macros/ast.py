@@ -28,6 +28,11 @@ class MacroName(ast.Name):
     def string(self):
         return self.id
 
+def maybe_macro(condition: bool, name: str):
+    if condition:
+        return MacroName(name)
+    return name
+
 class UnparsedFragment(UserList, ast.AST):
     if sys.version_info >= (3, 10):
         __match_args__ = ("data")
@@ -41,7 +46,7 @@ class FunctionDef(ast.FunctionDef):
     if sys.version_info >= (3, 10):
         __match_args__ = [*ast.FunctionDef.__match_args__, 'is_macro']
     is_macro: bool
-    _fields = [*ast.FunctionDef._fields, 'is_macro']
+    _fields = (*ast.FunctionDef._fields, 'is_macro')
 
     def __init__(self, *args, is_macro: bool = False, **kwargs):
         super().__init__(*args, **kwargs)
@@ -51,7 +56,7 @@ class AsyncFunctionDef(ast.AsyncFunctionDef):
     if sys.version_info >= (3, 10):
         __match_args__ = [*ast.AsyncFunctionDef.__match_args__, 'is_macro']
     is_macro: bool
-    _fields = [*ast.AsyncFunctionDef._fields, 'is_macro']
+    _fields = (*ast.AsyncFunctionDef._fields, 'is_macro')
 
     def __init__(self, *args, is_macro: bool = False, **kwargs):
         super().__init__(*args, **kwargs)
@@ -61,13 +66,33 @@ class ClassDef(ast.ClassDef):
     if sys.version_info >= (3, 10):
         __match_args__ = [*ast.ClassDef.__match_args__, 'is_macro']
     is_macro: bool
-    _fields = [*ast.ClassDef._fields, 'is_macro']
+    _fields = (*ast.ClassDef._fields, 'is_macro')
 
     def __init__(self, *args, is_macro: bool = False, **kwargs):
         super().__init__(*args, **kwargs)
         self.is_macro = is_macro
 
 FC = TypeVar("FC", FunctionDef, AsyncFunctionDef, ClassDef)
+
+class Import(ast.Import):
+    if sys.version_info >= (3, 10):
+        __match_args__ = [*ast.Import.__match_args__, 'is_macro']
+    is_macro: bool
+    _fields = (*ast.Import._fields, 'is_macro')
+
+    def __init__(self, *args, is_macro: bool = False, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.is_macro = is_macro
+
+class ImportFrom(ast.ImportFrom):
+    if sys.version_info >= (3, 10):
+        __match_args__ = [*ast.ImportFrom.__match_args__, 'is_macro']
+    is_macro: bool
+    _fields = (*ast.ImportFrom._fields, 'is_macro')
+
+    def __init__(self, *args, is_macro: bool = False, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.is_macro = is_macro
 
 class Code:
     __current_state: str | list[TokenInfo] | ast.AST

@@ -21,7 +21,7 @@
     warn_unused_configs    = true
     no_implicit_reexport   = true
     warn_unused_ignores    = true
-    disable_error_code     = ["unreachable"]
+    disable_error_code     = ["unreachable", "override"]
 
 [tool.pylint.'MESSAGES CONTROL']
     disable = """
