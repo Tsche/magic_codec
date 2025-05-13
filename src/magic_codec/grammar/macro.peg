@@ -2,10 +2,9 @@
 
 @import "python.peg"
 @class MacroPythonParser
-
 @subheader'''
 from magic_codec.macros.parser import *
-from magic_codec.macros.ast import *
+from magic_codec.macros.macro_ast import *
 '''
 
 # META RULES
@@ -303,10 +302,10 @@ macro_stmt_expr:
 
 macro_stmt[MacroStmt]:
     | a=macro_name ':' b=unparsed_block { MacroStmt(expr=a, body=b) }
-    | a=macro_name h=macro_stmt_expr ':' b=block {
-        MacroStmt(expr=MacroCall(a.id, args=h, kwargs=[], LOCATIONS),
-                  body=b)
-     }
+    # | a=macro_name h=macro_stmt_expr ':' b=block {
+    #     MacroStmt(expr=MacroCall(ast.Expr(a.id), args=h, kwargs=[], LOCATIONS),
+    #               body=b)
+    #  }
 
 # If statement
 # ------------
@@ -376,14 +375,6 @@ dotted_as_name[ast.alias]:
 # ----------------
 
 primary:
-    | a=macro_name '(' ~args=[unparsed_atoms] ')' {
-        MacroCall(
-            func=a.id,
-            args=args or [],
-            keywords=[],
-            LOCATIONS,
-        )
-     }
     | a=primary '.' b=NAME { ast.Attribute(value=a, attr=b.string, ctx=Load, LOCATIONS) }
     | a=primary b=genexp { ast.Call(func=a, args=[b], keywords=[], LOCATIONS) }
     | a=primary '(' b=[arguments] ')' {
@@ -398,6 +389,15 @@ primary:
     | atom
 
 atom:
+    # macro calls are atoms rather than primary to allow foo!()() etc
+    | a=macro_name '(' args=[unparsed_atoms] ')' {
+        MacroCall(
+            func=a.id,
+            args=args or [],
+            keywords=[],
+            LOCATIONS,
+        )
+     }
     | a=NAME { ast.Name(id=a.string, ctx=Load, LOCATIONS) }
     | 'True' {
         ast.Constant(value=True, LOCATIONS)

@@ -4,7 +4,7 @@ from io import StringIO
 from keyword import iskeyword, issoftkeyword
 import re
 import sys
-from tokenize import TokenInfo, generate_tokens, untokenize
+from tokenize import TokenInfo, generate_tokens, tokenize, untokenize
 from types import NoneType
 from typing import Iterable, Self, TypeVar, Union
 
@@ -72,7 +72,7 @@ class ClassDef(ast.ClassDef):
         super().__init__(*args, **kwargs)
         self.is_macro = is_macro
 
-FC = TypeVar("FC", FunctionDef, AsyncFunctionDef, ClassDef)
+type Def = FunctionDef | AsyncFunctionDef | ClassDef
 
 class Import(ast.Import):
     if sys.version_info >= (3, 10):
@@ -95,9 +95,9 @@ class ImportFrom(ast.ImportFrom):
         self.is_macro = is_macro
 
 class Code:
-    __current_state: str | list[TokenInfo] | ast.AST
+    __current_state: str | list[TokenInfo] | list[tuple[int, str]] | ast.AST
 
-    def __init__(self, state: Self | str | Iterable[TokenInfo] | ast.AST | None):
+    def __init__(self, state: Self | str | Iterable[TokenInfo | tuple[int, str]] | ast.AST | None):
         if isinstance(state, Code):
             self.__current_state = state.__current_state
         elif isinstance(state, NoneType):
@@ -105,7 +105,7 @@ class Code:
         elif isinstance(state, str):
             self.__current_state = state
         elif isinstance(state, Iterable):
-            self.__current_state = [(token.type, token.string) if isinstance(token, TokenInfo) else (token[0], token[1]) 
+            self.__current_state = [(int(token.type), str(token.string)) if isinstance(token, TokenInfo) else (int(token[0]), str(token[1])) 
                                     for token in state]
         elif isinstance(state, ast.AST):
             self.__current_state = state
@@ -126,13 +126,16 @@ class Code:
     def ast(self):
         if isinstance(self.__current_state, ast.AST):
             return self.__current_state
-        return ast.parse(self.string)
+
+        with StringIO(self.string) as file:
+            return parse(file)
 
     @property
     def tokens(self):
         if isinstance(self.__current_state, Iterable) and not isinstance(self.__current_state, str):
             return self.__current_state
-        return tokenize(self.string, False)
+        # return tokenize(self.string, False)
+        return tokenize(self.string)
     
     def __repr__(self):
         return f"Code({str(self.tokens)})"
@@ -151,14 +154,23 @@ def demangle(text):
 class Unparser(ast._Unparser):
     def visit_MacroName(self, node: MacroName):
         self.write(mangle(node.id))
-    
+
     def visit_MacroCall(self, node: MacroCall):
-        token_list = ', '.join(f"({token.type}, {token.string!r})" for token in node.args)
+        if not node.args:
+            token_list = ""
+        else:
+            assert isinstance(node.args, UnparsedFragment)
+            token_list = ', '.join(f"({token.type}, {token.string!r})" for token in node.args)
+        assert isinstance(node.func, str)
         self.write(f"{mangle(node.func)}(Code([{token_list}]))")
     
-    def visit_TokenLiteral(self, node: TokenLiteral):
+    def visit_UnparsedFragment(self, node: UnparsedFragment):
         token_list = ', '.join(f"({token.type}, {token.string!r})" for token in node.data)
         self.write(f"[{token_list}]")
+
+    def visit_TokenLiteral(self, node: TokenLiteral):
+        self.visit_UnparsedFragment(node)
+
 
 def parse(source, mode: str = 'file'):
     from magic_codec.macros.macro_parser import MacroPythonParser

@@ -1,8 +1,12 @@
+import ast
 from pathlib import Path
 import re
 
-from magic_codec.macro import transform
-from magic_codec.util import untokenize
+# from magic_codec.legacy_macro import transform
+# from magic_codec.util import untokenize
+
+from magic_codec.macros.macro_ast import Code
+from magic_codec.macros.evaluator import transform
 
 
 def remove_magic(data: str) -> str:
@@ -21,5 +25,5 @@ def preprocess(data: str):
         source = Path(__main__.__file__).read_text(encoding="utf-8")
         if data == remove_magic(source):
             source_path = Path(__main__.__file__)
-    _, code = transform(data, source_path=source_path)
-    return untokenize(code)
+    code, _ = transform(data, source_path)
+    return "\n\n" + Code(code).string + '\n'

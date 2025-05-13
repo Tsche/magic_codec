@@ -2,7 +2,7 @@ import ast
 from token import NAME, NUMBER, STRING
 from tokenize import TokenInfo, tokenize, untokenize
 from typing import Any, Generator, Iterable, Optional
-from magic_codec.macros.ast import Code
+from magic_codec.macros.macro_ast import Code
 
 # def synthesize_token_list(tokens: list[TokenInfo], raw = False):
 #     cast_to = "" if raw else "Token"
@@ -63,17 +63,27 @@ def synthesize_constant(value: Any):
 
 class Interpreter:
     def __init__(self, globals: dict[str, Any]):
+        self.__default_globals = globals.copy()
         self.globals: dict[str, Any] = globals
+        self.module = ast.Module()
 
     def execute_fnc(self, fnc, *args, **kwargs):
-        self.exec(Code("__fn(*__args, **__kwargs)"), {'__fn': fnc, '__args': args, '__kwargs': kwargs})
+        self.exec(Code("__fn(*__args, **__kwargs)"), {'__fn': fnc, '__args': args, '__kwargs': kwargs}, memoize=False)
 
     def reset(self):
         self.globals = self.__default_globals
         self.macros = {}
 
-    def exec(self, code: Code, locals=None):
+    def push_code(self, tree: ast.AST):
+        if isinstance(tree, ast.Module):
+            self.module.body.extend(tree.body)
+        else:
+            self.module.body.append(tree)
+
+    def exec(self, code: Code, locals=None, memoize=True):
         print("exec: ", code.string)
+        if memoize:
+            self.push_code(code.ast)
         exec(code.string, self.globals, locals or self.globals)
 
     def eval(self, code: Code, locals=None):

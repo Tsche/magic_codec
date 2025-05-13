@@ -14,8 +14,8 @@ from typing import (
     Any, Callable, Iterator, List, Literal, NoReturn, Optional, Sequence, Tuple, TypeVar, Union
 )
 
-from magic_codec.macros.ast import (
-   MacroCall, FC, MacroName
+from magic_codec.macros.macro_ast import (
+   MacroCall, Def, MacroName
 )
 
 from pegen.tokenizer import Tokenizer
@@ -334,19 +334,18 @@ class Parser(ParserBase):
                 level += 3
         return level
 
-    def set_is_macro(self, target: FC, decorators: list) -> FC:
-        for decorator in decorators:
+    def find_macro_decorator(self, target: Def) -> Optional[ast.expr]:
+        for decorator in target.decorator_list:
             if ((isinstance(decorator, ast.Name) and decorator.id == "macro") or
                 (isinstance(decorator, ast.Call) and isinstance(decorator.func, ast.Name) and decorator.func.id == "macro")):
-                target.is_macro = True
-                break
-        return target      
+                return decorator
+        return None
 
     def set_decorators(self,
         decorators: list,
         unparsed,
         parsed
-    ) -> FC:
+    ) -> Optional[Def]:
         """Set the decorators on a function or class definition."""
         def get_target():
             if any(isinstance(e, (MacroName, MacroCall)) for e in decorators):
@@ -355,10 +354,20 @@ class Parser(ParserBase):
         
         target = get_target()
         if target is None:
+            # TODO parsing body failed - fail hard?
             return None
         
         target.decorator_list = decorators
-        return self.set_is_macro(target, decorators)
+        if self.find_macro_decorator(target):
+            target.is_macro = True
+
+        # fix lineno/col_offset to include decorators as well
+        if decorators:
+            lineno, col_offset = decorators[0].lineno, decorators[0].col_offset
+            target.lineno = lineno
+            target.col_offset = col_offset
+
+        return target
 
     def get_comparison_ops(self, pairs):
         return [op for op, _ in pairs]

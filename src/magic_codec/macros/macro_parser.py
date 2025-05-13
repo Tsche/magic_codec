@@ -10,7 +10,7 @@ from typing import Any, Optional
 from pegen.parser import memoize, memoize_left_rec, logger, Parser
 
 from magic_codec.macros.parser import *
-from magic_codec.macros.ast import *
+from magic_codec.macros.macro_ast import *
 
 # Keywords and soft keywords are listed at the end of the parser definition.
 class MacroPythonParser(Parser):
@@ -3809,28 +3809,10 @@ class MacroPythonParser(Parser):
 
     @memoize_left_rec
     def primary(self) -> Optional[Any]:
-        # primary: macro_name '(' ~ unparsed_atoms? ')' | primary '.' NAME | primary genexp | primary '(' arguments? ')' | primary '[' slices ']' | atom
+        # primary: primary '.' NAME | primary genexp | primary '(' arguments? ')' | primary '[' slices ']' | atom
         mark = self._mark()
         tok = self._tokenizer.peek()
         start_lineno, start_col_offset = tok.start
-        cut = False
-        if (
-            (a := self.macro_name())
-            and
-            (self.expect('('))
-            and
-            (cut := True)
-            and
-            (args := self.unparsed_atoms(),)
-            and
-            (self.expect(')'))
-        ):
-            tok = self._tokenizer.get_last_non_whitespace_token()
-            end_lineno, end_col_offset = tok.end
-            return MacroCall ( func = a . id , args = args or [] , keywords = [] , lineno=start_lineno, col_offset=start_col_offset, end_lineno=end_lineno, end_col_offset=end_col_offset , );
-        self._reset(mark)
-        if cut:
-            return None;
         if (
             (a := self.primary())
             and
@@ -3936,10 +3918,23 @@ class MacroPythonParser(Parser):
 
     @memoize
     def atom(self) -> Optional[Any]:
-        # atom: NAME | 'True' | 'False' | 'None' | &(STRING | FSTRING_START) strings | NUMBER | &'(' (tuple | group | genexp) | &'[' (list | listcomp) | &'{' (dict | set | dictcomp | setcomp) | '...' | token_literal
+        # atom: macro_name '(' unparsed_atoms? ')' | NAME | 'True' | 'False' | 'None' | &(STRING | FSTRING_START) strings | NUMBER | &'(' (tuple | group | genexp) | &'[' (list | listcomp) | &'{' (dict | set | dictcomp | setcomp) | '...' | token_literal
         mark = self._mark()
         tok = self._tokenizer.peek()
         start_lineno, start_col_offset = tok.start
+        if (
+            (a := self.macro_name())
+            and
+            (self.expect('('))
+            and
+            (args := self.unparsed_atoms(),)
+            and
+            (self.expect(')'))
+        ):
+            tok = self._tokenizer.get_last_non_whitespace_token()
+            end_lineno, end_col_offset = tok.end
+            return MacroCall ( func = a . id , args = args or [] , keywords = [] , lineno=start_lineno, col_offset=start_col_offset, end_lineno=end_lineno, end_col_offset=end_col_offset , );
+        self._reset(mark)
         if (
             (a := self.name())
         ):
@@ -7546,10 +7541,8 @@ class MacroPythonParser(Parser):
 
     @memoize
     def macro_stmt(self) -> Optional[MacroStmt]:
-        # macro_stmt: macro_name ':' unparsed_block | macro_name macro_stmt_expr ':' block
+        # macro_stmt: macro_name ':' unparsed_block
         mark = self._mark()
-        tok = self._tokenizer.peek()
-        start_lineno, start_col_offset = tok.start
         if (
             (a := self.macro_name())
             and
@@ -7558,19 +7551,6 @@ class MacroPythonParser(Parser):
             (b := self.unparsed_block())
         ):
             return MacroStmt ( expr = a , body = b );
-        self._reset(mark)
-        if (
-            (a := self.macro_name())
-            and
-            (h := self.macro_stmt_expr())
-            and
-            (self.expect(':'))
-            and
-            (b := self.block())
-        ):
-            tok = self._tokenizer.get_last_non_whitespace_token()
-            end_lineno, end_col_offset = tok.end
-            return MacroStmt ( expr = MacroCall ( a . id , args = h , kwargs = [] , lineno=start_lineno, col_offset=start_col_offset, end_lineno=end_lineno, end_col_offset=end_col_offset ) , body = b );
         self._reset(mark)
         return None;
 
