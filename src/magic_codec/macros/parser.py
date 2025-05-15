@@ -15,7 +15,7 @@ from typing import (
 )
 
 from magic_codec.macros.macro_ast import (
-   MacroCall, Def, MacroName
+   MacroCall, Def, MacroName, UnparsedFragment
 )
 
 from pegen.tokenizer import Tokenizer
@@ -234,7 +234,6 @@ class Parser(ParserBase):
             args["kind"] = "u"
         return ast.Constant(**args)
 
-
     def concatenate_strings(self, parts):
         """Concatenate multiple tokens and ast.JoinedStr"""
         # Get proper start and stop
@@ -379,6 +378,18 @@ class Parser(ParserBase):
         if type_comment or sys.version_info < (3, 9):
             arg.type_comment = type_comment
         return arg
+
+    def flatten(self, nested_list):
+        for item in nested_list:
+            if item is None:
+                continue
+            if isinstance(item, list):
+                yield from self.flatten(item)
+            else:
+                yield item
+
+    def make_fragment(self, *captures):
+        return UnparsedFragment(self.flatten(captures))
 
     def make_arguments(self,
         pos_only: Optional[List[Tuple[ast.arg, None]]],

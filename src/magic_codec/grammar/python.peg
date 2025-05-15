@@ -4,7 +4,7 @@
 
 @subheader'''
 from magic_codec.macros.parser import *
-from magic_codec.macros.ast import *
+from magic_codec.macros.macro_ast import *
 '''
 
 

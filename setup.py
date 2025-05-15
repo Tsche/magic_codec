@@ -32,6 +32,6 @@ setup(
     # },
     install_requires = ["colorama==0.4.6"],
     entry_points = {
-        'console_scripts': ['magic-macro=magic_codec.macro:main'],
+        'console_scripts': ['magic-macro=magic_codec.macros.__main__:main'],
     }
 )

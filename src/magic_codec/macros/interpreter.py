@@ -1,6 +1,6 @@
 import ast
 from token import NAME, NUMBER, STRING
-from tokenize import TokenInfo, tokenize, untokenize
+from tokenize import TokenInfo, tokenize
 from typing import Any, Generator, Iterable, Optional
 from magic_codec.macros.macro_ast import Code
 
@@ -81,18 +81,18 @@ class Interpreter:
             self.module.body.append(tree)
 
     def exec(self, code: Code, locals=None, memoize=True):
-        print("exec: ", code.string)
+        # print("exec: ", code.string)
         if memoize:
             self.push_code(code.ast)
         exec(code.string, self.globals, locals or self.globals)
 
     def eval(self, code: Code, locals=None):
-        print("eval: ", code.string, end=" -> ")
+        # print("eval: ", code.string) #, end=" -> ")
         ret = eval(code.string, self.globals, locals or self.globals)
-        print(ret)
+        # print(ret)
         return ret
 
     def apply_macros(self, code: Code, macros: Iterable[Code]):
-        call = synthesize_call_chain(macros, args=Code("__magic_macro_code_object"), convert_to="_Code")
-        call_locals = {'__magic_macro_code_object': Code(code), '_Code': Code}
+        call = synthesize_call_chain(macros, args=Code("__magic_macro_code_object"), convert_to="_CodeArtifact")
+        call_locals = {'__magic_macro_code_object': Code(code)}
         return self.eval(call, call_locals)

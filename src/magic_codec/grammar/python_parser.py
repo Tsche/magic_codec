@@ -9,11 +9,565 @@ from typing import Any, Optional
 
 from pegen.parser import memoize, memoize_left_rec, logger, Parser
 
-from magic_codec.macros.parser import *
-from magic_codec.macros.macro_ast import *
+import enum
+import io
+import itertools
+import os
+import sys
+import token
+from typing import (
+    Any, Callable, Iterator, List, Literal, NoReturn, Sequence, Tuple, TypeVar, Union
+)
+
+from pegen.tokenizer import Tokenizer
+
+# Singleton ast nodes, created once for efficiency
+Load = ast.Load()
+Store = ast.Store()
+Del = ast.Del()
+
+Node = TypeVar("Node")
+FC = TypeVar("FC", ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+
+EXPR_NAME_MAPPING = {
+    ast.Attribute: "attribute",
+    ast.Subscript: "subscript",
+    ast.Starred: "starred",
+    ast.Name: "name",
+    ast.List: "list",
+    ast.Tuple: "tuple",
+    ast.Lambda: "lambda",
+    ast.Call: "function call",
+    ast.BoolOp: "expression",
+    ast.BinOp: "expression",
+    ast.UnaryOp: "expression",
+    ast.GeneratorExp: "generator expression",
+    ast.Yield: "yield expression",
+    ast.YieldFrom: "yield expression",
+    ast.Await: "await expression",
+    ast.ListComp: "list comprehension",
+    ast.SetComp: "set comprehension",
+    ast.DictComp: "dict comprehension",
+    ast.Dict: "dict literal",
+    ast.Set: "set display",
+    ast.JoinedStr: "f-string expression",
+    ast.FormattedValue: "f-string expression",
+    ast.Compare: "comparison",
+    ast.IfExp: "conditional expression",
+    ast.NamedExpr: "named expression",
+}
+
+
+def parse_file(
+    path: str,
+    py_version: Optional[tuple]=None,
+    token_stream_factory: Optional[
+        Callable[[Callable[[], str]], Iterator[tokenize.TokenInfo]]
+    ] = None,
+    verbose:bool = False,
+) -> ast.Module:
+    """Parse a file."""
+    with open(path) as f:
+        tok_stream = (
+            token_stream_factory(f.readline)
+            if token_stream_factory else
+            tokenize.generate_tokens(f.readline)
+        )
+        tokenizer = Tokenizer(tok_stream, verbose=verbose, path=path)
+        parser = PythonParser(
+            tokenizer,
+            verbose=verbose,
+            filename=os.path.basename(path),
+            py_version=py_version
+        )
+        return parser.parse("file")
+
+
+def parse_string(
+    source: str,
+    mode: Union[Literal["eval"], Literal["exec"]],
+    py_version: Optional[tuple]=None,
+    token_stream_factory: Optional[
+        Callable[[Callable[[], str]], Iterator[tokenize.TokenInfo]]
+    ] = None,
+    verbose:bool = False,
+) -> Any:
+    """Parse a string."""
+    tok_stream = (
+        token_stream_factory(io.StringIO(source).readline)
+        if token_stream_factory else
+        tokenize.generate_tokens(io.StringIO(source).readline)
+    )
+    tokenizer = Tokenizer(tok_stream, verbose=verbose)
+    parser = PythonParser(tokenizer, verbose=verbose, py_version=py_version)
+    return parser.parse(mode if mode == "eval" else "file")
+
+
+class Target(enum.Enum):
+    FOR_TARGETS = enum.auto()
+    STAR_TARGETS = enum.auto()
+    DEL_TARGETS = enum.auto()
+
+
+class Parser(Parser):
+
+    #: Name of the source file, used in error reports
+    filename : str
+
+    def __init__(self,
+        tokenizer: Tokenizer, *,
+        verbose: bool = False,
+        filename: str = "<unknown>",
+        py_version: Optional[tuple] = None,
+    ) -> None:
+        super().__init__(tokenizer, verbose=verbose)
+        self.filename = filename
+        self.py_version = min(py_version, sys.version_info) if py_version else sys.version_info
+
+    def parse(self, rule: str, call_invalid_rules: bool = False) -> Optional[ast.AST]:
+        old = self.call_invalid_rules
+        self.call_invalid_rules = call_invalid_rules
+        res = getattr(self, rule)()
+
+        if res is None:
+
+            # Grab the last token that was parsed in the first run to avoid
+            # polluting a generic error reports with progress made by invalid rules.
+            last_token = self._tokenizer.diagnose()
+
+            if not call_invalid_rules:
+                self.call_invalid_rules = True
+
+                # Reset the parser cache to be able to restart parsing from the
+                # beginning.
+                self._reset(0)  # type: ignore
+                self._cache.clear()
+
+                res = getattr(self, rule)()
+
+            self.raise_raw_syntax_error("invalid syntax", last_token.start, last_token.end)
+
+        return res
+
+    def check_version(self, min_version: Tuple[int, ...], error_msg: str, node: Node) -> Node:
+        """Check that the python version is high enough for a rule to apply.
+
+        """
+        if self.py_version >= min_version:
+            return node
+        else:
+            raise SyntaxError(
+                f"{error_msg} is only supported in Python {min_version} and above."
+            )
+
+    def raise_indentation_error(self, msg: str) -> None:
+        """Raise an indentation error."""
+        last_token = self._tokenizer.diagnose()
+        args = (self.filename, last_token.start[0], last_token.start[1] + 1, last_token.line)
+        if sys.version_info >= (3, 10):
+            args += (last_token.end[0], last_token.end[1] + 1)
+        raise IndentationError(msg, args)
+
+    def get_expr_name(self, node) -> str:
+        """Get a descriptive name for an expression."""
+        # See https://github.com/python/cpython/blob/master/Parser/pegen.c#L161
+        assert node is not None
+        node_t = type(node)
+        if node_t is ast.Constant:
+            v = node.value
+            if v is Ellipsis:
+                return "ellipsis"
+            elif v is None:
+                return str(v)
+            # Avoid treating 1 as True through == comparison
+            elif v is True:
+                return str(v)
+            elif v is False:
+                return str(v)
+            else:
+                return "literal"
+
+        try:
+            return EXPR_NAME_MAPPING[node_t]
+        except KeyError:
+            raise ValueError(
+                f"unexpected expression in assignment {type(node).__name__} "
+                f"(line {node.lineno})."
+            )
+
+    def get_invalid_target(self, target: Target, node: Optional[ast.AST]) -> Optional[ast.AST]:
+        """Get the meaningful invalid target for different assignment type."""
+        if node is None:
+            return None
+
+        # We only need to visit List and Tuple nodes recursively as those
+        # are the only ones that can contain valid names in targets when
+        # they are parsed as expressions. Any other kind of expression
+        # that is a container (like Sets or Dicts) is directly invalid and
+        # we do not need to visit it recursively.
+        if isinstance(node, (ast.List, ast.Tuple)):
+            for e in node.elts:
+                if (inv := self.get_invalid_target(target, e)) is not None:
+                    return inv
+        elif isinstance(node, ast.Starred):
+            if target is Target.DEL_TARGETS:
+                return node
+            return self.get_invalid_target(target, node.value)
+        elif isinstance(node, ast.Compare):
+            # This is needed, because the `a in b` in `for a in b` gets parsed
+            # as a comparison, and so we need to search the left side of the comparison
+            # for invalid targets.
+            if target is Target.FOR_TARGETS:
+                if isinstance(node.ops[0], ast.In):
+                    return self.get_invalid_target(target, node.left)
+                return None
+
+            return node
+        elif isinstance(node, (ast.Name, ast.Subscript, ast.Attribute)):
+            return None
+        else:
+            return node
+
+    def set_expr_context(self, node, context):
+        """Set the context (Load, Store, Del) of an ast node."""
+        node.ctx = context
+        return node
+
+    def ensure_real(self, number: tokenize.TokenInfo) -> float:
+        value = ast.literal_eval(number.string)
+        if type(value) is complex:
+            self.raise_syntax_error_known_location("real number required in complex literal", number)
+        return value
+
+    def ensure_imaginary(self, number: tokenize.TokenInfo) -> complex:
+        value = ast.literal_eval(number.string)
+        if type(value) is not complex:
+            self.raise_syntax_error_known_location("imaginary number required in complex literal", number)
+        return value
+
+    def check_fstring_conversion(self, mark: tokenize.TokenInfo, name: tokenize.TokenInfo) -> tokenize.TokenInfo:
+        if mark.lineno != name.lineno or mark.col_offset != name.col_offset:
+            self.raise_syntax_error_known_range(
+                "f-string: conversion type must come right after the exclamanation mark",
+                mark,
+                name
+            )
+
+        s = name.string
+        if len(s) > 1 or s not in ("s", "r", "a"):
+            self.raise_syntax_error_known_location(
+                f"f-string: invalid conversion character '{s}': expected 's', 'r', or 'a'",
+                name,
+            )
+
+        return name
+
+    def _concat_strings_in_constant(self, parts) -> Union[str, bytes]:
+        s = ast.literal_eval(parts[0].string)
+        for ss in parts[1:]:
+            s += ast.literal_eval(ss.string)
+        args = dict(
+            value=s,
+            lineno=parts[0].start[0],
+            col_offset=parts[0].start[1],
+            end_lineno=parts[-1].end[0],
+            end_col_offset=parts[0].end[1],
+        )
+        if parts[0].string.startswith("u"):
+            args["kind"] = "u"
+        return ast.Constant(**args)
+
+
+    def concatenate_strings(self, parts):
+        """Concatenate multiple tokens and ast.JoinedStr"""
+        # Get proper start and stop
+        start = end = None
+        if isinstance(parts[0], ast.JoinedStr):
+            start = parts[0].lineno, parts[0].col_offset
+        if isinstance(parts[-1], ast.JoinedStr):
+            end = parts[-1].end_lineno, parts[-1].end_col_offset
+
+        # Combine the different parts
+        seen_joined = False
+        values = []
+        ss = []
+        for p in parts:
+            if isinstance(p, ast.JoinedStr):
+                seen_joined = True
+                if ss:
+                    values.append(self._concat_strings_in_constant(ss))
+                    ss.clear()
+                values.extend(p.values)
+            else:
+                ss.append(p)
+
+        if ss:
+            values.append(self._concat_strings_in_constant(ss))
+
+        consolidated = []
+        for p in values:
+            if consolidated and isinstance(consolidated[-1], ast.Constant) and isinstance(p, ast.Constant):
+                consolidated[-1].value += p.value
+                consolidated[-1].end_lineno = p.end_lineno
+                consolidated[-1].end_col_offset = p.end_col_offset
+            else:
+                consolidated.append(p)
+
+        if not seen_joined and len(values) == 1 and isinstance(values[0], ast.Constant):
+            return values[0]
+        else:
+            return ast.JoinedStr(
+                values=consolidated,
+                lineno=start[0] if start else values[0].lineno,
+                col_offset=start[1] if start else values[0].col_offset,
+                end_lineno=end[0] if end else values[-1].end_lineno,
+                end_col_offset=end[1] if end else values[-1].end_col_offset,
+            )
+
+    def generate_ast_for_string(self, tokens):
+        """Generate AST nodes for strings."""
+        err_args = None
+        line_offset = tokens[0].start[0]
+        line = line_offset
+        col_offset = 0
+        source = "(\n"
+        for t in tokens:
+            n_line = t.start[0] - line
+            if n_line:
+                col_offset = 0
+            source += """\n""" * n_line + ' ' * (t.start[1] - col_offset) + t.string
+            line, col_offset = t.end
+        source += "\n)"
+        try:
+            m = ast.parse(source)
+        except SyntaxError as err:
+            args = (err.filename, err.lineno + line_offset - 2, err.offset, err.text)
+            if sys.version_info >= (3, 10):
+                args += (err.end_lineno + line_offset - 2, err.end_offset)
+            err_args = (err.msg, args)
+            # Ensure we do not keep the frame alive longer than necessary
+            # by explicitly deleting the error once we got what we needed out
+            # of it
+            del err
+
+        # Avoid getting a triple nesting in the error report that does not
+        # bring anything relevant to the traceback.
+        if err_args is not None:
+            raise SyntaxError(*err_args)
+
+        node = m.body[0].value
+        # Since we asked Python to parse an alterred source starting at line 2
+        # we alter the lineno of the returned AST to recover the right line.
+        # If the string start at line 1, tha AST says 2 so we need to decrement by 1
+        # hence the -2.
+        ast.increment_lineno(node, line_offset - 2)
+        return node
+
+    def extract_import_level(self, tokens: List[tokenize.TokenInfo]) -> int:
+        """Extract the relative import level from the tokens preceding the module name.
+
+        '.' count for one and '...' for 3.
+
+        """
+        level = 0
+        for t in tokens:
+            if t.string == ".":
+                level += 1
+            else:
+                level += 3
+        return level
+
+    def set_decorators(self,
+        target: FC,
+        decorators: list
+    ) -> FC:
+        """Set the decorators on a function or class definition."""
+        target.decorator_list = decorators
+        return target
+
+    def get_comparison_ops(self, pairs):
+        return [op for op, _ in pairs]
+
+    def get_comparators(self, pairs):
+        return [comp for _, comp in pairs]
+
+    def set_arg_type_comment(self, arg, type_comment):
+        if type_comment or sys.version_info < (3, 9):
+            arg.type_comment = type_comment
+        return arg
+
+    def make_arguments(self,
+        pos_only: Optional[List[Tuple[ast.arg, None]]],
+        pos_only_with_default: List[Tuple[ast.arg, Any]],
+        param_no_default: Optional[List[Tuple[ast.arg, None]]],
+        param_default: Optional[List[Tuple[ast.arg, Any]]],
+        after_star: Optional[Tuple[Optional[ast.arg], List[Tuple[ast.arg, Any]], Optional[ast.arg]]]
+    ) -> ast.arguments:
+        """Build a function definition arguments."""
+        defaults = (
+            [d for _, d in pos_only_with_default if d is not None]
+            if pos_only_with_default else
+            []
+        )
+        defaults += (
+            [d for _, d in param_default if d is not None]
+            if param_default else
+            []
+        )
+
+        pos_only = pos_only or pos_only_with_default
+
+        # Because we need to combine pos only with and without default even
+        # the version with no default is a tuple
+        pos_only = [p for p, _ in pos_only]
+        params = (param_no_default or []) + ([p for p, _ in param_default] if param_default else [])
+
+        # If after_star is None, make a default tuple
+        after_star = after_star or (None, [], None)
+
+        return ast.arguments(
+            posonlyargs=pos_only,
+            args=params,
+            defaults=defaults,
+            vararg=after_star[0],
+            kwonlyargs=[p for p, _ in after_star[1]],
+            kw_defaults=[d for _, d in after_star[1]],
+            kwarg=after_star[2]
+        )
+
+    def _build_syntax_error(
+        self,
+        message: str,
+        start: Optional[Tuple[int, int]] = None,
+        end: Optional[Tuple[int, int]] = None
+    ) -> SyntaxError:
+        line_from_token = start is None and end is None
+        if start is None or end is None:
+            tok = self._tokenizer.diagnose()
+            start = start or tok.start
+            end = end or tok.end
+
+        if line_from_token:
+            line = tok.line
+        else:
+            # End is used only to get the proper text
+            line = "\n".join(
+                self._tokenizer.get_lines(list(range(start[0], end[0] + 1)))
+            )
+
+        # tokenize.py index column offset from 0 while Cpython index column
+        # offset at 1 when reporting SyntaxError, so we need to increment
+        # the column offset when reporting the error.
+        args = (self.filename, start[0], start[1] + 1, line)
+        if sys.version_info >= (3, 10):
+            args += (end[0], end[1] + 1)
+
+        return SyntaxError(message, args)
+
+    def raise_raw_syntax_error(
+        self,
+        message: str,
+        start: Optional[Tuple[int, int]] = None,
+        end: Optional[Tuple[int, int]] = None
+    ) -> NoReturn:
+        raise self._build_syntax_error(message, start, end)
+
+    def make_syntax_error(self, message: str) -> SyntaxError:
+        return self._build_syntax_error(message)
+
+    def expect_forced(self, res: Any, expectation: str) -> Optional[tokenize.TokenInfo]:
+        if res is None:
+            last_token = self._tokenizer.diagnose()
+            end = last_token.start
+            if (
+                sys.version_info >= (3, 12)
+                or (
+                    sys.version_info >= (3, 11)
+                    and last_token.type != 4
+                )
+            ):  # i.e. not a 
+
+                end = last_token.end
+            self.raise_raw_syntax_error(
+                f"expected {expectation}", last_token.start, end
+            )
+        return res
+
+    def raise_syntax_error(self, message: str) -> NoReturn:
+        """Raise a syntax error."""
+        tok = self._tokenizer.diagnose()
+        raise self._build_syntax_error(
+            message, tok.start,
+            tok.end if sys.version_info >= (3, 12) or tok.type != 4 else tok.start
+        )
+
+    def raise_syntax_error_known_location(
+        self, message: str, node: Union[ast.AST, tokenize.TokenInfo]
+    ) -> NoReturn:
+        """Raise a syntax error that occured at a given AST node."""
+        if isinstance(node, tokenize.TokenInfo):
+            start = node.start
+            end = node.end
+        else:
+            start = node.lineno, node.col_offset
+            end = node.end_lineno, node.end_col_offset
+
+        raise self._build_syntax_error(message, start, end)
+
+    def raise_syntax_error_known_range(
+        self,
+        message: str,
+        start_node: Union[ast.AST, tokenize.TokenInfo],
+        end_node: Union[ast.AST, tokenize.TokenInfo]
+    ) -> NoReturn:
+        if isinstance(start_node, tokenize.TokenInfo):
+            start = start_node.start
+        else:
+            start = start_node.lineno, start_node.col_offset
+
+        if isinstance(end_node, tokenize.TokenInfo):
+            end = end_node.end
+        else:
+            end = end_node.end_lineno, end_node.end_col_offset
+
+        raise self._build_syntax_error(message, start, end)
+
+    def raise_syntax_error_starting_from(
+        self,
+        message: str,
+        start_node: Union[ast.AST, tokenize.TokenInfo]
+    ) -> NoReturn:
+        if isinstance(start_node, tokenize.TokenInfo):
+            start = start_node.start
+        else:
+            start = start_node.lineno, start_node.col_offset
+
+        last_token = self._tokenizer.diagnose()
+
+        raise self._build_syntax_error(message, start, last_token.start)
+
+    def raise_syntax_error_invalid_target(
+        self, target: Target, node: Optional[ast.AST]
+    ) -> None:
+        invalid_target = self.get_invalid_target(target, node)
+
+        if invalid_target is None:
+            return None
+
+        if target in (Target.STAR_TARGETS, Target.FOR_TARGETS):
+            msg = f"cannot assign to {self.get_expr_name(invalid_target)}"
+        else:
+            msg = f"cannot delete {self.get_expr_name(invalid_target)}"
+
+        self.raise_syntax_error_known_location(msg, invalid_target)
+
+    def raise_syntax_error_on_next_token(self, message: str) -> NoReturn:
+        next_token = self._tokenizer.peek()
+        raise self._build_syntax_error(message, next_token.start, next_token.end)
+
 
 # Keywords and soft keywords are listed at the end of the parser definition.
-class MacroPythonParser(Parser):
+class PythonParser(Parser):
 
     @memoize
     def start(self) -> Optional[Any]:
@@ -296,13 +850,8 @@ class MacroPythonParser(Parser):
 
     @memoize
     def compound_stmt(self) -> Optional[Any]:
-        # compound_stmt: macro_stmt | &('def' | '@' | 'async') function_def | &'if' if_stmt | &('class' | '@') class_def | &('with' | 'async') with_stmt | &('for' | 'async') for_stmt | &'try' try_stmt | &'while' while_stmt | match_stmt
+        # compound_stmt: &('def' | '@' | 'async') function_def | &'if' if_stmt | &('class' | '@') class_def | &('with' | 'async') with_stmt | &('for' | 'async') for_stmt | &'try' try_stmt | &'while' while_stmt | match_stmt
         mark = self._mark()
-        if (
-            (macro_stmt := self.macro_stmt())
-        ):
-            return macro_stmt;
-        self._reset(mark)
         if (
             (self.positive_lookahead(self._tmp_8, ))
             and
@@ -677,67 +1226,55 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def import_name(self) -> Optional[Import]:
-        # import_name: 'import' '!'? dotted_as_names
+    def import_name(self) -> Optional[ast . Import]:
+        # import_name: 'import' dotted_as_names
         mark = self._mark()
         tok = self._tokenizer.peek()
         start_lineno, start_col_offset = tok.start
         if (
             (self.expect('import'))
-            and
-            (m := self.expect('!'),)
             and
             (a := self.dotted_as_names())
         ):
             tok = self._tokenizer.get_last_non_whitespace_token()
             end_lineno, end_col_offset = tok.end
-            return Import ( names = a , is_macro = bool ( m ) , lineno=start_lineno, col_offset=start_col_offset, end_lineno=end_lineno, end_col_offset=end_col_offset );
+            return ast . Import ( names = a , lineno=start_lineno, col_offset=start_col_offset, end_lineno=end_lineno, end_col_offset=end_col_offset );
         self._reset(mark)
         return None;
 
     @memoize
-    def import_from(self) -> Optional[ImportFrom]:
-        # import_from: 'from' '!'? (('.' | '...'))* dotted_name '!'? 'import' '!'? import_from_targets | 'from' '!'? (('.' | '...'))+ 'import' '!'? import_from_targets
+    def import_from(self) -> Optional[ast . ImportFrom]:
+        # import_from: 'from' (('.' | '...'))* dotted_name 'import' import_from_targets | 'from' (('.' | '...'))+ 'import' import_from_targets
         mark = self._mark()
         tok = self._tokenizer.peek()
         start_lineno, start_col_offset = tok.start
         if (
             (self.expect('from'))
             and
-            (f := self.expect('!'),)
-            and
             (a := self._loop0_25(),)
             and
             (b := self.dotted_name())
             and
-            (mb := self.expect('!'),)
-            and
             (self.expect('import'))
-            and
-            (i := self.expect('!'),)
             and
             (c := self.import_from_targets())
         ):
             tok = self._tokenizer.get_last_non_whitespace_token()
             end_lineno, end_col_offset = tok.end
-            return ImportFrom ( module = maybe_macro ( mb , b ) , names = c , level = self . extract_import_level ( a ) , is_macro = bool ( f or i ) , lineno=start_lineno, col_offset=start_col_offset, end_lineno=end_lineno, end_col_offset=end_col_offset );
+            return ast . ImportFrom ( module = b , names = c , level = self . extract_import_level ( a ) , lineno=start_lineno, col_offset=start_col_offset, end_lineno=end_lineno, end_col_offset=end_col_offset );
         self._reset(mark)
         if (
             (self.expect('from'))
-            and
-            (f := self.expect('!'),)
             and
             (a := self._loop1_26())
             and
             (self.expect('import'))
             and
-            (i := self.expect('!'),)
-            and
             (b := self.import_from_targets())
         ):
             tok = self._tokenizer.get_last_non_whitespace_token()
             end_lineno, end_col_offset = tok.end
-            return ImportFrom ( names = b , level = self . extract_import_level ( a ) , is_macro = bool ( f or i ) , lineno=start_lineno, col_offset=start_col_offset, end_lineno=end_lineno, end_col_offset=end_col_offset ) if sys . version_info >= ( 3 , 9 ) else ImportFrom ( module = None , names = b , level = self . extract_import_level ( a ) , is_macro = bool ( f or i ) , lineno=start_lineno, col_offset=start_col_offset, end_lineno=end_lineno, end_col_offset=end_col_offset );
+            return ast . ImportFrom ( names = b , level = self . extract_import_level ( a ) , lineno=start_lineno, col_offset=start_col_offset, end_lineno=end_lineno, end_col_offset=end_col_offset ) if sys . version_info >= ( 3 , 9 ) else ast . ImportFrom ( module = None , names = b , level = self . extract_import_level ( a ) , lineno=start_lineno, col_offset=start_col_offset, end_lineno=end_lineno, end_col_offset=end_col_offset );
         self._reset(mark)
         return None;
 
@@ -794,20 +1331,18 @@ class MacroPythonParser(Parser):
 
     @memoize
     def import_from_as_name(self) -> Optional[ast . alias]:
-        # import_from_as_name: NAME '!'? ['as' NAME '!'?]
+        # import_from_as_name: NAME ['as' NAME]
         mark = self._mark()
         tok = self._tokenizer.peek()
         start_lineno, start_col_offset = tok.start
         if (
             (a := self.name())
             and
-            (m := self.expect('!'),)
-            and
             (b := self._tmp_29(),)
         ):
             tok = self._tokenizer.get_last_non_whitespace_token()
             end_lineno, end_col_offset = tok.end
-            return ast . alias ( name = maybe_macro ( m , a . string ) , asname = b , lineno=start_lineno, col_offset=start_col_offset, end_lineno=end_lineno, end_col_offset=end_col_offset );
+            return ast . alias ( name = a . string , asname = b , lineno=start_lineno, col_offset=start_col_offset, end_lineno=end_lineno, end_col_offset=end_col_offset );
         self._reset(mark)
         return None;
 
@@ -824,20 +1359,18 @@ class MacroPythonParser(Parser):
 
     @memoize
     def dotted_as_name(self) -> Optional[ast . alias]:
-        # dotted_as_name: dotted_name '!'? ['as' NAME '!'?]
+        # dotted_as_name: dotted_name ['as' NAME]
         mark = self._mark()
         tok = self._tokenizer.peek()
         start_lineno, start_col_offset = tok.start
         if (
             (a := self.dotted_name())
             and
-            (m := self.expect('!'),)
-            and
             (b := self._tmp_32(),)
         ):
             tok = self._tokenizer.get_last_non_whitespace_token()
             end_lineno, end_col_offset = tok.end
-            return ast . alias ( name = maybe_macro ( m , a ) , asname = b , lineno=start_lineno, col_offset=start_col_offset, end_lineno=end_lineno, end_col_offset=end_col_offset );
+            return ast . alias ( name = a , asname = b , lineno=start_lineno, col_offset=start_col_offset, end_lineno=end_lineno, end_col_offset=end_col_offset );
         self._reset(mark)
         return None;
 
@@ -903,7 +1436,7 @@ class MacroPythonParser(Parser):
 
     @memoize
     def decorator(self) -> Optional[Any]:
-        # decorator: ('@' dec_macro NEWLINE) | ('@' dec_maybe_call NEWLINE) | ('@' named_expression NEWLINE)
+        # decorator: ('@' dec_maybe_call NEWLINE) | ('@' named_expression NEWLINE)
         mark = self._mark()
         if (
             (a := self._tmp_34())
@@ -912,11 +1445,6 @@ class MacroPythonParser(Parser):
         self._reset(mark)
         if (
             (a := self._tmp_35())
-        ):
-            return a;
-        self._reset(mark)
-        if (
-            (a := self._tmp_36())
         ):
             return self . check_version ( ( 3 , 9 ) , "Generic decorator are" , a );
         self._reset(mark)
@@ -975,15 +1503,15 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def class_def(self) -> Optional[Union [ClassDef]]:
-        # class_def: decorators &'class' | class_def_raw
+    def class_def(self) -> Optional[ast . ClassDef]:
+        # class_def: decorators class_def_raw | class_def_raw
         mark = self._mark()
         if (
             (a := self.decorators())
             and
-            (self.positive_lookahead(self.expect, 'class'))
+            (b := self.class_def_raw())
         ):
-            return self . set_decorators ( a , self . unparsed_class_def , self . class_def_raw );
+            return self . set_decorators ( b , a );
         self._reset(mark)
         if (
             (class_def_raw := self.class_def_raw())
@@ -993,8 +1521,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def class_def_raw(self) -> Optional[Union [ClassDef]]:
-        # class_def_raw: invalid_class_def_raw | 'class' maybe_macro type_params? ['(' arguments? ')'] &&':' block
+    def class_def_raw(self) -> Optional[ast . ClassDef]:
+        # class_def_raw: invalid_class_def_raw | 'class' NAME type_params? ['(' arguments? ')'] &&':' block
         mark = self._mark()
         tok = self._tokenizer.peek()
         start_lineno, start_col_offset = tok.start
@@ -1008,11 +1536,11 @@ class MacroPythonParser(Parser):
         if (
             (self.expect('class'))
             and
-            (a := self.maybe_macro())
+            (a := self.name())
             and
             (t := self.type_params(),)
             and
-            (b := self._tmp_37(),)
+            (b := self._tmp_36(),)
             and
             (self.expect_forced(self.expect(':'), "':'"))
             and
@@ -1020,31 +1548,31 @@ class MacroPythonParser(Parser):
         ):
             tok = self._tokenizer.get_last_non_whitespace_token()
             end_lineno, end_col_offset = tok.end
-            return ( ClassDef ( a . string , bases = b [0] if b else [] , keywords = b [1] if b else [] , body = c , decorator_list = [] , type_params = t or [] , is_macro = isinstance ( a , MacroName ) , lineno=start_lineno, col_offset=start_col_offset, end_lineno=end_lineno, end_col_offset=end_col_offset , ) if sys . version_info >= ( 3 , 12 ) else ClassDef ( a . string , bases = b [0] if b else [] , keywords = b [1] if b else [] , body = c , decorator_list = [] , is_macro = isinstance ( a , MacroName ) , lineno=start_lineno, col_offset=start_col_offset, end_lineno=end_lineno, end_col_offset=end_col_offset , ) );
+            return ( ast . ClassDef ( a . string , bases = b [0] if b else [] , keywords = b [1] if b else [] , body = c , decorator_list = [] , type_params = t or [] , lineno=start_lineno, col_offset=start_col_offset, end_lineno=end_lineno, end_col_offset=end_col_offset , ) if sys . version_info >= ( 3 , 12 ) else ast . ClassDef ( a . string , bases = b [0] if b else [] , keywords = b [1] if b else [] , body = c , decorator_list = [] , lineno=start_lineno, col_offset=start_col_offset, end_lineno=end_lineno, end_col_offset=end_col_offset , ) );
         self._reset(mark)
         return None;
 
     @memoize
-    def function_def(self) -> Optional[Union [FunctionDef , AsyncFunctionDef]]:
-        # function_def: decorators &('def' | 'async') | function_def_raw
+    def function_def(self) -> Optional[Union [ast . FunctionDef , ast . AsyncFunctionDef]]:
+        # function_def: decorators function_def_raw | function_def_raw
         mark = self._mark()
         if (
             (d := self.decorators())
             and
-            (self.positive_lookahead(self._tmp_38, ))
+            (f := self.function_def_raw())
         ):
-            return self . set_decorators ( d , self . unparsed_function_def , self . function_def_raw );
+            return self . set_decorators ( f , d );
         self._reset(mark)
         if (
-            (function_def_raw := self.function_def_raw())
+            (f := self.function_def_raw())
         ):
-            return function_def_raw;
+            return self . set_decorators ( f , [] );
         self._reset(mark)
         return None;
 
     @memoize
-    def function_def_raw(self) -> Optional[Union [FunctionDef , AsyncFunctionDef]]:
-        # function_def_raw: invalid_def_raw | 'def' maybe_macro type_params? &&'(' params? ')' ['->' expression] &&':' func_type_comment? block | 'async' 'def' maybe_macro type_params? &&'(' params? ')' ['->' expression] &&':' func_type_comment? block
+    def function_def_raw(self) -> Optional[Union [ast . FunctionDef , ast . AsyncFunctionDef]]:
+        # function_def_raw: invalid_def_raw | 'def' NAME type_params? &&'(' params? ')' ['->' expression] &&':' func_type_comment? block | 'async' 'def' NAME type_params? &&'(' params? ')' ['->' expression] &&':' func_type_comment? block
         mark = self._mark()
         tok = self._tokenizer.peek()
         start_lineno, start_col_offset = tok.start
@@ -1058,7 +1586,7 @@ class MacroPythonParser(Parser):
         if (
             (self.expect('def'))
             and
-            (n := self.maybe_macro())
+            (n := self.name())
             and
             (t := self.type_params(),)
             and
@@ -1068,7 +1596,7 @@ class MacroPythonParser(Parser):
             and
             (self.expect(')'))
             and
-            (a := self._tmp_39(),)
+            (a := self._tmp_37(),)
             and
             (self.expect_forced(self.expect(':'), "':'"))
             and
@@ -1078,14 +1606,14 @@ class MacroPythonParser(Parser):
         ):
             tok = self._tokenizer.get_last_non_whitespace_token()
             end_lineno, end_col_offset = tok.end
-            return ( FunctionDef ( name = n . string , args = params or self . make_arguments ( None , [] , None , [] , None ) , returns = a , body = b , type_comment = tc , type_params = t or [] , decorator_list = [] , is_macro = isinstance ( n , MacroName ) , lineno=start_lineno, col_offset=start_col_offset, end_lineno=end_lineno, end_col_offset=end_col_offset , ) if sys . version_info >= ( 3 , 12 ) else FunctionDef ( name = n . string , args = params or self . make_arguments ( None , [] , None , [] , None ) , returns = a , body = b , type_comment = tc , decorator_list = [] , is_macro = isinstance ( n , MacroName ) , lineno=start_lineno, col_offset=start_col_offset, end_lineno=end_lineno, end_col_offset=end_col_offset , ) );
+            return ( ast . FunctionDef ( name = n . string , args = params or self . make_arguments ( None , [] , None , [] , None ) , returns = a , body = b , type_comment = tc , type_params = t or [] , lineno=start_lineno, col_offset=start_col_offset, end_lineno=end_lineno, end_col_offset=end_col_offset , ) if sys . version_info >= ( 3 , 12 ) else ast . FunctionDef ( name = n . string , args = params or self . make_arguments ( None , [] , None , [] , None ) , returns = a , body = b , type_comment = tc , lineno=start_lineno, col_offset=start_col_offset, end_lineno=end_lineno, end_col_offset=end_col_offset , ) );
         self._reset(mark)
         if (
             (self.expect('async'))
             and
             (self.expect('def'))
             and
-            (n := self.maybe_macro())
+            (n := self.name())
             and
             (t := self.type_params(),)
             and
@@ -1095,7 +1623,7 @@ class MacroPythonParser(Parser):
             and
             (self.expect(')'))
             and
-            (a := self._tmp_40(),)
+            (a := self._tmp_38(),)
             and
             (self.expect_forced(self.expect(':'), "':'"))
             and
@@ -1105,7 +1633,7 @@ class MacroPythonParser(Parser):
         ):
             tok = self._tokenizer.get_last_non_whitespace_token()
             end_lineno, end_col_offset = tok.end
-            return ( self . check_version ( ( 3 , 5 ) , "Async functions are" , AsyncFunctionDef ( name = n . string , args = params or self . make_arguments ( None , [] , None , [] , None ) , returns = a , body = b , type_comment = tc , type_params = t or [] , decorator_list = [] , is_macro = isinstance ( n , MacroName ) , lineno=start_lineno, col_offset=start_col_offset, end_lineno=end_lineno, end_col_offset=end_col_offset , ) ) if sys . version_info >= ( 3 , 12 ) else self . check_version ( ( 3 , 5 ) , "Async functions are" , AsyncFunctionDef ( name = n . string , args = params or self . make_arguments ( None , [] , None , [] , None ) , returns = a , body = b , type_comment = tc , decorator_list = [] , is_macro = isinstance ( n , MacroName ) , lineno=start_lineno, col_offset=start_col_offset, end_lineno=end_lineno, end_col_offset=end_col_offset , ) ) );
+            return ( self . check_version ( ( 3 , 5 ) , "Async functions are" , ast . AsyncFunctionDef ( name = n . string , args = params or self . make_arguments ( None , [] , None , [] , None ) , returns = a , body = b , type_comment = tc , type_params = t or [] , lineno=start_lineno, col_offset=start_col_offset, end_lineno=end_lineno, end_col_offset=end_col_offset , ) ) if sys . version_info >= ( 3 , 12 ) else self . check_version ( ( 3 , 5 ) , "Async functions are" , ast . AsyncFunctionDef ( name = n . string , args = params or self . make_arguments ( None , [] , None , [] , None ) , returns = a , body = b , type_comment = tc , lineno=start_lineno, col_offset=start_col_offset, end_lineno=end_lineno, end_col_offset=end_col_offset , ) ) );
         self._reset(mark)
         return None;
 
@@ -1134,9 +1662,9 @@ class MacroPythonParser(Parser):
         if (
             (a := self.slash_no_default())
             and
-            (b := self._loop0_41(),)
+            (b := self._loop0_39(),)
             and
-            (c := self._loop0_42(),)
+            (c := self._loop0_40(),)
             and
             (d := self.star_etc(),)
         ):
@@ -1145,23 +1673,23 @@ class MacroPythonParser(Parser):
         if (
             (a := self.slash_with_default())
             and
-            (b := self._loop0_43(),)
+            (b := self._loop0_41(),)
             and
             (c := self.star_etc(),)
         ):
             return self . check_version ( ( 3 , 8 ) , "Positional only arguments are" , self . make_arguments ( None , a , None , b , c ) , );
         self._reset(mark)
         if (
-            (a := self._loop1_44())
+            (a := self._loop1_42())
             and
-            (b := self._loop0_45(),)
+            (b := self._loop0_43(),)
             and
             (c := self.star_etc(),)
         ):
             return self . make_arguments ( None , [] , a , b , c );
         self._reset(mark)
         if (
-            (a := self._loop1_46())
+            (a := self._loop1_44())
             and
             (b := self.star_etc(),)
         ):
@@ -1179,7 +1707,7 @@ class MacroPythonParser(Parser):
         # slash_no_default: param_no_default+ '/' ',' | param_no_default+ '/' &')'
         mark = self._mark()
         if (
-            (a := self._loop1_47())
+            (a := self._loop1_45())
             and
             (self.expect('/'))
             and
@@ -1188,7 +1716,7 @@ class MacroPythonParser(Parser):
             return [( p , None ) for p in a];
         self._reset(mark)
         if (
-            (a := self._loop1_48())
+            (a := self._loop1_46())
             and
             (self.expect('/'))
             and
@@ -1203,9 +1731,9 @@ class MacroPythonParser(Parser):
         # slash_with_default: param_no_default* param_with_default+ '/' ',' | param_no_default* param_with_default+ '/' &')'
         mark = self._mark()
         if (
-            (a := self._loop0_49(),)
+            (a := self._loop0_47(),)
             and
-            (b := self._loop1_50())
+            (b := self._loop1_48())
             and
             (self.expect('/'))
             and
@@ -1214,9 +1742,9 @@ class MacroPythonParser(Parser):
             return ( [( p , None ) for p in a] if a else [] ) + b;
         self._reset(mark)
         if (
-            (a := self._loop0_51(),)
+            (a := self._loop0_49(),)
             and
-            (b := self._loop1_52())
+            (b := self._loop1_50())
             and
             (self.expect('/'))
             and
@@ -1242,7 +1770,7 @@ class MacroPythonParser(Parser):
             and
             (a := self.param_no_default())
             and
-            (b := self._loop0_53(),)
+            (b := self._loop0_51(),)
             and
             (c := self.kwds(),)
         ):
@@ -1253,7 +1781,7 @@ class MacroPythonParser(Parser):
             and
             (a := self.param_no_default_star_annotation())
             and
-            (b := self._loop0_54(),)
+            (b := self._loop0_52(),)
             and
             (c := self.kwds(),)
         ):
@@ -1264,7 +1792,7 @@ class MacroPythonParser(Parser):
             and
             (self.expect(','))
             and
-            (b := self._loop1_55())
+            (b := self._loop1_53())
             and
             (c := self.kwds(),)
         ):
@@ -1573,7 +2101,7 @@ class MacroPythonParser(Parser):
 
     @memoize
     def else_block(self) -> Optional[list]:
-        # else_block: invalid_else_stmt | &'else' macro_stmt | 'else' &&':' block
+        # else_block: invalid_else_stmt | 'else' &&':' block
         mark = self._mark()
         if (
             self.call_invalid_rules
@@ -1581,13 +2109,6 @@ class MacroPythonParser(Parser):
             (self.invalid_else_stmt())
         ):
             return None  # pragma: no cover;
-        self._reset(mark)
-        if (
-            (self.positive_lookahead(self.expect, 'else'))
-            and
-            (a := self.macro_stmt())
-        ):
-            return a;
         self._reset(mark)
         if (
             (self.expect('else'))
@@ -1724,7 +2245,7 @@ class MacroPythonParser(Parser):
             and
             (self.expect('('))
             and
-            (a := self._gather_56())
+            (a := self._gather_54())
             and
             (self.expect(','),)
             and
@@ -1741,7 +2262,7 @@ class MacroPythonParser(Parser):
         if (
             (self.expect('with'))
             and
-            (a := self._gather_58())
+            (a := self._gather_56())
             and
             (self.expect(':'))
             and
@@ -1760,7 +2281,7 @@ class MacroPythonParser(Parser):
             and
             (self.expect('('))
             and
-            (a := self._gather_60())
+            (a := self._gather_58())
             and
             (self.expect(','),)
             and
@@ -1779,7 +2300,7 @@ class MacroPythonParser(Parser):
             and
             (self.expect('with'))
             and
-            (a := self._gather_62())
+            (a := self._gather_60())
             and
             (self.expect(':'))
             and
@@ -1811,7 +2332,7 @@ class MacroPythonParser(Parser):
             and
             (t := self.star_target())
             and
-            (self.positive_lookahead(self._tmp_64, ))
+            (self.positive_lookahead(self._tmp_62, ))
         ):
             return ast . withitem ( context_expr = e , optional_vars = t );
         self._reset(mark)
@@ -1831,7 +2352,7 @@ class MacroPythonParser(Parser):
 
     @memoize
     def try_stmt(self) -> Optional[ast . Try]:
-        # try_stmt: invalid_try_stmt | &'try' macro_stmt | 'try' &&':' block finally_block | 'try' &&':' block except_block+ else_block? finally_block? | 'try' &&':' block except_star_block+ else_block? finally_block?
+        # try_stmt: invalid_try_stmt | 'try' &&':' block finally_block | 'try' &&':' block except_block+ else_block? finally_block? | 'try' &&':' block except_star_block+ else_block? finally_block?
         mark = self._mark()
         tok = self._tokenizer.peek()
         start_lineno, start_col_offset = tok.start
@@ -1841,13 +2362,6 @@ class MacroPythonParser(Parser):
             (self.invalid_try_stmt())
         ):
             return None  # pragma: no cover;
-        self._reset(mark)
-        if (
-            (self.positive_lookahead(self.expect, 'try'))
-            and
-            (a := self.macro_stmt())
-        ):
-            return a;
         self._reset(mark)
         if (
             (self.expect('try'))
@@ -1869,7 +2383,7 @@ class MacroPythonParser(Parser):
             and
             (b := self.block())
             and
-            (ex := self._loop1_65())
+            (ex := self._loop1_63())
             and
             (el := self.else_block(),)
             and
@@ -1886,7 +2400,7 @@ class MacroPythonParser(Parser):
             and
             (b := self.block())
             and
-            (ex := self._loop1_66())
+            (ex := self._loop1_64())
             and
             (el := self.else_block(),)
             and
@@ -1916,7 +2430,7 @@ class MacroPythonParser(Parser):
             and
             (e := self.expression())
             and
-            (t := self._tmp_67(),)
+            (t := self._tmp_65(),)
             and
             (self.expect(':'))
             and
@@ -1966,7 +2480,7 @@ class MacroPythonParser(Parser):
             and
             (e := self.expression())
             and
-            (t := self._tmp_68(),)
+            (t := self._tmp_66(),)
             and
             (self.expect(':'))
             and
@@ -1987,7 +2501,7 @@ class MacroPythonParser(Parser):
 
     @memoize
     def finally_block(self) -> Optional[list]:
-        # finally_block: invalid_finally_stmt | &'finally' macro_stmt | 'finally' &&':' block
+        # finally_block: invalid_finally_stmt | 'finally' &&':' block
         mark = self._mark()
         if (
             self.call_invalid_rules
@@ -1995,13 +2509,6 @@ class MacroPythonParser(Parser):
             (self.invalid_finally_stmt())
         ):
             return None  # pragma: no cover;
-        self._reset(mark)
-        if (
-            (self.positive_lookahead(self.expect, 'finally'))
-            and
-            (a := self.macro_stmt())
-        ):
-            return a;
         self._reset(mark)
         if (
             (self.expect('finally'))
@@ -2031,7 +2538,7 @@ class MacroPythonParser(Parser):
             and
             (self.expect('INDENT'))
             and
-            (cases := self._loop1_69())
+            (cases := self._loop1_67())
             and
             (self.expect('DEDENT'))
         ):
@@ -2180,7 +2687,7 @@ class MacroPythonParser(Parser):
         tok = self._tokenizer.peek()
         start_lineno, start_col_offset = tok.start
         if (
-            (patterns := self._gather_70())
+            (patterns := self._gather_68())
         ):
             tok = self._tokenizer.get_last_non_whitespace_token()
             end_lineno, end_col_offset = tok.end
@@ -2243,7 +2750,7 @@ class MacroPythonParser(Parser):
         if (
             (value := self.signed_number())
             and
-            (self.negative_lookahead(self._tmp_72, ))
+            (self.negative_lookahead(self._tmp_70, ))
         ):
             tok = self._tokenizer.get_last_non_whitespace_token()
             end_lineno, end_col_offset = tok.end
@@ -2295,7 +2802,7 @@ class MacroPythonParser(Parser):
         if (
             (signed_number := self.signed_number())
             and
-            (self.negative_lookahead(self._tmp_73, ))
+            (self.negative_lookahead(self._tmp_71, ))
         ):
             return signed_number;
         self._reset(mark)
@@ -2462,7 +2969,7 @@ class MacroPythonParser(Parser):
             and
             (name := self.name())
             and
-            (self.negative_lookahead(self._tmp_74, ))
+            (self.negative_lookahead(self._tmp_72, ))
         ):
             return name . string;
         self._reset(mark)
@@ -2492,7 +2999,7 @@ class MacroPythonParser(Parser):
         if (
             (attr := self.attr())
             and
-            (self.negative_lookahead(self._tmp_75, ))
+            (self.negative_lookahead(self._tmp_73, ))
         ):
             tok = self._tokenizer.get_last_non_whitespace_token()
             end_lineno, end_col_offset = tok.end
@@ -2604,7 +3111,7 @@ class MacroPythonParser(Parser):
         # maybe_sequence_pattern: ','.maybe_star_pattern+ ','?
         mark = self._mark()
         if (
-            (patterns := self._gather_76())
+            (patterns := self._gather_74())
             and
             (self.expect(','),)
         ):
@@ -2719,9 +3226,9 @@ class MacroPythonParser(Parser):
         # items_pattern: ','.key_value_pattern+
         mark = self._mark()
         if (
-            (_gather_78 := self._gather_78())
+            (_gather_76 := self._gather_76())
         ):
-            return _gather_78;
+            return _gather_76;
         self._reset(mark)
         return None;
 
@@ -2730,7 +3237,7 @@ class MacroPythonParser(Parser):
         # key_value_pattern: (literal_expr | attr) ':' pattern
         mark = self._mark()
         if (
-            (key := self._tmp_80())
+            (key := self._tmp_78())
             and
             (self.expect(':'))
             and
@@ -2833,7 +3340,7 @@ class MacroPythonParser(Parser):
         # positional_patterns: ','.pattern+
         mark = self._mark()
         if (
-            (args := self._gather_81())
+            (args := self._gather_79())
         ):
             return args;
         self._reset(mark)
@@ -2844,9 +3351,9 @@ class MacroPythonParser(Parser):
         # keyword_patterns: ','.keyword_pattern+
         mark = self._mark()
         if (
-            (_gather_83 := self._gather_83())
+            (_gather_81 := self._gather_81())
         ):
-            return _gather_83;
+            return _gather_81;
         self._reset(mark)
         return None;
 
@@ -2908,7 +3415,7 @@ class MacroPythonParser(Parser):
         # type_param_seq: ','.type_param+ ','?
         mark = self._mark()
         if (
-            (a := self._gather_85())
+            (a := self._gather_83())
             and
             (self.expect(','),)
         ):
@@ -2995,7 +3502,7 @@ class MacroPythonParser(Parser):
         if (
             (a := self.expression())
             and
-            (b := self._loop1_87())
+            (b := self._loop1_85())
             and
             (self.expect(','),)
         ):
@@ -3103,7 +3610,7 @@ class MacroPythonParser(Parser):
         if (
             (a := self.star_expression())
             and
-            (b := self._loop1_88())
+            (b := self._loop1_86())
             and
             (self.expect(','),)
         ):
@@ -3154,7 +3661,7 @@ class MacroPythonParser(Parser):
         # star_named_expressions: ','.star_named_expression+ ','?
         mark = self._mark()
         if (
-            (a := self._gather_89())
+            (a := self._gather_87())
             and
             (self.expect(','),)
         ):
@@ -3242,7 +3749,7 @@ class MacroPythonParser(Parser):
         if (
             (a := self.conjunction())
             and
-            (b := self._loop1_91())
+            (b := self._loop1_89())
         ):
             tok = self._tokenizer.get_last_non_whitespace_token()
             end_lineno, end_col_offset = tok.end
@@ -3264,7 +3771,7 @@ class MacroPythonParser(Parser):
         if (
             (a := self.inversion())
             and
-            (b := self._loop1_92())
+            (b := self._loop1_90())
         ):
             tok = self._tokenizer.get_last_non_whitespace_token()
             end_lineno, end_col_offset = tok.end
@@ -3308,7 +3815,7 @@ class MacroPythonParser(Parser):
         if (
             (a := self.bitwise_or())
             and
-            (b := self._loop1_93())
+            (b := self._loop1_91())
         ):
             tok = self._tokenizer.get_last_non_whitespace_token()
             end_lineno, end_col_offset = tok.end
@@ -3880,7 +4387,7 @@ class MacroPythonParser(Parser):
             return a;
         self._reset(mark)
         if (
-            (a := self._gather_94())
+            (a := self._gather_92())
             and
             (self.expect(','),)
         ):
@@ -3903,7 +4410,7 @@ class MacroPythonParser(Parser):
             and
             (b := self.expression(),)
             and
-            (c := self._tmp_96(),)
+            (c := self._tmp_94(),)
         ):
             tok = self._tokenizer.get_last_non_whitespace_token()
             end_lineno, end_col_offset = tok.end
@@ -3918,23 +4425,10 @@ class MacroPythonParser(Parser):
 
     @memoize
     def atom(self) -> Optional[Any]:
-        # atom: macro_name '(' args_fragment? ')' | NAME | 'True' | 'False' | 'None' | &(STRING | FSTRING_START) strings | NUMBER | &'(' (tuple | group | genexp) | &'[' (list | listcomp) | &'{' (dict | set | dictcomp | setcomp) | '...' | token_literal
+        # atom: NAME | 'True' | 'False' | 'None' | &(STRING | FSTRING_START) strings | NUMBER | &'(' (tuple | group | genexp) | &'[' (list | listcomp) | &'{' (dict | set | dictcomp | setcomp) | '...'
         mark = self._mark()
         tok = self._tokenizer.peek()
         start_lineno, start_col_offset = tok.start
-        if (
-            (a := self.macro_name())
-            and
-            (self.expect('('))
-            and
-            (args := self.args_fragment(),)
-            and
-            (self.expect(')'))
-        ):
-            tok = self._tokenizer.get_last_non_whitespace_token()
-            end_lineno, end_col_offset = tok.end
-            return MacroCall ( func = a . id , args = args or [] , keywords = [] , lineno=start_lineno, col_offset=start_col_offset, end_lineno=end_lineno, end_col_offset=end_col_offset , );
-        self._reset(mark)
         if (
             (a := self.name())
         ):
@@ -3964,7 +4458,7 @@ class MacroPythonParser(Parser):
             return ast . Constant ( value = None , lineno=start_lineno, col_offset=start_col_offset, end_lineno=end_lineno, end_col_offset=end_col_offset ) if sys . version_info >= ( 3 , 9 ) else ast . Constant ( value = None , kind = None , lineno=start_lineno, col_offset=start_col_offset, end_lineno=end_lineno, end_col_offset=end_col_offset );
         self._reset(mark)
         if (
-            (self.positive_lookahead(self._tmp_97, ))
+            (self.positive_lookahead(self._tmp_95, ))
             and
             (strings := self.strings())
         ):
@@ -3980,23 +4474,23 @@ class MacroPythonParser(Parser):
         if (
             (self.positive_lookahead(self.expect, '('))
             and
-            (_tmp_98 := self._tmp_98())
+            (_tmp_96 := self._tmp_96())
         ):
-            return _tmp_98;
+            return _tmp_96;
         self._reset(mark)
         if (
             (self.positive_lookahead(self.expect, '['))
             and
-            (_tmp_99 := self._tmp_99())
+            (_tmp_97 := self._tmp_97())
         ):
-            return _tmp_99;
+            return _tmp_97;
         self._reset(mark)
         if (
             (self.positive_lookahead(self.expect, '{'))
             and
-            (_tmp_100 := self._tmp_100())
+            (_tmp_98 := self._tmp_98())
         ):
-            return _tmp_100;
+            return _tmp_98;
         self._reset(mark)
         if (
             (self.expect('...'))
@@ -4004,11 +4498,6 @@ class MacroPythonParser(Parser):
             tok = self._tokenizer.get_last_non_whitespace_token()
             end_lineno, end_col_offset = tok.end
             return ast . Constant ( value = Ellipsis , lineno=start_lineno, col_offset=start_col_offset, end_lineno=end_lineno, end_col_offset=end_col_offset ) if sys . version_info >= ( 3 , 9 ) else ast . Constant ( value = Ellipsis , kind = None , lineno=start_lineno, col_offset=start_col_offset, end_lineno=end_lineno, end_col_offset=end_col_offset );
-        self._reset(mark)
-        if (
-            (token_literal := self.token_literal())
-        ):
-            return token_literal;
         self._reset(mark)
         return None;
 
@@ -4019,7 +4508,7 @@ class MacroPythonParser(Parser):
         if (
             (self.expect('('))
             and
-            (a := self._tmp_101())
+            (a := self._tmp_99())
             and
             (self.expect(')'))
         ):
@@ -4080,9 +4569,9 @@ class MacroPythonParser(Parser):
         if (
             (a := self.lambda_slash_no_default())
             and
-            (b := self._loop0_102(),)
+            (b := self._loop0_100(),)
             and
-            (c := self._loop0_103(),)
+            (c := self._loop0_101(),)
             and
             (d := self.lambda_star_etc(),)
         ):
@@ -4091,23 +4580,23 @@ class MacroPythonParser(Parser):
         if (
             (a := self.lambda_slash_with_default())
             and
-            (b := self._loop0_104(),)
+            (b := self._loop0_102(),)
             and
             (c := self.lambda_star_etc(),)
         ):
             return self . make_arguments ( None , a , None , b , c );
         self._reset(mark)
         if (
-            (a := self._loop1_105())
+            (a := self._loop1_103())
             and
-            (b := self._loop0_106(),)
+            (b := self._loop0_104(),)
             and
             (c := self.lambda_star_etc(),)
         ):
             return self . make_arguments ( None , [] , a , b , c );
         self._reset(mark)
         if (
-            (a := self._loop1_107())
+            (a := self._loop1_105())
             and
             (b := self.lambda_star_etc(),)
         ):
@@ -4125,7 +4614,7 @@ class MacroPythonParser(Parser):
         # lambda_slash_no_default: lambda_param_no_default+ '/' ',' | lambda_param_no_default+ '/' &':'
         mark = self._mark()
         if (
-            (a := self._loop1_108())
+            (a := self._loop1_106())
             and
             (self.expect('/'))
             and
@@ -4134,7 +4623,7 @@ class MacroPythonParser(Parser):
             return [( p , None ) for p in a];
         self._reset(mark)
         if (
-            (a := self._loop1_109())
+            (a := self._loop1_107())
             and
             (self.expect('/'))
             and
@@ -4149,9 +4638,9 @@ class MacroPythonParser(Parser):
         # lambda_slash_with_default: lambda_param_no_default* lambda_param_with_default+ '/' ',' | lambda_param_no_default* lambda_param_with_default+ '/' &':'
         mark = self._mark()
         if (
-            (a := self._loop0_110(),)
+            (a := self._loop0_108(),)
             and
-            (b := self._loop1_111())
+            (b := self._loop1_109())
             and
             (self.expect('/'))
             and
@@ -4160,9 +4649,9 @@ class MacroPythonParser(Parser):
             return ( [( p , None ) for p in a] if a else [] ) + b;
         self._reset(mark)
         if (
-            (a := self._loop0_112(),)
+            (a := self._loop0_110(),)
             and
-            (b := self._loop1_113())
+            (b := self._loop1_111())
             and
             (self.expect('/'))
             and
@@ -4188,7 +4677,7 @@ class MacroPythonParser(Parser):
             and
             (a := self.lambda_param_no_default())
             and
-            (b := self._loop0_114(),)
+            (b := self._loop0_112(),)
             and
             (c := self.lambda_kwds(),)
         ):
@@ -4199,7 +4688,7 @@ class MacroPythonParser(Parser):
             and
             (self.expect(','))
             and
-            (b := self._loop1_115())
+            (b := self._loop1_113())
             and
             (c := self.lambda_kwds(),)
         ):
@@ -4344,7 +4833,7 @@ class MacroPythonParser(Parser):
         if (
             (self.expect('{'))
             and
-            (a := self._tmp_116())
+            (a := self._tmp_114())
             and
             (debug_expr := self.expect("="),)
             and
@@ -4389,7 +4878,7 @@ class MacroPythonParser(Parser):
         if (
             (self.expect(':'))
             and
-            (spec := self._loop0_117(),)
+            (spec := self._loop0_115(),)
         ):
             tok = self._tokenizer.get_last_non_whitespace_token()
             end_lineno, end_col_offset = tok.end
@@ -4422,7 +4911,7 @@ class MacroPythonParser(Parser):
         # strings: ((fstring | STRING))+
         mark = self._mark()
         if (
-            (a := self._loop1_118())
+            (a := self._loop1_116())
         ):
             return self . concatenate_strings ( a ) if sys . version_info >= ( 3 , 12 ) else self . generate_ast_for_string ( a );
         self._reset(mark)
@@ -4456,7 +4945,7 @@ class MacroPythonParser(Parser):
         if (
             (self.expect('('))
             and
-            (a := self._tmp_119(),)
+            (a := self._tmp_117(),)
             and
             (self.expect(')'))
         ):
@@ -4520,7 +5009,7 @@ class MacroPythonParser(Parser):
         # double_starred_kvpairs: ','.double_starred_kvpair+ ','?
         mark = self._mark()
         if (
-            (a := self._gather_120())
+            (a := self._gather_118())
             and
             (self.expect(','),)
         ):
@@ -4566,7 +5055,7 @@ class MacroPythonParser(Parser):
         # for_if_clauses: for_if_clause+
         mark = self._mark()
         if (
-            (a := self._loop1_122())
+            (a := self._loop1_120())
         ):
             return a;
         self._reset(mark)
@@ -4590,7 +5079,7 @@ class MacroPythonParser(Parser):
             and
             (b := self.disjunction())
             and
-            (c := self._loop0_123(),)
+            (c := self._loop0_121(),)
         ):
             return self . check_version ( ( 3 , 6 ) , "Async comprehensions are" , ast . comprehension ( target = a , iter = b , ifs = c , is_async = 1 ) );
         self._reset(mark)
@@ -4608,7 +5097,7 @@ class MacroPythonParser(Parser):
             and
             (b := self.disjunction())
             and
-            (c := self._loop0_124(),)
+            (c := self._loop0_122(),)
         ):
             return ast . comprehension ( target = a , iter = b , ifs = c , is_async = 0 );
         self._reset(mark)
@@ -4688,7 +5177,7 @@ class MacroPythonParser(Parser):
         if (
             (self.expect('('))
             and
-            (a := self._tmp_125())
+            (a := self._tmp_123())
             and
             (b := self.for_if_clauses())
             and
@@ -4762,9 +5251,9 @@ class MacroPythonParser(Parser):
         # args: ','.(starred_expression | (assignment_expression | expression !':=') !'=')+ [',' kwargs] | kwargs
         mark = self._mark()
         if (
-            (a := self._gather_126())
+            (a := self._gather_124())
             and
-            (b := self._tmp_128(),)
+            (b := self._tmp_126(),)
         ):
             return ( a + ( [e for e in b if isinstance ( e , ast . Starred )] if b else [] ) , ( [e for e in b if not isinstance ( e , ast . Starred )] if b else [] ) );
         self._reset(mark)
@@ -4780,23 +5269,23 @@ class MacroPythonParser(Parser):
         # kwargs: ','.kwarg_or_starred+ ',' ','.kwarg_or_double_starred+ | ','.kwarg_or_starred+ | ','.kwarg_or_double_starred+
         mark = self._mark()
         if (
-            (a := self._gather_129())
+            (a := self._gather_127())
             and
             (self.expect(','))
             and
-            (b := self._gather_131())
+            (b := self._gather_129())
         ):
             return a + b;
+        self._reset(mark)
+        if (
+            (_gather_131 := self._gather_131())
+        ):
+            return _gather_131;
         self._reset(mark)
         if (
             (_gather_133 := self._gather_133())
         ):
             return _gather_133;
-        self._reset(mark)
-        if (
-            (_gather_135 := self._gather_135())
-        ):
-            return _gather_135;
         self._reset(mark)
         return None;
 
@@ -4911,7 +5400,7 @@ class MacroPythonParser(Parser):
         if (
             (a := self.star_target())
             and
-            (b := self._loop0_137(),)
+            (b := self._loop0_135(),)
             and
             (self.expect(','),)
         ):
@@ -4926,7 +5415,7 @@ class MacroPythonParser(Parser):
         # star_targets_list_seq: ','.star_target+ ','?
         mark = self._mark()
         if (
-            (a := self._gather_138())
+            (a := self._gather_136())
             and
             (self.expect(','),)
         ):
@@ -4941,7 +5430,7 @@ class MacroPythonParser(Parser):
         if (
             (a := self.star_target())
             and
-            (b := self._loop1_140())
+            (b := self._loop1_138())
             and
             (self.expect(','),)
         ):
@@ -4965,7 +5454,7 @@ class MacroPythonParser(Parser):
         if (
             (self.expect('*'))
             and
-            (a := self._tmp_141())
+            (a := self._tmp_139())
         ):
             tok = self._tokenizer.get_last_non_whitespace_token()
             end_lineno, end_col_offset = tok.end
@@ -5225,7 +5714,7 @@ class MacroPythonParser(Parser):
         # del_targets: ','.del_target+ ','?
         mark = self._mark()
         if (
-            (a := self._gather_142())
+            (a := self._gather_140())
             and
             (self.expect(','),)
         ):
@@ -5325,7 +5814,7 @@ class MacroPythonParser(Parser):
         # type_expressions: ','.expression+ ',' '*' expression ',' '**' expression | ','.expression+ ',' '*' expression | ','.expression+ ',' '**' expression | '*' expression ',' '**' expression | '*' expression | '**' expression | ','.expression+
         mark = self._mark()
         if (
-            (a := self._gather_144())
+            (a := self._gather_142())
             and
             (self.expect(','))
             and
@@ -5342,7 +5831,7 @@ class MacroPythonParser(Parser):
             return a + [b , c];
         self._reset(mark)
         if (
-            (a := self._gather_146())
+            (a := self._gather_144())
             and
             (self.expect(','))
             and
@@ -5353,7 +5842,7 @@ class MacroPythonParser(Parser):
             return a + [b];
         self._reset(mark)
         if (
-            (a := self._gather_148())
+            (a := self._gather_146())
             and
             (self.expect(','))
             and
@@ -5391,7 +5880,7 @@ class MacroPythonParser(Parser):
             return [a];
         self._reset(mark)
         if (
-            (a := self._gather_150())
+            (a := self._gather_148())
         ):
             return a;
         self._reset(mark)
@@ -5406,7 +5895,7 @@ class MacroPythonParser(Parser):
             and
             (t := self.type_comment())
             and
-            (self.positive_lookahead(self._tmp_152, ))
+            (self.positive_lookahead(self._tmp_150, ))
         ):
             return t . string;
         self._reset(mark)
@@ -5429,11 +5918,11 @@ class MacroPythonParser(Parser):
         # invalid_arguments: ((','.(starred_expression | (assignment_expression | expression !':=') !'=')+ ',' kwargs) | kwargs) ',' ','.(starred_expression !'=')+ | expression for_if_clauses ',' [args | expression for_if_clauses] | NAME '=' expression for_if_clauses | [(args ',')] NAME '=' &(',' | ')') | args for_if_clauses | args ',' expression for_if_clauses | args ',' args
         mark = self._mark()
         if (
-            (self._tmp_153())
+            (self._tmp_151())
             and
             (a := self.expect(','))
             and
-            (self._gather_154())
+            (self._gather_152())
         ):
             return self . raise_syntax_error_starting_from ( "iterable argument unpacking follows keyword argument unpacking" , a , );
         self._reset(mark)
@@ -5444,7 +5933,7 @@ class MacroPythonParser(Parser):
             and
             (self.expect(','))
             and
-            (self._tmp_156(),)
+            (self._tmp_154(),)
         ):
             return self . raise_syntax_error_known_range ( "Generator expression must be parenthesized" , a , ( b [- 1] . ifs [- 1] if b [- 1] . ifs else b [- 1] . iter ) );
         self._reset(mark)
@@ -5460,13 +5949,13 @@ class MacroPythonParser(Parser):
             return self . raise_syntax_error_known_range ( "invalid syntax. Maybe you meant '==' or ':=' instead of '='?" , a , b );
         self._reset(mark)
         if (
-            (self._tmp_157(),)
+            (self._tmp_155(),)
             and
             (a := self.name())
             and
             (b := self.expect('='))
             and
-            (self.positive_lookahead(self._tmp_158, ))
+            (self.positive_lookahead(self._tmp_156, ))
         ):
             return self . raise_syntax_error_known_range ( "expected argument value expression" , a , b );
         self._reset(mark)
@@ -5504,7 +5993,7 @@ class MacroPythonParser(Parser):
         # invalid_kwarg: ('True' | 'False' | 'None') '=' | NAME '=' expression for_if_clauses | !(NAME '=') expression '=' | '**' expression '=' expression
         mark = self._mark()
         if (
-            (a := self._tmp_159())
+            (a := self._tmp_157())
             and
             (b := self.expect('='))
         ):
@@ -5522,7 +6011,7 @@ class MacroPythonParser(Parser):
             return self . raise_syntax_error_known_range ( "invalid syntax. Maybe you meant '==' or ':=' instead of '='?" , a , b );
         self._reset(mark)
         if (
-            (self.negative_lookahead(self._tmp_160, ))
+            (self.negative_lookahead(self._tmp_158, ))
             and
             (a := self.expression())
             and
@@ -5602,7 +6091,7 @@ class MacroPythonParser(Parser):
         # invalid_expression: !(NAME STRING | SOFT_KEYWORD) disjunction expression_without_invalid | disjunction 'if' disjunction !('else' | ':') | 'lambda' lambda_params? ':' &(FSTRING_MIDDLE | fstring_replacement_field)
         mark = self._mark()
         if (
-            (self.negative_lookahead(self._tmp_161, ))
+            (self.negative_lookahead(self._tmp_159, ))
             and
             (a := self.disjunction())
             and
@@ -5617,7 +6106,7 @@ class MacroPythonParser(Parser):
             and
             (b := self.disjunction())
             and
-            (self.negative_lookahead(self._tmp_162, ))
+            (self.negative_lookahead(self._tmp_160, ))
         ):
             return self . raise_syntax_error_known_range ( "expected 'else' after 'if' expression" , a , b );
         self._reset(mark)
@@ -5628,7 +6117,7 @@ class MacroPythonParser(Parser):
             and
             (b := self.expect(':'))
             and
-            (self.positive_lookahead(self._tmp_163, ))
+            (self.positive_lookahead(self._tmp_161, ))
         ):
             return self . raise_syntax_error_known_range ( "f-string: lambda expressions are not allowed without parentheses" , a , b );
         self._reset(mark)
@@ -5654,12 +6143,12 @@ class MacroPythonParser(Parser):
             and
             (b := self.bitwise_or())
             and
-            (self.negative_lookahead(self._tmp_164, ))
+            (self.negative_lookahead(self._tmp_162, ))
         ):
             return ( None if self . in_recursive_rule else self . raise_syntax_error_known_range ( "invalid syntax. Maybe you meant '==' or ':=' instead of '='?" , a , b ) );
         self._reset(mark)
         if (
-            (self.negative_lookahead(self._tmp_165, ))
+            (self.negative_lookahead(self._tmp_163, ))
             and
             (a := self.bitwise_or())
             and
@@ -5667,7 +6156,7 @@ class MacroPythonParser(Parser):
             and
             (self.bitwise_or())
             and
-            (self.negative_lookahead(self._tmp_166, ))
+            (self.negative_lookahead(self._tmp_164, ))
         ):
             return ( None if self . in_recursive_rule else self . raise_syntax_error_known_location ( f"cannot assign to {self.get_expr_name(a)} here. Maybe you meant '==' instead of '='?" , a ) );
         self._reset(mark)
@@ -5693,7 +6182,7 @@ class MacroPythonParser(Parser):
             and
             (self.expect(','))
             and
-            (self._loop0_167(),)
+            (self._loop0_165(),)
             and
             (self.expect(':'))
             and
@@ -5711,7 +6200,7 @@ class MacroPythonParser(Parser):
             return self . raise_syntax_error_known_location ( "illegal target for annotation" , a );
         self._reset(mark)
         if (
-            (self._loop0_168(),)
+            (self._loop0_166(),)
             and
             (a := self.star_expressions())
             and
@@ -5720,7 +6209,7 @@ class MacroPythonParser(Parser):
             return self . raise_syntax_error_invalid_target ( Target . STAR_TARGETS , a );
         self._reset(mark)
         if (
-            (self._loop0_169(),)
+            (self._loop0_167(),)
             and
             (a := self.yield_expr())
             and
@@ -5733,7 +6222,7 @@ class MacroPythonParser(Parser):
             and
             (self.augassign())
             and
-            (self._tmp_170())
+            (self._tmp_168())
         ):
             return self . raise_syntax_error_known_location ( f"'{self.get_expr_name(a)}' is an illegal expression for augmented assignment" , a );
         self._reset(mark)
@@ -5797,7 +6286,7 @@ class MacroPythonParser(Parser):
         # invalid_comprehension: ('[' | '(' | '{') starred_expression for_if_clauses | ('[' | '{') star_named_expression ',' star_named_expressions for_if_clauses | ('[' | '{') star_named_expression ',' for_if_clauses
         mark = self._mark()
         if (
-            (self._tmp_171())
+            (self._tmp_169())
             and
             (a := self.starred_expression())
             and
@@ -5806,7 +6295,7 @@ class MacroPythonParser(Parser):
             return self . raise_syntax_error_known_location ( "iterable unpacking cannot be used in comprehension" , a );
         self._reset(mark)
         if (
-            (self._tmp_172())
+            (self._tmp_170())
             and
             (a := self.star_named_expression())
             and
@@ -5819,7 +6308,7 @@ class MacroPythonParser(Parser):
             return self . raise_syntax_error_known_range ( "did you forget parentheses around the comprehension target?" , a , b [- 1] );
         self._reset(mark)
         if (
-            (self._tmp_173())
+            (self._tmp_171())
             and
             (a := self.star_named_expression())
             and
@@ -5862,9 +6351,9 @@ class MacroPythonParser(Parser):
             return self . raise_syntax_error_known_location ( "at least one argument must precede /" , a );
         self._reset(mark)
         if (
-            (self._tmp_174())
+            (self._tmp_172())
             and
-            (self._loop0_175(),)
+            (self._loop0_173(),)
             and
             (a := self.expect('/'))
         ):
@@ -5875,7 +6364,7 @@ class MacroPythonParser(Parser):
             and
             (self.slash_no_default(),)
             and
-            (self._loop0_176(),)
+            (self._loop0_174(),)
             and
             (self.invalid_parameters_helper())
             and
@@ -5884,11 +6373,11 @@ class MacroPythonParser(Parser):
             return self . raise_syntax_error_known_location ( "parameter without a default follows parameter with a default" , a );
         self._reset(mark)
         if (
-            (self._loop0_177(),)
+            (self._loop0_175(),)
             and
             (a := self.expect('('))
             and
-            (self._loop1_178())
+            (self._loop1_176())
             and
             (self.expect(','),)
             and
@@ -5897,22 +6386,22 @@ class MacroPythonParser(Parser):
             return self . raise_syntax_error_known_range ( "Function parameters cannot be parenthesized" , a , b );
         self._reset(mark)
         if (
-            (self._tmp_179(),)
+            (self._tmp_177(),)
             and
-            (self._loop0_180(),)
+            (self._loop0_178(),)
             and
             (self.expect('*'))
             and
-            (self._tmp_181())
+            (self._tmp_179())
             and
-            (self._loop0_182(),)
+            (self._loop0_180(),)
             and
             (a := self.expect('/'))
         ):
             return self . raise_syntax_error_known_location ( "/ must be ahead of *" , a );
         self._reset(mark)
         if (
-            (self._loop1_183())
+            (self._loop1_181())
             and
             (self.expect('/'))
             and
@@ -5929,7 +6418,7 @@ class MacroPythonParser(Parser):
         if (
             (a := self.expect('='))
             and
-            (self.positive_lookahead(self._tmp_184, ))
+            (self.positive_lookahead(self._tmp_182, ))
         ):
             return self . raise_syntax_error_known_location ( "expected default value expression" , a );
         self._reset(mark)
@@ -5942,7 +6431,7 @@ class MacroPythonParser(Parser):
         if (
             (a := self.expect('*'))
             and
-            (self._tmp_185())
+            (self._tmp_183())
         ):
             return self . raise_syntax_error_known_location ( "named arguments must follow bare *" , a );
         self._reset(mark)
@@ -5967,13 +6456,13 @@ class MacroPythonParser(Parser):
         if (
             (self.expect('*'))
             and
-            (self._tmp_186())
+            (self._tmp_184())
             and
-            (self._loop0_187(),)
+            (self._loop0_185(),)
             and
             (a := self.expect('*'))
             and
-            (self._tmp_188())
+            (self._tmp_186())
         ):
             return self . raise_syntax_error_known_location ( "* argument may appear only once" , a );
         self._reset(mark)
@@ -6010,7 +6499,7 @@ class MacroPythonParser(Parser):
             and
             (self.expect(','))
             and
-            (a := self._tmp_189())
+            (a := self._tmp_187())
         ):
             return self . raise_syntax_error_known_location ( "arguments cannot follow var-keyword argument" , a );
         self._reset(mark)
@@ -6026,7 +6515,7 @@ class MacroPythonParser(Parser):
             return [a];
         self._reset(mark)
         if (
-            (a := self._loop1_190())
+            (a := self._loop1_188())
         ):
             return a;
         self._reset(mark)
@@ -6044,9 +6533,9 @@ class MacroPythonParser(Parser):
             return self . raise_syntax_error_known_location ( "at least one argument must precede /" , a );
         self._reset(mark)
         if (
-            (self._tmp_191())
+            (self._tmp_189())
             and
-            (self._loop0_192(),)
+            (self._loop0_190(),)
             and
             (a := self.expect('/'))
         ):
@@ -6057,7 +6546,7 @@ class MacroPythonParser(Parser):
             and
             (self.lambda_slash_no_default(),)
             and
-            (self._loop0_193(),)
+            (self._loop0_191(),)
             and
             (self.invalid_lambda_parameters_helper())
             and
@@ -6066,11 +6555,11 @@ class MacroPythonParser(Parser):
             return self . raise_syntax_error_known_location ( "parameter without a default follows parameter with a default" , a );
         self._reset(mark)
         if (
-            (self._loop0_194(),)
+            (self._loop0_192(),)
             and
             (a := self.expect('('))
             and
-            (self._gather_195())
+            (self._gather_193())
             and
             (self.expect(','),)
             and
@@ -6079,22 +6568,22 @@ class MacroPythonParser(Parser):
             return self . raise_syntax_error_known_range ( "Lambda expression parameters cannot be parenthesized" , a , b );
         self._reset(mark)
         if (
-            (self._tmp_197(),)
+            (self._tmp_195(),)
             and
-            (self._loop0_198(),)
+            (self._loop0_196(),)
             and
             (self.expect('*'))
             and
-            (self._tmp_199())
+            (self._tmp_197())
             and
-            (self._loop0_200(),)
+            (self._loop0_198(),)
             and
             (a := self.expect('/'))
         ):
             return self . raise_syntax_error_known_location ( "/ must be ahead of *" , a );
         self._reset(mark)
         if (
-            (self._loop1_201())
+            (self._loop1_199())
             and
             (self.expect('/'))
             and
@@ -6114,7 +6603,7 @@ class MacroPythonParser(Parser):
             return [a];
         self._reset(mark)
         if (
-            (a := self._loop1_202())
+            (a := self._loop1_200())
         ):
             return a;
         self._reset(mark)
@@ -6127,7 +6616,7 @@ class MacroPythonParser(Parser):
         if (
             (self.expect('*'))
             and
-            (self._tmp_203())
+            (self._tmp_201())
         ):
             return self . raise_syntax_error ( "named arguments must follow bare *" );
         self._reset(mark)
@@ -6143,13 +6632,13 @@ class MacroPythonParser(Parser):
         if (
             (self.expect('*'))
             and
-            (self._tmp_204())
+            (self._tmp_202())
             and
-            (self._loop0_205(),)
+            (self._loop0_203(),)
             and
             (a := self.expect('*'))
             and
-            (self._tmp_206())
+            (self._tmp_204())
         ):
             return self . raise_syntax_error_known_location ( "* argument may appear only once" , a );
         self._reset(mark)
@@ -6186,7 +6675,7 @@ class MacroPythonParser(Parser):
             and
             (self.expect(','))
             and
-            (a := self._tmp_207())
+            (a := self._tmp_205())
         ):
             return self . raise_syntax_error_known_location ( "arguments cannot follow var-keyword argument" , a );
         self._reset(mark)
@@ -6222,7 +6711,7 @@ class MacroPythonParser(Parser):
             and
             (a := self.expression())
             and
-            (self.positive_lookahead(self._tmp_208, ))
+            (self.positive_lookahead(self._tmp_206, ))
         ):
             return self . raise_syntax_error_invalid_target ( Target . STAR_TARGETS , a );
         self._reset(mark)
@@ -6276,7 +6765,7 @@ class MacroPythonParser(Parser):
         if (
             (a := self.expect('import'))
             and
-            (self._gather_209())
+            (self._gather_207())
             and
             (self.expect('from'))
             and
@@ -6310,7 +6799,7 @@ class MacroPythonParser(Parser):
             and
             (self.expect('with'))
             and
-            (self._gather_211())
+            (self._gather_209())
             and
             (self.expect_forced(self.expect(':'), "':'"))
         ):
@@ -6323,7 +6812,7 @@ class MacroPythonParser(Parser):
             and
             (self.expect('('))
             and
-            (self._gather_213())
+            (self._gather_211())
             and
             (self.expect(','),)
             and
@@ -6344,7 +6833,7 @@ class MacroPythonParser(Parser):
             and
             (a := self.expect('with'))
             and
-            (self._gather_215())
+            (self._gather_213())
             and
             (self.expect(':'))
             and
@@ -6361,7 +6850,7 @@ class MacroPythonParser(Parser):
             and
             (self.expect('('))
             and
-            (self._gather_217())
+            (self._gather_215())
             and
             (self.expect(','),)
             and
@@ -6399,7 +6888,7 @@ class MacroPythonParser(Parser):
             and
             (self.block())
             and
-            (self.negative_lookahead(self._tmp_219, ))
+            (self.negative_lookahead(self._tmp_217, ))
         ):
             return self . raise_syntax_error ( "expected 'except' or 'finally' block" );
         self._reset(mark)
@@ -6408,9 +6897,9 @@ class MacroPythonParser(Parser):
             and
             (self.expect(':'))
             and
-            (self._loop0_220(),)
+            (self._loop0_218(),)
             and
-            (self._loop1_221())
+            (self._loop1_219())
             and
             (a := self.expect('except'))
             and
@@ -6418,7 +6907,7 @@ class MacroPythonParser(Parser):
             and
             (self.expression())
             and
-            (self._tmp_222(),)
+            (self._tmp_220(),)
             and
             (self.expect(':'))
         ):
@@ -6429,13 +6918,13 @@ class MacroPythonParser(Parser):
             and
             (self.expect(':'))
             and
-            (self._loop0_223(),)
+            (self._loop0_221(),)
             and
-            (self._loop1_224())
+            (self._loop1_222())
             and
             (a := self.expect('except'))
             and
-            (self._tmp_225(),)
+            (self._tmp_223(),)
             and
             (self.expect(':'))
         ):
@@ -6458,7 +6947,7 @@ class MacroPythonParser(Parser):
             and
             (self.expressions())
             and
-            (self._tmp_226(),)
+            (self._tmp_224(),)
             and
             (self.expect(':'))
         ):
@@ -6471,7 +6960,7 @@ class MacroPythonParser(Parser):
             and
             (self.expression())
             and
-            (self._tmp_227(),)
+            (self._tmp_225(),)
             and
             (self.expect('NEWLINE'))
         ):
@@ -6491,7 +6980,7 @@ class MacroPythonParser(Parser):
             and
             (self.expect('*'))
             and
-            (self._tmp_228())
+            (self._tmp_226())
         ):
             return self . raise_syntax_error ( "expected one or more exception types" );
         self._reset(mark)
@@ -6523,7 +7012,7 @@ class MacroPythonParser(Parser):
             and
             (self.expression())
             and
-            (self._tmp_229(),)
+            (self._tmp_227(),)
             and
             (self.expect(':'))
             and
@@ -6557,7 +7046,7 @@ class MacroPythonParser(Parser):
             and
             (self.expression())
             and
-            (self._tmp_230(),)
+            (self._tmp_228(),)
             and
             (self.expect(':'))
             and
@@ -6677,7 +7166,7 @@ class MacroPythonParser(Parser):
         # invalid_class_argument_pattern: [positional_patterns ','] keyword_patterns ',' positional_patterns
         mark = self._mark()
         if (
-            (self._tmp_231(),)
+            (self._tmp_229(),)
             and
             (self.keyword_patterns())
             and
@@ -6832,7 +7321,7 @@ class MacroPythonParser(Parser):
 
     @memoize
     def invalid_def_raw(self) -> Optional[NoReturn]:
-        # invalid_def_raw: 'async'? 'def' NAME '!'? type_params? '(' params? ')' ['->' expression] ':' NEWLINE !INDENT
+        # invalid_def_raw: 'async'? 'def' NAME type_params? '(' params? ')' ['->' expression] ':' NEWLINE !INDENT
         mark = self._mark()
         if (
             (self.expect('async'),)
@@ -6840,8 +7329,6 @@ class MacroPythonParser(Parser):
             (a := self.expect('def'))
             and
             (self.name())
-            and
-            (self.expect('!'),)
             and
             (self.type_params(),)
             and
@@ -6851,7 +7338,7 @@ class MacroPythonParser(Parser):
             and
             (self.expect(')'))
             and
-            (self._tmp_232(),)
+            (self._tmp_230(),)
             and
             (self.expect(':'))
             and
@@ -6865,18 +7352,16 @@ class MacroPythonParser(Parser):
 
     @memoize
     def invalid_class_def_raw(self) -> Optional[NoReturn]:
-        # invalid_class_def_raw: 'class' NAME '!'? type_params? ['(' arguments? ')'] NEWLINE | 'class' NAME '!'? type_params? ['(' arguments? ')'] ':' NEWLINE !INDENT
+        # invalid_class_def_raw: 'class' NAME type_params? ['(' arguments? ')'] NEWLINE | 'class' NAME type_params? ['(' arguments? ')'] ':' NEWLINE !INDENT
         mark = self._mark()
         if (
             (self.expect('class'))
             and
             (self.name())
             and
-            (self.expect('!'),)
-            and
             (self.type_params(),)
             and
-            (self._tmp_233(),)
+            (self._tmp_231(),)
             and
             (self.expect('NEWLINE'))
         ):
@@ -6887,11 +7372,9 @@ class MacroPythonParser(Parser):
             and
             (self.name())
             and
-            (self.expect('!'),)
-            and
             (self.type_params(),)
             and
-            (self._tmp_234(),)
+            (self._tmp_232(),)
             and
             (self.expect(':'))
             and
@@ -6910,7 +7393,7 @@ class MacroPythonParser(Parser):
         if (
             self.call_invalid_rules
             and
-            (self._gather_235())
+            (self._gather_233())
             and
             (self.expect(','))
             and
@@ -6934,7 +7417,7 @@ class MacroPythonParser(Parser):
             and
             (a := self.expect(':'))
             and
-            (self.positive_lookahead(self._tmp_237, ))
+            (self.positive_lookahead(self._tmp_235, ))
         ):
             return self . raise_syntax_error_known_location ( "expression expected after dictionary key and ':'" , a );
         self._reset(mark)
@@ -6967,7 +7450,7 @@ class MacroPythonParser(Parser):
             and
             (a := self.expect(':'))
             and
-            (self.positive_lookahead(self._tmp_238, ))
+            (self.positive_lookahead(self._tmp_236, ))
         ):
             return self . raise_syntax_error_known_location ( "expression expected after dictionary key and ':'" , a );
         self._reset(mark)
@@ -7032,27 +7515,27 @@ class MacroPythonParser(Parser):
         if (
             (self.expect('{'))
             and
-            (self.negative_lookahead(self._tmp_239, ))
+            (self.negative_lookahead(self._tmp_237, ))
         ):
             return self . raise_syntax_error_on_next_token ( "f-string: expecting a valid expression after '{'" );
         self._reset(mark)
         if (
             (self.expect('{'))
             and
-            (self._tmp_240())
+            (self._tmp_238())
             and
-            (self.negative_lookahead(self._tmp_241, ))
+            (self.negative_lookahead(self._tmp_239, ))
         ):
             return self . raise_syntax_error_on_next_token ( "f-string: expecting '=', or '!', or ':', or '}'" );
         self._reset(mark)
         if (
             (self.expect('{'))
             and
-            (self._tmp_242())
+            (self._tmp_240())
             and
             (self.expect('='))
             and
-            (self.negative_lookahead(self._tmp_243, ))
+            (self.negative_lookahead(self._tmp_241, ))
         ):
             return self . raise_syntax_error_on_next_token ( "f-string: expecting '!', or ':', or '}'" );
         self._reset(mark)
@@ -7061,7 +7544,7 @@ class MacroPythonParser(Parser):
             and
             (self.expect('{'))
             and
-            (self._tmp_244())
+            (self._tmp_242())
             and
             (self.expect('='),)
             and
@@ -7072,28 +7555,28 @@ class MacroPythonParser(Parser):
         if (
             (self.expect('{'))
             and
-            (self._tmp_245())
+            (self._tmp_243())
             and
             (self.expect('='),)
             and
-            (self._tmp_246(),)
+            (self._tmp_244(),)
             and
-            (self.negative_lookahead(self._tmp_247, ))
+            (self.negative_lookahead(self._tmp_245, ))
         ):
             return self . raise_syntax_error_on_next_token ( "f-string: expecting ':' or '}'" );
         self._reset(mark)
         if (
             (self.expect('{'))
             and
-            (self._tmp_248())
+            (self._tmp_246())
             and
             (self.expect('='),)
             and
-            (self._tmp_249(),)
+            (self._tmp_247(),)
             and
             (self.expect(':'))
             and
-            (self._loop0_250(),)
+            (self._loop0_248(),)
             and
             (self.negative_lookahead(self.expect, '}'))
         ):
@@ -7102,11 +7585,11 @@ class MacroPythonParser(Parser):
         if (
             (self.expect('{'))
             and
-            (self._tmp_251())
+            (self._tmp_249())
             and
             (self.expect('='),)
             and
-            (self._tmp_252(),)
+            (self._tmp_250(),)
             and
             (self.negative_lookahead(self.expect, '}'))
         ):
@@ -7121,7 +7604,7 @@ class MacroPythonParser(Parser):
         if (
             (self.expect('!'))
             and
-            (self.positive_lookahead(self._tmp_253, ))
+            (self.positive_lookahead(self._tmp_251, ))
         ):
             return self . raise_syntax_error_on_next_token ( "f-string: missing conversion character" );
         self._reset(mark)
@@ -7131,518 +7614,6 @@ class MacroPythonParser(Parser):
             (self.negative_lookahead(self.name, ))
         ):
             return self . raise_syntax_error_on_next_token ( "f-string: invalid conversion character" );
-        self._reset(mark)
-        return None;
-
-    @memoize
-    def KEYWORD(self) -> Optional[Any]:
-        # KEYWORD: ~
-        mark = self._mark()
-        cut = False
-        if (
-            (cut := True)
-        ):
-            return ( self . _tokenizer . getnext ( ) if ( tok := self . _tokenizer . peek ( ) ) . type == token . NAME and tok . string in self . KEYWORDS else None );
-        self._reset(mark)
-        if cut:
-            return None;
-        return None;
-
-    @memoize
-    def ANY(self) -> Optional[Any]:
-        # ANY: !$
-        mark = self._mark()
-        if (
-            (self.negative_lookahead(self.expect, 'ENDMARKER'))
-        ):
-            return self . _tokenizer . getnext ( );
-        self._reset(mark)
-        return None;
-
-    @memoize
-    def braces(self) -> Optional[Any]:
-        # braces: '(' | ')' | '[' | ']' | '{' | '}'
-        mark = self._mark()
-        if (
-            (literal := self.expect('('))
-        ):
-            return literal;
-        self._reset(mark)
-        if (
-            (literal := self.expect(')'))
-        ):
-            return literal;
-        self._reset(mark)
-        if (
-            (literal := self.expect('['))
-        ):
-            return literal;
-        self._reset(mark)
-        if (
-            (literal := self.expect(']'))
-        ):
-            return literal;
-        self._reset(mark)
-        if (
-            (literal := self.expect('{'))
-        ):
-            return literal;
-        self._reset(mark)
-        if (
-            (literal := self.expect('}'))
-        ):
-            return literal;
-        self._reset(mark)
-        return None;
-
-    @memoize
-    def unparsed_atoms(self) -> Optional[Any]:
-        # unparsed_atoms: ((!NEWLINE !INDENT !DEDENT ANY))+
-        mark = self._mark()
-        if (
-            (a := self._loop1_254())
-        ):
-            return a;
-        self._reset(mark)
-        return None;
-
-    @memoize
-    def unparsed_balanced(self) -> Optional[Any]:
-        # unparsed_balanced: '(' unparsed_balanced? ')' unparsed_balanced? | '[' unparsed_balanced? ']' unparsed_balanced? | '{' unparsed_balanced? '}' unparsed_balanced? | ((!braces !NEWLINE ANY))+ unparsed_balanced?
-        mark = self._mark()
-        if (
-            (literal := self.expect('('))
-            and
-            (opt := self.unparsed_balanced(),)
-            and
-            (literal_1 := self.expect(')'))
-            and
-            (opt_1 := self.unparsed_balanced(),)
-        ):
-            return [literal, opt, literal_1, opt_1];
-        self._reset(mark)
-        if (
-            (literal := self.expect('['))
-            and
-            (opt := self.unparsed_balanced(),)
-            and
-            (literal_1 := self.expect(']'))
-            and
-            (opt_1 := self.unparsed_balanced(),)
-        ):
-            return [literal, opt, literal_1, opt_1];
-        self._reset(mark)
-        if (
-            (literal := self.expect('{'))
-            and
-            (opt := self.unparsed_balanced(),)
-            and
-            (literal_1 := self.expect('}'))
-            and
-            (opt_1 := self.unparsed_balanced(),)
-        ):
-            return [literal, opt, literal_1, opt_1];
-        self._reset(mark)
-        if (
-            (_loop1_255 := self._loop1_255())
-            and
-            (opt := self.unparsed_balanced(),)
-        ):
-            return [_loop1_255, opt];
-        self._reset(mark)
-        return None;
-
-    @memoize
-    def unparsed_line(self) -> Optional[Any]:
-        # unparsed_line: unparsed_atoms NEWLINE
-        mark = self._mark()
-        if (
-            (unparsed_atoms := self.unparsed_atoms())
-            and
-            (_newline := self.expect('NEWLINE'))
-        ):
-            return [unparsed_atoms, _newline];
-        self._reset(mark)
-        return None;
-
-    @memoize
-    def unparsed_block(self) -> Optional[Any]:
-        # unparsed_block: INDENT unparsed_block+ DEDENT | unparsed_line
-        mark = self._mark()
-        if (
-            (_indent := self.expect('INDENT'))
-            and
-            (_loop1_256 := self._loop1_256())
-            and
-            (_dedent := self.expect('DEDENT'))
-        ):
-            return [_indent, _loop1_256, _dedent];
-        self._reset(mark)
-        if (
-            (unparsed_line := self.unparsed_line())
-        ):
-            return unparsed_line;
-        self._reset(mark)
-        return None;
-
-    @memoize
-    def args_fragment(self) -> Optional[Any]:
-        # args_fragment: unparsed_balanced
-        mark = self._mark()
-        if (
-            (a := self.unparsed_balanced())
-        ):
-            return self . make_fragment ( a );
-        self._reset(mark)
-        return None;
-
-    @memoize
-    def suite_fragment(self) -> Optional[Any]:
-        # suite_fragment: NEWLINE INDENT unparsed_block+ DEDENT | unparsed_line
-        mark = self._mark()
-        if (
-            (self.expect('NEWLINE'))
-            and
-            (self.expect('INDENT'))
-            and
-            (a := self._loop1_257())
-            and
-            (self.expect('DEDENT'))
-        ):
-            return self . make_fragment ( a );
-        self._reset(mark)
-        if (
-            (a := self.unparsed_line())
-        ):
-            return self . make_fragment ( a );
-        self._reset(mark)
-        return None;
-
-    @memoize
-    def raw_macro_stmt_args(self) -> Optional[Any]:
-        # raw_macro_stmt_args: '(' unparsed_balanced? ')' raw_macro_stmt_args? | '[' unparsed_balanced? ']' raw_macro_stmt_args? | '{' unparsed_balanced? '}' raw_macro_stmt_args? | ((!braces !':' !NEWLINE ANY))+ raw_macro_stmt_args?
-        mark = self._mark()
-        if (
-            (a := self.expect('('))
-            and
-            (b := self.unparsed_balanced(),)
-            and
-            (c := self.expect(')'))
-            and
-            (opt := self.raw_macro_stmt_args(),)
-        ):
-            return [a, b, c, opt];
-        self._reset(mark)
-        if (
-            (a := self.expect('['))
-            and
-            (b := self.unparsed_balanced(),)
-            and
-            (c := self.expect(']'))
-            and
-            (opt := self.raw_macro_stmt_args(),)
-        ):
-            return [a, b, c, opt];
-        self._reset(mark)
-        if (
-            (a := self.expect('{'))
-            and
-            (b := self.unparsed_balanced(),)
-            and
-            (c := self.expect('}'))
-            and
-            (opt := self.raw_macro_stmt_args(),)
-        ):
-            return [a, b, c, opt];
-        self._reset(mark)
-        if (
-            (a := self._loop1_258())
-            and
-            (opt := self.raw_macro_stmt_args(),)
-        ):
-            return [a, opt];
-        self._reset(mark)
-        return None;
-
-    @memoize
-    def macro_stmt_args(self) -> Optional[Any]:
-        # macro_stmt_args: raw_macro_stmt_args
-        mark = self._mark()
-        if (
-            (a := self.raw_macro_stmt_args())
-        ):
-            return self . make_fragment ( a );
-        self._reset(mark)
-        return None;
-
-    @memoize
-    def macro_stmt(self) -> Optional[MacroCall]:
-        # macro_stmt: macro_name ':' suite_fragment | macro_name macro_stmt_args ':' suite_fragment
-        mark = self._mark()
-        tok = self._tokenizer.peek()
-        start_lineno, start_col_offset = tok.start
-        if (
-            (a := self.macro_name())
-            and
-            (self.expect(':'))
-            and
-            (b := self.suite_fragment())
-        ):
-            tok = self._tokenizer.get_last_non_whitespace_token()
-            end_lineno, end_col_offset = tok.end
-            return MacroCall ( a , args = b , lineno=start_lineno, col_offset=start_col_offset, end_lineno=end_lineno, end_col_offset=end_col_offset );
-        self._reset(mark)
-        if (
-            (a := self.macro_name())
-            and
-            (h := self.macro_stmt_args())
-            and
-            (self.expect(':'))
-            and
-            (b := self.suite_fragment())
-        ):
-            tok = self._tokenizer.get_last_non_whitespace_token()
-            end_lineno, end_col_offset = tok.end
-            return MacroCall ( MacroCall ( a , args = h , lineno=start_lineno, col_offset=start_col_offset, end_lineno=end_lineno, end_col_offset=end_col_offset ) , b , lineno=start_lineno, col_offset=start_col_offset, end_lineno=end_lineno, end_col_offset=end_col_offset );
-        self._reset(mark)
-        return None;
-
-    @memoize
-    def forbidden_macro_keywords(self) -> Optional[Any]:
-        # forbidden_macro_keywords: 'import' | 'from'
-        mark = self._mark()
-        if (
-            (literal := self.expect('import'))
-        ):
-            return literal;
-        self._reset(mark)
-        if (
-            (literal := self.expect('from'))
-        ):
-            return literal;
-        self._reset(mark)
-        return None;
-
-    @memoize
-    def macro_name(self) -> Optional[Any]:
-        # macro_name: (NAME | !forbidden_macro_keywords KEYWORD) '!'
-        mark = self._mark()
-        tok = self._tokenizer.peek()
-        start_lineno, start_col_offset = tok.start
-        if (
-            (a := self._tmp_259())
-            and
-            (self.expect('!'))
-        ):
-            tok = self._tokenizer.get_last_non_whitespace_token()
-            end_lineno, end_col_offset = tok.end
-            return MacroName ( id = a . string , ctx = Load , lineno=start_lineno, col_offset=start_col_offset, end_lineno=end_lineno, end_col_offset=end_col_offset );
-        self._reset(mark)
-        return None;
-
-    @memoize
-    def maybe_macro(self) -> Optional[Any]:
-        # maybe_macro: macro_name | NAME
-        mark = self._mark()
-        if (
-            (macro_name := self.macro_name())
-        ):
-            return macro_name;
-        self._reset(mark)
-        if (
-            (name := self.name())
-        ):
-            return name;
-        self._reset(mark)
-        return None;
-
-    @memoize
-    def dec_macro(self) -> Optional[Any]:
-        # dec_macro: macro_name '(' args_fragment? ')' | macro_name | 'macro' '(' arguments? ')' | 'macro'
-        mark = self._mark()
-        tok = self._tokenizer.peek()
-        start_lineno, start_col_offset = tok.start
-        if (
-            (a := self.macro_name())
-            and
-            (self.expect('('))
-            and
-            (args := self.args_fragment(),)
-            and
-            (self.expect(')'))
-        ):
-            tok = self._tokenizer.get_last_non_whitespace_token()
-            end_lineno, end_col_offset = tok.end
-            return MacroCall ( func = a . id , args = args or [] , keywords = [] , lineno=start_lineno, col_offset=start_col_offset, end_lineno=end_lineno, end_col_offset=end_col_offset );
-        self._reset(mark)
-        if (
-            (macro_name := self.macro_name())
-        ):
-            return macro_name;
-        self._reset(mark)
-        if (
-            (a := self.expect('macro'))
-            and
-            (self.expect('('))
-            and
-            (z := self.arguments(),)
-            and
-            (self.expect(')'))
-        ):
-            tok = self._tokenizer.get_last_non_whitespace_token()
-            end_lineno, end_col_offset = tok.end
-            return ast . Call ( func = a , args = z [0] if z else [] , keywords = z [1] if z else [] , lineno=start_lineno, col_offset=start_col_offset, end_lineno=end_lineno, end_col_offset=end_col_offset );
-        self._reset(mark)
-        if (
-            (a := self.expect('macro'))
-        ):
-            tok = self._tokenizer.get_last_non_whitespace_token()
-            end_lineno, end_col_offset = tok.end
-            return ast . Name ( id = a . string , ctx = Load , lineno=start_lineno, col_offset=start_col_offset, end_lineno=end_lineno, end_col_offset=end_col_offset );
-        self._reset(mark)
-        return None;
-
-    @memoize
-    def unparsed_class_def(self) -> Optional[Union [ClassDef]]:
-        # unparsed_class_def: invalid_class_def_raw | 'class' maybe_macro type_params? ['(' arguments? ')'] &&':' suite_fragment
-        mark = self._mark()
-        tok = self._tokenizer.peek()
-        start_lineno, start_col_offset = tok.start
-        if (
-            self.call_invalid_rules
-            and
-            (self.invalid_class_def_raw())
-        ):
-            return None  # pragma: no cover;
-        self._reset(mark)
-        if (
-            (self.expect('class'))
-            and
-            (a := self.maybe_macro())
-            and
-            (t := self.type_params(),)
-            and
-            (b := self._tmp_260(),)
-            and
-            (self.expect_forced(self.expect(':'), "':'"))
-            and
-            (c := self.suite_fragment())
-        ):
-            tok = self._tokenizer.get_last_non_whitespace_token()
-            end_lineno, end_col_offset = tok.end
-            return ( ClassDef ( a . string , bases = b [0] if b else [] , keywords = b [1] if b else [] , body = c , decorator_list = [] , type_params = t or [] , is_macro = isinstance ( a , MacroName ) , lineno=start_lineno, col_offset=start_col_offset, end_lineno=end_lineno, end_col_offset=end_col_offset , ) if sys . version_info >= ( 3 , 12 ) else ClassDef ( a . string , bases = b [0] if b else [] , keywords = b [1] if b else [] , body = c , decorator_list = [] , is_macro = isinstance ( a , MacroName ) , lineno=start_lineno, col_offset=start_col_offset, end_lineno=end_lineno, end_col_offset=end_col_offset , ) );
-        self._reset(mark)
-        return None;
-
-    @memoize
-    def unparsed_function_def(self) -> Optional[Union [FunctionDef , AsyncFunctionDef]]:
-        # unparsed_function_def: invalid_def_raw | 'def' maybe_macro type_params? &&'(' params? ')' ['->' expression] &&':' func_type_comment? suite_fragment | 'async' 'def' maybe_macro type_params? &&'(' params? ')' ['->' expression] &&':' func_type_comment? suite_fragment
-        mark = self._mark()
-        tok = self._tokenizer.peek()
-        start_lineno, start_col_offset = tok.start
-        if (
-            self.call_invalid_rules
-            and
-            (self.invalid_def_raw())
-        ):
-            return None  # pragma: no cover;
-        self._reset(mark)
-        if (
-            (self.expect('def'))
-            and
-            (n := self.maybe_macro())
-            and
-            (t := self.type_params(),)
-            and
-            (self.expect_forced(self.expect('('), "'('"))
-            and
-            (params := self.params(),)
-            and
-            (self.expect(')'))
-            and
-            (a := self._tmp_261(),)
-            and
-            (self.expect_forced(self.expect(':'), "':'"))
-            and
-            (tc := self.func_type_comment(),)
-            and
-            (b := self.suite_fragment())
-        ):
-            tok = self._tokenizer.get_last_non_whitespace_token()
-            end_lineno, end_col_offset = tok.end
-            return ( FunctionDef ( name = n . string , args = params or self . make_arguments ( None , [] , None , [] , None ) , returns = a , body = b , type_comment = tc , type_params = t or [] , decorator_list = [] , is_macro = isinstance ( n , MacroName ) , lineno=start_lineno, col_offset=start_col_offset, end_lineno=end_lineno, end_col_offset=end_col_offset , ) if sys . version_info >= ( 3 , 12 ) else FunctionDef ( name = n . string , args = params or self . make_arguments ( None , [] , None , [] , None ) , returns = a , body = b , type_comment = tc , is_macro = isinstance ( n , MacroName ) , lineno=start_lineno, col_offset=start_col_offset, end_lineno=end_lineno, end_col_offset=end_col_offset , ) );
-        self._reset(mark)
-        if (
-            (self.expect('async'))
-            and
-            (self.expect('def'))
-            and
-            (n := self.maybe_macro())
-            and
-            (t := self.type_params(),)
-            and
-            (self.expect_forced(self.expect('('), "'('"))
-            and
-            (params := self.params(),)
-            and
-            (self.expect(')'))
-            and
-            (a := self._tmp_262(),)
-            and
-            (self.expect_forced(self.expect(':'), "':'"))
-            and
-            (tc := self.func_type_comment(),)
-            and
-            (b := self.suite_fragment())
-        ):
-            tok = self._tokenizer.get_last_non_whitespace_token()
-            end_lineno, end_col_offset = tok.end
-            return ( self . check_version ( ( 3 , 5 ) , "Async functions are" , AsyncFunctionDef ( name = n . string , args = params or self . make_arguments ( None , [] , None , [] , None ) , returns = a , body = b , type_comment = tc , type_params = t or [] , decorator_list = [] , is_macro = isinstance ( n , MacroName ) , lineno=start_lineno, col_offset=start_col_offset, end_lineno=end_lineno, end_col_offset=end_col_offset , ) ) if sys . version_info >= ( 3 , 12 ) else self . check_version ( ( 3 , 5 ) , "Async functions are" , AsyncFunctionDef ( name = n . string , args = params or self . make_arguments ( None , [] , None , [] , None ) , returns = a , body = b , type_comment = tc , decorator_list = [] , is_macro = isinstance ( n , MacroName ) , lineno=start_lineno, col_offset=start_col_offset, end_lineno=end_lineno, end_col_offset=end_col_offset , ) ) );
-        self._reset(mark)
-        return None;
-
-    @memoize
-    def any_except_backtick(self) -> Optional[Any]:
-        # any_except_backtick: !'`' ANY
-        mark = self._mark()
-        if (
-            (self.negative_lookahead(self.expect, '`'))
-            and
-            (ANY := self.ANY())
-        ):
-            return ANY;
-        self._reset(mark)
-        return None;
-
-    @memoize
-    def token_literal(self) -> Optional[Any]:
-        # token_literal: '`' '`' '`' any_except_backtick* '`' '`' '`' | '`' any_except_backtick* '`'
-        mark = self._mark()
-        if (
-            (self.expect('`'))
-            and
-            (self.expect('`'))
-            and
-            (self.expect('`'))
-            and
-            (tokens := self._loop0_263(),)
-            and
-            (self.expect('`'))
-            and
-            (self.expect('`'))
-            and
-            (self.expect('`'))
-        ):
-            return TokenLiteral ( tokens );
-        self._reset(mark)
-        if (
-            (self.expect('`'))
-            and
-            (tokens := self._loop0_264(),)
-            and
-            (self.expect('`'))
-        ):
-            return TokenLiteral ( tokens );
         self._reset(mark)
         return None;
 
@@ -7865,9 +7836,9 @@ class MacroPythonParser(Parser):
         mark = self._mark()
         children = []
         while (
-            (_tmp_265 := self._tmp_265())
+            (_tmp_252 := self._tmp_252())
         ):
-            children.append(_tmp_265)
+            children.append(_tmp_252)
             mark = self._mark()
         self._reset(mark)
         return children;
@@ -8012,9 +7983,9 @@ class MacroPythonParser(Parser):
         mark = self._mark()
         children = []
         while (
-            (_tmp_266 := self._tmp_266())
+            (_tmp_253 := self._tmp_253())
         ):
-            children.append(_tmp_266)
+            children.append(_tmp_253)
             mark = self._mark()
         self._reset(mark)
         return children;
@@ -8025,9 +7996,9 @@ class MacroPythonParser(Parser):
         mark = self._mark()
         children = []
         while (
-            (_tmp_267 := self._tmp_267())
+            (_tmp_254 := self._tmp_254())
         ):
-            children.append(_tmp_267)
+            children.append(_tmp_254)
             mark = self._mark()
         self._reset(mark)
         return children;
@@ -8064,16 +8035,14 @@ class MacroPythonParser(Parser):
 
     @memoize
     def _tmp_29(self) -> Optional[Any]:
-        # _tmp_29: 'as' NAME '!'?
+        # _tmp_29: 'as' NAME
         mark = self._mark()
         if (
             (self.expect('as'))
             and
             (z := self.name())
-            and
-            (n := self.expect('!'),)
         ):
-            return maybe_macro ( n , z . string );
+            return z . string;
         self._reset(mark)
         return None;
 
@@ -8109,16 +8078,14 @@ class MacroPythonParser(Parser):
 
     @memoize
     def _tmp_32(self) -> Optional[Any]:
-        # _tmp_32: 'as' NAME '!'?
+        # _tmp_32: 'as' NAME
         mark = self._mark()
         if (
             (self.expect('as'))
             and
             (z := self.name())
-            and
-            (n := self.expect('!'),)
         ):
-            return maybe_macro ( n , z . string );
+            return z . string;
         self._reset(mark)
         return None;
 
@@ -8137,22 +8104,7 @@ class MacroPythonParser(Parser):
 
     @memoize
     def _tmp_34(self) -> Optional[Any]:
-        # _tmp_34: '@' dec_macro NEWLINE
-        mark = self._mark()
-        if (
-            (self.expect('@'))
-            and
-            (f := self.dec_macro())
-            and
-            (self.expect('NEWLINE'))
-        ):
-            return f;
-        self._reset(mark)
-        return None;
-
-    @memoize
-    def _tmp_35(self) -> Optional[Any]:
-        # _tmp_35: '@' dec_maybe_call NEWLINE
+        # _tmp_34: '@' dec_maybe_call NEWLINE
         mark = self._mark()
         if (
             (self.expect('@'))
@@ -8166,8 +8118,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _tmp_36(self) -> Optional[Any]:
-        # _tmp_36: '@' named_expression NEWLINE
+    def _tmp_35(self) -> Optional[Any]:
+        # _tmp_35: '@' named_expression NEWLINE
         mark = self._mark()
         if (
             (self.expect('@'))
@@ -8181,8 +8133,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _tmp_37(self) -> Optional[Any]:
-        # _tmp_37: '(' arguments? ')'
+    def _tmp_36(self) -> Optional[Any]:
+        # _tmp_36: '(' arguments? ')'
         mark = self._mark()
         if (
             (self.expect('('))
@@ -8196,24 +8148,21 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
+    def _tmp_37(self) -> Optional[Any]:
+        # _tmp_37: '->' expression
+        mark = self._mark()
+        if (
+            (self.expect('->'))
+            and
+            (z := self.expression())
+        ):
+            return z;
+        self._reset(mark)
+        return None;
+
+    @memoize
     def _tmp_38(self) -> Optional[Any]:
-        # _tmp_38: 'def' | 'async'
-        mark = self._mark()
-        if (
-            (literal := self.expect('def'))
-        ):
-            return literal;
-        self._reset(mark)
-        if (
-            (literal := self.expect('async'))
-        ):
-            return literal;
-        self._reset(mark)
-        return None;
-
-    @memoize
-    def _tmp_39(self) -> Optional[Any]:
-        # _tmp_39: '->' expression
+        # _tmp_38: '->' expression
         mark = self._mark()
         if (
             (self.expect('->'))
@@ -8225,21 +8174,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _tmp_40(self) -> Optional[Any]:
-        # _tmp_40: '->' expression
-        mark = self._mark()
-        if (
-            (self.expect('->'))
-            and
-            (z := self.expression())
-        ):
-            return z;
-        self._reset(mark)
-        return None;
-
-    @memoize
-    def _loop0_41(self) -> Optional[Any]:
-        # _loop0_41: param_no_default
+    def _loop0_39(self) -> Optional[Any]:
+        # _loop0_39: param_no_default
         mark = self._mark()
         children = []
         while (
@@ -8251,14 +8187,40 @@ class MacroPythonParser(Parser):
         return children;
 
     @memoize
-    def _loop0_42(self) -> Optional[Any]:
-        # _loop0_42: param_with_default
+    def _loop0_40(self) -> Optional[Any]:
+        # _loop0_40: param_with_default
         mark = self._mark()
         children = []
         while (
             (param_with_default := self.param_with_default())
         ):
             children.append(param_with_default)
+            mark = self._mark()
+        self._reset(mark)
+        return children;
+
+    @memoize
+    def _loop0_41(self) -> Optional[Any]:
+        # _loop0_41: param_with_default
+        mark = self._mark()
+        children = []
+        while (
+            (param_with_default := self.param_with_default())
+        ):
+            children.append(param_with_default)
+            mark = self._mark()
+        self._reset(mark)
+        return children;
+
+    @memoize
+    def _loop1_42(self) -> Optional[Any]:
+        # _loop1_42: param_no_default
+        mark = self._mark()
+        children = []
+        while (
+            (param_no_default := self.param_no_default())
+        ):
+            children.append(param_no_default)
             mark = self._mark()
         self._reset(mark)
         return children;
@@ -8278,7 +8240,20 @@ class MacroPythonParser(Parser):
 
     @memoize
     def _loop1_44(self) -> Optional[Any]:
-        # _loop1_44: param_no_default
+        # _loop1_44: param_with_default
+        mark = self._mark()
+        children = []
+        while (
+            (param_with_default := self.param_with_default())
+        ):
+            children.append(param_with_default)
+            mark = self._mark()
+        self._reset(mark)
+        return children;
+
+    @memoize
+    def _loop1_45(self) -> Optional[Any]:
+        # _loop1_45: param_no_default
         mark = self._mark()
         children = []
         while (
@@ -8290,34 +8265,21 @@ class MacroPythonParser(Parser):
         return children;
 
     @memoize
-    def _loop0_45(self) -> Optional[Any]:
-        # _loop0_45: param_with_default
-        mark = self._mark()
-        children = []
-        while (
-            (param_with_default := self.param_with_default())
-        ):
-            children.append(param_with_default)
-            mark = self._mark()
-        self._reset(mark)
-        return children;
-
-    @memoize
     def _loop1_46(self) -> Optional[Any]:
-        # _loop1_46: param_with_default
+        # _loop1_46: param_no_default
         mark = self._mark()
         children = []
         while (
-            (param_with_default := self.param_with_default())
+            (param_no_default := self.param_no_default())
         ):
-            children.append(param_with_default)
+            children.append(param_no_default)
             mark = self._mark()
         self._reset(mark)
         return children;
 
     @memoize
-    def _loop1_47(self) -> Optional[Any]:
-        # _loop1_47: param_no_default
+    def _loop0_47(self) -> Optional[Any]:
+        # _loop0_47: param_no_default
         mark = self._mark()
         children = []
         while (
@@ -8330,13 +8292,13 @@ class MacroPythonParser(Parser):
 
     @memoize
     def _loop1_48(self) -> Optional[Any]:
-        # _loop1_48: param_no_default
+        # _loop1_48: param_with_default
         mark = self._mark()
         children = []
         while (
-            (param_no_default := self.param_no_default())
+            (param_with_default := self.param_with_default())
         ):
-            children.append(param_no_default)
+            children.append(param_with_default)
             mark = self._mark()
         self._reset(mark)
         return children;
@@ -8369,33 +8331,7 @@ class MacroPythonParser(Parser):
 
     @memoize
     def _loop0_51(self) -> Optional[Any]:
-        # _loop0_51: param_no_default
-        mark = self._mark()
-        children = []
-        while (
-            (param_no_default := self.param_no_default())
-        ):
-            children.append(param_no_default)
-            mark = self._mark()
-        self._reset(mark)
-        return children;
-
-    @memoize
-    def _loop1_52(self) -> Optional[Any]:
-        # _loop1_52: param_with_default
-        mark = self._mark()
-        children = []
-        while (
-            (param_with_default := self.param_with_default())
-        ):
-            children.append(param_with_default)
-            mark = self._mark()
-        self._reset(mark)
-        return children;
-
-    @memoize
-    def _loop0_53(self) -> Optional[Any]:
-        # _loop0_53: param_maybe_default
+        # _loop0_51: param_maybe_default
         mark = self._mark()
         children = []
         while (
@@ -8407,8 +8343,8 @@ class MacroPythonParser(Parser):
         return children;
 
     @memoize
-    def _loop0_54(self) -> Optional[Any]:
-        # _loop0_54: param_maybe_default
+    def _loop0_52(self) -> Optional[Any]:
+        # _loop0_52: param_maybe_default
         mark = self._mark()
         children = []
         while (
@@ -8420,8 +8356,8 @@ class MacroPythonParser(Parser):
         return children;
 
     @memoize
-    def _loop1_55(self) -> Optional[Any]:
-        # _loop1_55: param_maybe_default
+    def _loop1_53(self) -> Optional[Any]:
+        # _loop1_53: param_maybe_default
         mark = self._mark()
         children = []
         while (
@@ -8431,6 +8367,36 @@ class MacroPythonParser(Parser):
             mark = self._mark()
         self._reset(mark)
         return children;
+
+    @memoize
+    def _loop0_55(self) -> Optional[Any]:
+        # _loop0_55: ',' with_item
+        mark = self._mark()
+        children = []
+        while (
+            (self.expect(','))
+            and
+            (elem := self.with_item())
+        ):
+            children.append(elem)
+            mark = self._mark()
+        self._reset(mark)
+        return children;
+
+    @memoize
+    def _gather_54(self) -> Optional[Any]:
+        # _gather_54: with_item _loop0_55
+        mark = self._mark()
+        if (
+            (elem := self.with_item())
+            is not None
+            and
+            (seq := self._loop0_55())
+            is not None
+        ):
+            return [elem] + seq;
+        self._reset(mark)
+        return None;
 
     @memoize
     def _loop0_57(self) -> Optional[Any]:
@@ -8523,38 +8489,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _loop0_63(self) -> Optional[Any]:
-        # _loop0_63: ',' with_item
-        mark = self._mark()
-        children = []
-        while (
-            (self.expect(','))
-            and
-            (elem := self.with_item())
-        ):
-            children.append(elem)
-            mark = self._mark()
-        self._reset(mark)
-        return children;
-
-    @memoize
-    def _gather_62(self) -> Optional[Any]:
-        # _gather_62: with_item _loop0_63
-        mark = self._mark()
-        if (
-            (elem := self.with_item())
-            is not None
-            and
-            (seq := self._loop0_63())
-            is not None
-        ):
-            return [elem] + seq;
-        self._reset(mark)
-        return None;
-
-    @memoize
-    def _tmp_64(self) -> Optional[Any]:
-        # _tmp_64: ',' | ')' | ':'
+    def _tmp_62(self) -> Optional[Any]:
+        # _tmp_62: ',' | ')' | ':'
         mark = self._mark()
         if (
             (literal := self.expect(','))
@@ -8574,8 +8510,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _loop1_65(self) -> Optional[Any]:
-        # _loop1_65: except_block
+    def _loop1_63(self) -> Optional[Any]:
+        # _loop1_63: except_block
         mark = self._mark()
         children = []
         while (
@@ -8587,8 +8523,8 @@ class MacroPythonParser(Parser):
         return children;
 
     @memoize
-    def _loop1_66(self) -> Optional[Any]:
-        # _loop1_66: except_star_block
+    def _loop1_64(self) -> Optional[Any]:
+        # _loop1_64: except_star_block
         mark = self._mark()
         children = []
         while (
@@ -8600,8 +8536,8 @@ class MacroPythonParser(Parser):
         return children;
 
     @memoize
-    def _tmp_67(self) -> Optional[Any]:
-        # _tmp_67: 'as' NAME
+    def _tmp_65(self) -> Optional[Any]:
+        # _tmp_65: 'as' NAME
         mark = self._mark()
         if (
             (self.expect('as'))
@@ -8613,8 +8549,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _tmp_68(self) -> Optional[Any]:
-        # _tmp_68: 'as' NAME
+    def _tmp_66(self) -> Optional[Any]:
+        # _tmp_66: 'as' NAME
         mark = self._mark()
         if (
             (self.expect('as'))
@@ -8626,8 +8562,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _loop1_69(self) -> Optional[Any]:
-        # _loop1_69: case_block
+    def _loop1_67(self) -> Optional[Any]:
+        # _loop1_67: case_block
         mark = self._mark()
         children = []
         while (
@@ -8639,8 +8575,8 @@ class MacroPythonParser(Parser):
         return children;
 
     @memoize
-    def _loop0_71(self) -> Optional[Any]:
-        # _loop0_71: '|' closed_pattern
+    def _loop0_69(self) -> Optional[Any]:
+        # _loop0_69: '|' closed_pattern
         mark = self._mark()
         children = []
         while (
@@ -8654,14 +8590,14 @@ class MacroPythonParser(Parser):
         return children;
 
     @memoize
-    def _gather_70(self) -> Optional[Any]:
-        # _gather_70: closed_pattern _loop0_71
+    def _gather_68(self) -> Optional[Any]:
+        # _gather_68: closed_pattern _loop0_69
         mark = self._mark()
         if (
             (elem := self.closed_pattern())
             is not None
             and
-            (seq := self._loop0_71())
+            (seq := self._loop0_69())
             is not None
         ):
             return [elem] + seq;
@@ -8669,8 +8605,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _tmp_72(self) -> Optional[Any]:
-        # _tmp_72: '+' | '-'
+    def _tmp_70(self) -> Optional[Any]:
+        # _tmp_70: '+' | '-'
         mark = self._mark()
         if (
             (literal := self.expect('+'))
@@ -8679,6 +8615,43 @@ class MacroPythonParser(Parser):
         self._reset(mark)
         if (
             (literal := self.expect('-'))
+        ):
+            return literal;
+        self._reset(mark)
+        return None;
+
+    @memoize
+    def _tmp_71(self) -> Optional[Any]:
+        # _tmp_71: '+' | '-'
+        mark = self._mark()
+        if (
+            (literal := self.expect('+'))
+        ):
+            return literal;
+        self._reset(mark)
+        if (
+            (literal := self.expect('-'))
+        ):
+            return literal;
+        self._reset(mark)
+        return None;
+
+    @memoize
+    def _tmp_72(self) -> Optional[Any]:
+        # _tmp_72: '.' | '(' | '='
+        mark = self._mark()
+        if (
+            (literal := self.expect('.'))
+        ):
+            return literal;
+        self._reset(mark)
+        if (
+            (literal := self.expect('('))
+        ):
+            return literal;
+        self._reset(mark)
+        if (
+            (literal := self.expect('='))
         ):
             return literal;
         self._reset(mark)
@@ -8686,23 +8659,7 @@ class MacroPythonParser(Parser):
 
     @memoize
     def _tmp_73(self) -> Optional[Any]:
-        # _tmp_73: '+' | '-'
-        mark = self._mark()
-        if (
-            (literal := self.expect('+'))
-        ):
-            return literal;
-        self._reset(mark)
-        if (
-            (literal := self.expect('-'))
-        ):
-            return literal;
-        self._reset(mark)
-        return None;
-
-    @memoize
-    def _tmp_74(self) -> Optional[Any]:
-        # _tmp_74: '.' | '(' | '='
+        # _tmp_73: '.' | '(' | '='
         mark = self._mark()
         if (
             (literal := self.expect('.'))
@@ -8722,29 +8679,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _tmp_75(self) -> Optional[Any]:
-        # _tmp_75: '.' | '(' | '='
-        mark = self._mark()
-        if (
-            (literal := self.expect('.'))
-        ):
-            return literal;
-        self._reset(mark)
-        if (
-            (literal := self.expect('('))
-        ):
-            return literal;
-        self._reset(mark)
-        if (
-            (literal := self.expect('='))
-        ):
-            return literal;
-        self._reset(mark)
-        return None;
-
-    @memoize
-    def _loop0_77(self) -> Optional[Any]:
-        # _loop0_77: ',' maybe_star_pattern
+    def _loop0_75(self) -> Optional[Any]:
+        # _loop0_75: ',' maybe_star_pattern
         mark = self._mark()
         children = []
         while (
@@ -8758,11 +8694,41 @@ class MacroPythonParser(Parser):
         return children;
 
     @memoize
-    def _gather_76(self) -> Optional[Any]:
-        # _gather_76: maybe_star_pattern _loop0_77
+    def _gather_74(self) -> Optional[Any]:
+        # _gather_74: maybe_star_pattern _loop0_75
         mark = self._mark()
         if (
             (elem := self.maybe_star_pattern())
+            is not None
+            and
+            (seq := self._loop0_75())
+            is not None
+        ):
+            return [elem] + seq;
+        self._reset(mark)
+        return None;
+
+    @memoize
+    def _loop0_77(self) -> Optional[Any]:
+        # _loop0_77: ',' key_value_pattern
+        mark = self._mark()
+        children = []
+        while (
+            (self.expect(','))
+            and
+            (elem := self.key_value_pattern())
+        ):
+            children.append(elem)
+            mark = self._mark()
+        self._reset(mark)
+        return children;
+
+    @memoize
+    def _gather_76(self) -> Optional[Any]:
+        # _gather_76: key_value_pattern _loop0_77
+        mark = self._mark()
+        if (
+            (elem := self.key_value_pattern())
             is not None
             and
             (seq := self._loop0_77())
@@ -8773,38 +8739,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _loop0_79(self) -> Optional[Any]:
-        # _loop0_79: ',' key_value_pattern
-        mark = self._mark()
-        children = []
-        while (
-            (self.expect(','))
-            and
-            (elem := self.key_value_pattern())
-        ):
-            children.append(elem)
-            mark = self._mark()
-        self._reset(mark)
-        return children;
-
-    @memoize
-    def _gather_78(self) -> Optional[Any]:
-        # _gather_78: key_value_pattern _loop0_79
-        mark = self._mark()
-        if (
-            (elem := self.key_value_pattern())
-            is not None
-            and
-            (seq := self._loop0_79())
-            is not None
-        ):
-            return [elem] + seq;
-        self._reset(mark)
-        return None;
-
-    @memoize
-    def _tmp_80(self) -> Optional[Any]:
-        # _tmp_80: literal_expr | attr
+    def _tmp_78(self) -> Optional[Any]:
+        # _tmp_78: literal_expr | attr
         mark = self._mark()
         if (
             (literal_expr := self.literal_expr())
@@ -8819,8 +8755,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _loop0_82(self) -> Optional[Any]:
-        # _loop0_82: ',' pattern
+    def _loop0_80(self) -> Optional[Any]:
+        # _loop0_80: ',' pattern
         mark = self._mark()
         children = []
         while (
@@ -8834,11 +8770,41 @@ class MacroPythonParser(Parser):
         return children;
 
     @memoize
-    def _gather_81(self) -> Optional[Any]:
-        # _gather_81: pattern _loop0_82
+    def _gather_79(self) -> Optional[Any]:
+        # _gather_79: pattern _loop0_80
         mark = self._mark()
         if (
             (elem := self.pattern())
+            is not None
+            and
+            (seq := self._loop0_80())
+            is not None
+        ):
+            return [elem] + seq;
+        self._reset(mark)
+        return None;
+
+    @memoize
+    def _loop0_82(self) -> Optional[Any]:
+        # _loop0_82: ',' keyword_pattern
+        mark = self._mark()
+        children = []
+        while (
+            (self.expect(','))
+            and
+            (elem := self.keyword_pattern())
+        ):
+            children.append(elem)
+            mark = self._mark()
+        self._reset(mark)
+        return children;
+
+    @memoize
+    def _gather_81(self) -> Optional[Any]:
+        # _gather_81: keyword_pattern _loop0_82
+        mark = self._mark()
+        if (
+            (elem := self.keyword_pattern())
             is not None
             and
             (seq := self._loop0_82())
@@ -8850,13 +8816,13 @@ class MacroPythonParser(Parser):
 
     @memoize
     def _loop0_84(self) -> Optional[Any]:
-        # _loop0_84: ',' keyword_pattern
+        # _loop0_84: ',' type_param
         mark = self._mark()
         children = []
         while (
             (self.expect(','))
             and
-            (elem := self.keyword_pattern())
+            (elem := self.type_param())
         ):
             children.append(elem)
             mark = self._mark()
@@ -8865,10 +8831,10 @@ class MacroPythonParser(Parser):
 
     @memoize
     def _gather_83(self) -> Optional[Any]:
-        # _gather_83: keyword_pattern _loop0_84
+        # _gather_83: type_param _loop0_84
         mark = self._mark()
         if (
-            (elem := self.keyword_pattern())
+            (elem := self.type_param())
             is not None
             and
             (seq := self._loop0_84())
@@ -8879,64 +8845,34 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _loop0_86(self) -> Optional[Any]:
-        # _loop0_86: ',' type_param
+    def _loop1_85(self) -> Optional[Any]:
+        # _loop1_85: (',' expression)
         mark = self._mark()
         children = []
         while (
-            (self.expect(','))
-            and
-            (elem := self.type_param())
+            (_tmp_255 := self._tmp_255())
         ):
-            children.append(elem)
+            children.append(_tmp_255)
             mark = self._mark()
         self._reset(mark)
         return children;
 
     @memoize
-    def _gather_85(self) -> Optional[Any]:
-        # _gather_85: type_param _loop0_86
-        mark = self._mark()
-        if (
-            (elem := self.type_param())
-            is not None
-            and
-            (seq := self._loop0_86())
-            is not None
-        ):
-            return [elem] + seq;
-        self._reset(mark)
-        return None;
-
-    @memoize
-    def _loop1_87(self) -> Optional[Any]:
-        # _loop1_87: (',' expression)
+    def _loop1_86(self) -> Optional[Any]:
+        # _loop1_86: (',' star_expression)
         mark = self._mark()
         children = []
         while (
-            (_tmp_268 := self._tmp_268())
+            (_tmp_256 := self._tmp_256())
         ):
-            children.append(_tmp_268)
+            children.append(_tmp_256)
             mark = self._mark()
         self._reset(mark)
         return children;
 
     @memoize
-    def _loop1_88(self) -> Optional[Any]:
-        # _loop1_88: (',' star_expression)
-        mark = self._mark()
-        children = []
-        while (
-            (_tmp_269 := self._tmp_269())
-        ):
-            children.append(_tmp_269)
-            mark = self._mark()
-        self._reset(mark)
-        return children;
-
-    @memoize
-    def _loop0_90(self) -> Optional[Any]:
-        # _loop0_90: ',' star_named_expression
+    def _loop0_88(self) -> Optional[Any]:
+        # _loop0_88: ',' star_named_expression
         mark = self._mark()
         children = []
         while (
@@ -8950,49 +8886,49 @@ class MacroPythonParser(Parser):
         return children;
 
     @memoize
-    def _gather_89(self) -> Optional[Any]:
-        # _gather_89: star_named_expression _loop0_90
+    def _gather_87(self) -> Optional[Any]:
+        # _gather_87: star_named_expression _loop0_88
         mark = self._mark()
         if (
             (elem := self.star_named_expression())
             is not None
             and
-            (seq := self._loop0_90())
+            (seq := self._loop0_88())
             is not None
         ):
             return [elem] + seq;
         self._reset(mark)
         return None;
+
+    @memoize
+    def _loop1_89(self) -> Optional[Any]:
+        # _loop1_89: ('or' conjunction)
+        mark = self._mark()
+        children = []
+        while (
+            (_tmp_257 := self._tmp_257())
+        ):
+            children.append(_tmp_257)
+            mark = self._mark()
+        self._reset(mark)
+        return children;
+
+    @memoize
+    def _loop1_90(self) -> Optional[Any]:
+        # _loop1_90: ('and' inversion)
+        mark = self._mark()
+        children = []
+        while (
+            (_tmp_258 := self._tmp_258())
+        ):
+            children.append(_tmp_258)
+            mark = self._mark()
+        self._reset(mark)
+        return children;
 
     @memoize
     def _loop1_91(self) -> Optional[Any]:
-        # _loop1_91: ('or' conjunction)
-        mark = self._mark()
-        children = []
-        while (
-            (_tmp_270 := self._tmp_270())
-        ):
-            children.append(_tmp_270)
-            mark = self._mark()
-        self._reset(mark)
-        return children;
-
-    @memoize
-    def _loop1_92(self) -> Optional[Any]:
-        # _loop1_92: ('and' inversion)
-        mark = self._mark()
-        children = []
-        while (
-            (_tmp_271 := self._tmp_271())
-        ):
-            children.append(_tmp_271)
-            mark = self._mark()
-        self._reset(mark)
-        return children;
-
-    @memoize
-    def _loop1_93(self) -> Optional[Any]:
-        # _loop1_93: compare_op_bitwise_or_pair
+        # _loop1_91: compare_op_bitwise_or_pair
         mark = self._mark()
         children = []
         while (
@@ -9004,14 +8940,14 @@ class MacroPythonParser(Parser):
         return children;
 
     @memoize
-    def _loop0_95(self) -> Optional[Any]:
-        # _loop0_95: ',' (slice | starred_expression)
+    def _loop0_93(self) -> Optional[Any]:
+        # _loop0_93: ',' (slice | starred_expression)
         mark = self._mark()
         children = []
         while (
             (self.expect(','))
             and
-            (elem := self._tmp_272())
+            (elem := self._tmp_259())
         ):
             children.append(elem)
             mark = self._mark()
@@ -9019,14 +8955,14 @@ class MacroPythonParser(Parser):
         return children;
 
     @memoize
-    def _gather_94(self) -> Optional[Any]:
-        # _gather_94: (slice | starred_expression) _loop0_95
+    def _gather_92(self) -> Optional[Any]:
+        # _gather_92: (slice | starred_expression) _loop0_93
         mark = self._mark()
         if (
-            (elem := self._tmp_272())
+            (elem := self._tmp_259())
             is not None
             and
-            (seq := self._loop0_95())
+            (seq := self._loop0_93())
             is not None
         ):
             return [elem] + seq;
@@ -9034,8 +8970,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _tmp_96(self) -> Optional[Any]:
-        # _tmp_96: ':' expression?
+    def _tmp_94(self) -> Optional[Any]:
+        # _tmp_94: ':' expression?
         mark = self._mark()
         if (
             (self.expect(':'))
@@ -9047,8 +8983,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _tmp_97(self) -> Optional[Any]:
-        # _tmp_97: STRING | FSTRING_START
+    def _tmp_95(self) -> Optional[Any]:
+        # _tmp_95: STRING | FSTRING_START
         mark = self._mark()
         if (
             (string := self.string())
@@ -9063,8 +8999,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _tmp_98(self) -> Optional[Any]:
-        # _tmp_98: tuple | group | genexp
+    def _tmp_96(self) -> Optional[Any]:
+        # _tmp_96: tuple | group | genexp
         mark = self._mark()
         if (
             (tuple := self.tuple())
@@ -9084,8 +9020,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _tmp_99(self) -> Optional[Any]:
-        # _tmp_99: list | listcomp
+    def _tmp_97(self) -> Optional[Any]:
+        # _tmp_97: list | listcomp
         mark = self._mark()
         if (
             (list := self.list())
@@ -9100,8 +9036,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _tmp_100(self) -> Optional[Any]:
-        # _tmp_100: dict | set | dictcomp | setcomp
+    def _tmp_98(self) -> Optional[Any]:
+        # _tmp_98: dict | set | dictcomp | setcomp
         mark = self._mark()
         if (
             (dict := self.dict())
@@ -9126,8 +9062,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _tmp_101(self) -> Optional[Any]:
-        # _tmp_101: yield_expr | named_expression
+    def _tmp_99(self) -> Optional[Any]:
+        # _tmp_99: yield_expr | named_expression
         mark = self._mark()
         if (
             (yield_expr := self.yield_expr())
@@ -9142,8 +9078,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _loop0_102(self) -> Optional[Any]:
-        # _loop0_102: lambda_param_no_default
+    def _loop0_100(self) -> Optional[Any]:
+        # _loop0_100: lambda_param_no_default
         mark = self._mark()
         children = []
         while (
@@ -9155,14 +9091,40 @@ class MacroPythonParser(Parser):
         return children;
 
     @memoize
-    def _loop0_103(self) -> Optional[Any]:
-        # _loop0_103: lambda_param_with_default
+    def _loop0_101(self) -> Optional[Any]:
+        # _loop0_101: lambda_param_with_default
         mark = self._mark()
         children = []
         while (
             (lambda_param_with_default := self.lambda_param_with_default())
         ):
             children.append(lambda_param_with_default)
+            mark = self._mark()
+        self._reset(mark)
+        return children;
+
+    @memoize
+    def _loop0_102(self) -> Optional[Any]:
+        # _loop0_102: lambda_param_with_default
+        mark = self._mark()
+        children = []
+        while (
+            (lambda_param_with_default := self.lambda_param_with_default())
+        ):
+            children.append(lambda_param_with_default)
+            mark = self._mark()
+        self._reset(mark)
+        return children;
+
+    @memoize
+    def _loop1_103(self) -> Optional[Any]:
+        # _loop1_103: lambda_param_no_default
+        mark = self._mark()
+        children = []
+        while (
+            (lambda_param_no_default := self.lambda_param_no_default())
+        ):
+            children.append(lambda_param_no_default)
             mark = self._mark()
         self._reset(mark)
         return children;
@@ -9182,7 +9144,20 @@ class MacroPythonParser(Parser):
 
     @memoize
     def _loop1_105(self) -> Optional[Any]:
-        # _loop1_105: lambda_param_no_default
+        # _loop1_105: lambda_param_with_default
+        mark = self._mark()
+        children = []
+        while (
+            (lambda_param_with_default := self.lambda_param_with_default())
+        ):
+            children.append(lambda_param_with_default)
+            mark = self._mark()
+        self._reset(mark)
+        return children;
+
+    @memoize
+    def _loop1_106(self) -> Optional[Any]:
+        # _loop1_106: lambda_param_no_default
         mark = self._mark()
         children = []
         while (
@@ -9194,34 +9169,21 @@ class MacroPythonParser(Parser):
         return children;
 
     @memoize
-    def _loop0_106(self) -> Optional[Any]:
-        # _loop0_106: lambda_param_with_default
-        mark = self._mark()
-        children = []
-        while (
-            (lambda_param_with_default := self.lambda_param_with_default())
-        ):
-            children.append(lambda_param_with_default)
-            mark = self._mark()
-        self._reset(mark)
-        return children;
-
-    @memoize
     def _loop1_107(self) -> Optional[Any]:
-        # _loop1_107: lambda_param_with_default
+        # _loop1_107: lambda_param_no_default
         mark = self._mark()
         children = []
         while (
-            (lambda_param_with_default := self.lambda_param_with_default())
+            (lambda_param_no_default := self.lambda_param_no_default())
         ):
-            children.append(lambda_param_with_default)
+            children.append(lambda_param_no_default)
             mark = self._mark()
         self._reset(mark)
         return children;
 
     @memoize
-    def _loop1_108(self) -> Optional[Any]:
-        # _loop1_108: lambda_param_no_default
+    def _loop0_108(self) -> Optional[Any]:
+        # _loop0_108: lambda_param_no_default
         mark = self._mark()
         children = []
         while (
@@ -9234,13 +9196,13 @@ class MacroPythonParser(Parser):
 
     @memoize
     def _loop1_109(self) -> Optional[Any]:
-        # _loop1_109: lambda_param_no_default
+        # _loop1_109: lambda_param_with_default
         mark = self._mark()
         children = []
         while (
-            (lambda_param_no_default := self.lambda_param_no_default())
+            (lambda_param_with_default := self.lambda_param_with_default())
         ):
-            children.append(lambda_param_no_default)
+            children.append(lambda_param_with_default)
             mark = self._mark()
         self._reset(mark)
         return children;
@@ -9273,33 +9235,20 @@ class MacroPythonParser(Parser):
 
     @memoize
     def _loop0_112(self) -> Optional[Any]:
-        # _loop0_112: lambda_param_no_default
+        # _loop0_112: lambda_param_maybe_default
         mark = self._mark()
         children = []
         while (
-            (lambda_param_no_default := self.lambda_param_no_default())
+            (lambda_param_maybe_default := self.lambda_param_maybe_default())
         ):
-            children.append(lambda_param_no_default)
+            children.append(lambda_param_maybe_default)
             mark = self._mark()
         self._reset(mark)
         return children;
 
     @memoize
     def _loop1_113(self) -> Optional[Any]:
-        # _loop1_113: lambda_param_with_default
-        mark = self._mark()
-        children = []
-        while (
-            (lambda_param_with_default := self.lambda_param_with_default())
-        ):
-            children.append(lambda_param_with_default)
-            mark = self._mark()
-        self._reset(mark)
-        return children;
-
-    @memoize
-    def _loop0_114(self) -> Optional[Any]:
-        # _loop0_114: lambda_param_maybe_default
+        # _loop1_113: lambda_param_maybe_default
         mark = self._mark()
         children = []
         while (
@@ -9311,21 +9260,8 @@ class MacroPythonParser(Parser):
         return children;
 
     @memoize
-    def _loop1_115(self) -> Optional[Any]:
-        # _loop1_115: lambda_param_maybe_default
-        mark = self._mark()
-        children = []
-        while (
-            (lambda_param_maybe_default := self.lambda_param_maybe_default())
-        ):
-            children.append(lambda_param_maybe_default)
-            mark = self._mark()
-        self._reset(mark)
-        return children;
-
-    @memoize
-    def _tmp_116(self) -> Optional[Any]:
-        # _tmp_116: yield_expr | star_expressions
+    def _tmp_114(self) -> Optional[Any]:
+        # _tmp_114: yield_expr | star_expressions
         mark = self._mark()
         if (
             (yield_expr := self.yield_expr())
@@ -9340,8 +9276,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _loop0_117(self) -> Optional[Any]:
-        # _loop0_117: fstring_format_spec
+    def _loop0_115(self) -> Optional[Any]:
+        # _loop0_115: fstring_format_spec
         mark = self._mark()
         children = []
         while (
@@ -9353,21 +9289,21 @@ class MacroPythonParser(Parser):
         return children;
 
     @memoize
-    def _loop1_118(self) -> Optional[Any]:
-        # _loop1_118: (fstring | STRING)
+    def _loop1_116(self) -> Optional[Any]:
+        # _loop1_116: (fstring | STRING)
         mark = self._mark()
         children = []
         while (
-            (_tmp_273 := self._tmp_273())
+            (_tmp_260 := self._tmp_260())
         ):
-            children.append(_tmp_273)
+            children.append(_tmp_260)
             mark = self._mark()
         self._reset(mark)
         return children;
 
     @memoize
-    def _tmp_119(self) -> Optional[Any]:
-        # _tmp_119: star_named_expression ',' star_named_expressions?
+    def _tmp_117(self) -> Optional[Any]:
+        # _tmp_117: star_named_expression ',' star_named_expressions?
         mark = self._mark()
         if (
             (y := self.star_named_expression())
@@ -9381,8 +9317,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _loop0_121(self) -> Optional[Any]:
-        # _loop0_121: ',' double_starred_kvpair
+    def _loop0_119(self) -> Optional[Any]:
+        # _loop0_119: ',' double_starred_kvpair
         mark = self._mark()
         children = []
         while (
@@ -9396,14 +9332,14 @@ class MacroPythonParser(Parser):
         return children;
 
     @memoize
-    def _gather_120(self) -> Optional[Any]:
-        # _gather_120: double_starred_kvpair _loop0_121
+    def _gather_118(self) -> Optional[Any]:
+        # _gather_118: double_starred_kvpair _loop0_119
         mark = self._mark()
         if (
             (elem := self.double_starred_kvpair())
             is not None
             and
-            (seq := self._loop0_121())
+            (seq := self._loop0_119())
             is not None
         ):
             return [elem] + seq;
@@ -9411,8 +9347,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _loop1_122(self) -> Optional[Any]:
-        # _loop1_122: for_if_clause
+    def _loop1_120(self) -> Optional[Any]:
+        # _loop1_120: for_if_clause
         mark = self._mark()
         children = []
         while (
@@ -9424,34 +9360,34 @@ class MacroPythonParser(Parser):
         return children;
 
     @memoize
-    def _loop0_123(self) -> Optional[Any]:
-        # _loop0_123: ('if' disjunction)
+    def _loop0_121(self) -> Optional[Any]:
+        # _loop0_121: ('if' disjunction)
         mark = self._mark()
         children = []
         while (
-            (_tmp_274 := self._tmp_274())
+            (_tmp_261 := self._tmp_261())
         ):
-            children.append(_tmp_274)
+            children.append(_tmp_261)
             mark = self._mark()
         self._reset(mark)
         return children;
 
     @memoize
-    def _loop0_124(self) -> Optional[Any]:
-        # _loop0_124: ('if' disjunction)
+    def _loop0_122(self) -> Optional[Any]:
+        # _loop0_122: ('if' disjunction)
         mark = self._mark()
         children = []
         while (
-            (_tmp_275 := self._tmp_275())
+            (_tmp_262 := self._tmp_262())
         ):
-            children.append(_tmp_275)
+            children.append(_tmp_262)
             mark = self._mark()
         self._reset(mark)
         return children;
 
     @memoize
-    def _tmp_125(self) -> Optional[Any]:
-        # _tmp_125: assignment_expression | expression !':='
+    def _tmp_123(self) -> Optional[Any]:
+        # _tmp_123: assignment_expression | expression !':='
         mark = self._mark()
         if (
             (assignment_expression := self.assignment_expression())
@@ -9468,14 +9404,14 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _loop0_127(self) -> Optional[Any]:
-        # _loop0_127: ',' (starred_expression | (assignment_expression | expression !':=') !'=')
+    def _loop0_125(self) -> Optional[Any]:
+        # _loop0_125: ',' (starred_expression | (assignment_expression | expression !':=') !'=')
         mark = self._mark()
         children = []
         while (
             (self.expect(','))
             and
-            (elem := self._tmp_276())
+            (elem := self._tmp_263())
         ):
             children.append(elem)
             mark = self._mark()
@@ -9483,14 +9419,14 @@ class MacroPythonParser(Parser):
         return children;
 
     @memoize
-    def _gather_126(self) -> Optional[Any]:
-        # _gather_126: (starred_expression | (assignment_expression | expression !':=') !'=') _loop0_127
+    def _gather_124(self) -> Optional[Any]:
+        # _gather_124: (starred_expression | (assignment_expression | expression !':=') !'=') _loop0_125
         mark = self._mark()
         if (
-            (elem := self._tmp_276())
+            (elem := self._tmp_263())
             is not None
             and
-            (seq := self._loop0_127())
+            (seq := self._loop0_125())
             is not None
         ):
             return [elem] + seq;
@@ -9498,8 +9434,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _tmp_128(self) -> Optional[Any]:
-        # _tmp_128: ',' kwargs
+    def _tmp_126(self) -> Optional[Any]:
+        # _tmp_126: ',' kwargs
         mark = self._mark()
         if (
             (self.expect(','))
@@ -9511,8 +9447,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _loop0_130(self) -> Optional[Any]:
-        # _loop0_130: ',' kwarg_or_starred
+    def _loop0_128(self) -> Optional[Any]:
+        # _loop0_128: ',' kwarg_or_starred
         mark = self._mark()
         children = []
         while (
@@ -9526,11 +9462,41 @@ class MacroPythonParser(Parser):
         return children;
 
     @memoize
-    def _gather_129(self) -> Optional[Any]:
-        # _gather_129: kwarg_or_starred _loop0_130
+    def _gather_127(self) -> Optional[Any]:
+        # _gather_127: kwarg_or_starred _loop0_128
         mark = self._mark()
         if (
             (elem := self.kwarg_or_starred())
+            is not None
+            and
+            (seq := self._loop0_128())
+            is not None
+        ):
+            return [elem] + seq;
+        self._reset(mark)
+        return None;
+
+    @memoize
+    def _loop0_130(self) -> Optional[Any]:
+        # _loop0_130: ',' kwarg_or_double_starred
+        mark = self._mark()
+        children = []
+        while (
+            (self.expect(','))
+            and
+            (elem := self.kwarg_or_double_starred())
+        ):
+            children.append(elem)
+            mark = self._mark()
+        self._reset(mark)
+        return children;
+
+    @memoize
+    def _gather_129(self) -> Optional[Any]:
+        # _gather_129: kwarg_or_double_starred _loop0_130
+        mark = self._mark()
+        if (
+            (elem := self.kwarg_or_double_starred())
             is not None
             and
             (seq := self._loop0_130())
@@ -9542,13 +9508,13 @@ class MacroPythonParser(Parser):
 
     @memoize
     def _loop0_132(self) -> Optional[Any]:
-        # _loop0_132: ',' kwarg_or_double_starred
+        # _loop0_132: ',' kwarg_or_starred
         mark = self._mark()
         children = []
         while (
             (self.expect(','))
             and
-            (elem := self.kwarg_or_double_starred())
+            (elem := self.kwarg_or_starred())
         ):
             children.append(elem)
             mark = self._mark()
@@ -9557,10 +9523,10 @@ class MacroPythonParser(Parser):
 
     @memoize
     def _gather_131(self) -> Optional[Any]:
-        # _gather_131: kwarg_or_double_starred _loop0_132
+        # _gather_131: kwarg_or_starred _loop0_132
         mark = self._mark()
         if (
-            (elem := self.kwarg_or_double_starred())
+            (elem := self.kwarg_or_starred())
             is not None
             and
             (seq := self._loop0_132())
@@ -9572,13 +9538,13 @@ class MacroPythonParser(Parser):
 
     @memoize
     def _loop0_134(self) -> Optional[Any]:
-        # _loop0_134: ',' kwarg_or_starred
+        # _loop0_134: ',' kwarg_or_double_starred
         mark = self._mark()
         children = []
         while (
             (self.expect(','))
             and
-            (elem := self.kwarg_or_starred())
+            (elem := self.kwarg_or_double_starred())
         ):
             children.append(elem)
             mark = self._mark()
@@ -9587,10 +9553,10 @@ class MacroPythonParser(Parser):
 
     @memoize
     def _gather_133(self) -> Optional[Any]:
-        # _gather_133: kwarg_or_starred _loop0_134
+        # _gather_133: kwarg_or_double_starred _loop0_134
         mark = self._mark()
         if (
-            (elem := self.kwarg_or_starred())
+            (elem := self.kwarg_or_double_starred())
             is not None
             and
             (seq := self._loop0_134())
@@ -9601,51 +9567,21 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _loop0_136(self) -> Optional[Any]:
-        # _loop0_136: ',' kwarg_or_double_starred
+    def _loop0_135(self) -> Optional[Any]:
+        # _loop0_135: (',' star_target)
         mark = self._mark()
         children = []
         while (
-            (self.expect(','))
-            and
-            (elem := self.kwarg_or_double_starred())
+            (_tmp_264 := self._tmp_264())
         ):
-            children.append(elem)
+            children.append(_tmp_264)
             mark = self._mark()
         self._reset(mark)
         return children;
-
-    @memoize
-    def _gather_135(self) -> Optional[Any]:
-        # _gather_135: kwarg_or_double_starred _loop0_136
-        mark = self._mark()
-        if (
-            (elem := self.kwarg_or_double_starred())
-            is not None
-            and
-            (seq := self._loop0_136())
-            is not None
-        ):
-            return [elem] + seq;
-        self._reset(mark)
-        return None;
 
     @memoize
     def _loop0_137(self) -> Optional[Any]:
-        # _loop0_137: (',' star_target)
-        mark = self._mark()
-        children = []
-        while (
-            (_tmp_277 := self._tmp_277())
-        ):
-            children.append(_tmp_277)
-            mark = self._mark()
-        self._reset(mark)
-        return children;
-
-    @memoize
-    def _loop0_139(self) -> Optional[Any]:
-        # _loop0_139: ',' star_target
+        # _loop0_137: ',' star_target
         mark = self._mark()
         children = []
         while (
@@ -9659,14 +9595,14 @@ class MacroPythonParser(Parser):
         return children;
 
     @memoize
-    def _gather_138(self) -> Optional[Any]:
-        # _gather_138: star_target _loop0_139
+    def _gather_136(self) -> Optional[Any]:
+        # _gather_136: star_target _loop0_137
         mark = self._mark()
         if (
             (elem := self.star_target())
             is not None
             and
-            (seq := self._loop0_139())
+            (seq := self._loop0_137())
             is not None
         ):
             return [elem] + seq;
@@ -9674,21 +9610,21 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _loop1_140(self) -> Optional[Any]:
-        # _loop1_140: (',' star_target)
+    def _loop1_138(self) -> Optional[Any]:
+        # _loop1_138: (',' star_target)
         mark = self._mark()
         children = []
         while (
-            (_tmp_278 := self._tmp_278())
+            (_tmp_265 := self._tmp_265())
         ):
-            children.append(_tmp_278)
+            children.append(_tmp_265)
             mark = self._mark()
         self._reset(mark)
         return children;
 
     @memoize
-    def _tmp_141(self) -> Optional[Any]:
-        # _tmp_141: !'*' star_target
+    def _tmp_139(self) -> Optional[Any]:
+        # _tmp_139: !'*' star_target
         mark = self._mark()
         if (
             (self.negative_lookahead(self.expect, '*'))
@@ -9700,8 +9636,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _loop0_143(self) -> Optional[Any]:
-        # _loop0_143: ',' del_target
+    def _loop0_141(self) -> Optional[Any]:
+        # _loop0_141: ',' del_target
         mark = self._mark()
         children = []
         while (
@@ -9715,11 +9651,41 @@ class MacroPythonParser(Parser):
         return children;
 
     @memoize
-    def _gather_142(self) -> Optional[Any]:
-        # _gather_142: del_target _loop0_143
+    def _gather_140(self) -> Optional[Any]:
+        # _gather_140: del_target _loop0_141
         mark = self._mark()
         if (
             (elem := self.del_target())
+            is not None
+            and
+            (seq := self._loop0_141())
+            is not None
+        ):
+            return [elem] + seq;
+        self._reset(mark)
+        return None;
+
+    @memoize
+    def _loop0_143(self) -> Optional[Any]:
+        # _loop0_143: ',' expression
+        mark = self._mark()
+        children = []
+        while (
+            (self.expect(','))
+            and
+            (elem := self.expression())
+        ):
+            children.append(elem)
+            mark = self._mark()
+        self._reset(mark)
+        return children;
+
+    @memoize
+    def _gather_142(self) -> Optional[Any]:
+        # _gather_142: expression _loop0_143
+        mark = self._mark()
+        if (
+            (elem := self.expression())
             is not None
             and
             (seq := self._loop0_143())
@@ -9820,38 +9786,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _loop0_151(self) -> Optional[Any]:
-        # _loop0_151: ',' expression
-        mark = self._mark()
-        children = []
-        while (
-            (self.expect(','))
-            and
-            (elem := self.expression())
-        ):
-            children.append(elem)
-            mark = self._mark()
-        self._reset(mark)
-        return children;
-
-    @memoize
-    def _gather_150(self) -> Optional[Any]:
-        # _gather_150: expression _loop0_151
-        mark = self._mark()
-        if (
-            (elem := self.expression())
-            is not None
-            and
-            (seq := self._loop0_151())
-            is not None
-        ):
-            return [elem] + seq;
-        self._reset(mark)
-        return None;
-
-    @memoize
-    def _tmp_152(self) -> Optional[Any]:
-        # _tmp_152: NEWLINE INDENT
+    def _tmp_150(self) -> Optional[Any]:
+        # _tmp_150: NEWLINE INDENT
         mark = self._mark()
         if (
             (_newline := self.expect('NEWLINE'))
@@ -9863,13 +9799,13 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _tmp_153(self) -> Optional[Any]:
-        # _tmp_153: (','.(starred_expression | (assignment_expression | expression !':=') !'=')+ ',' kwargs) | kwargs
+    def _tmp_151(self) -> Optional[Any]:
+        # _tmp_151: (','.(starred_expression | (assignment_expression | expression !':=') !'=')+ ',' kwargs) | kwargs
         mark = self._mark()
         if (
-            (_tmp_279 := self._tmp_279())
+            (_tmp_266 := self._tmp_266())
         ):
-            return _tmp_279;
+            return _tmp_266;
         self._reset(mark)
         if (
             (kwargs := self.kwargs())
@@ -9879,14 +9815,14 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _loop0_155(self) -> Optional[Any]:
-        # _loop0_155: ',' (starred_expression !'=')
+    def _loop0_153(self) -> Optional[Any]:
+        # _loop0_153: ',' (starred_expression !'=')
         mark = self._mark()
         children = []
         while (
             (self.expect(','))
             and
-            (elem := self._tmp_280())
+            (elem := self._tmp_267())
         ):
             children.append(elem)
             mark = self._mark()
@@ -9894,14 +9830,14 @@ class MacroPythonParser(Parser):
         return children;
 
     @memoize
-    def _gather_154(self) -> Optional[Any]:
-        # _gather_154: (starred_expression !'=') _loop0_155
+    def _gather_152(self) -> Optional[Any]:
+        # _gather_152: (starred_expression !'=') _loop0_153
         mark = self._mark()
         if (
-            (elem := self._tmp_280())
+            (elem := self._tmp_267())
             is not None
             and
-            (seq := self._loop0_155())
+            (seq := self._loop0_153())
             is not None
         ):
             return [elem] + seq;
@@ -9909,8 +9845,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _tmp_156(self) -> Optional[Any]:
-        # _tmp_156: args | expression for_if_clauses
+    def _tmp_154(self) -> Optional[Any]:
+        # _tmp_154: args | expression for_if_clauses
         mark = self._mark()
         if (
             (args := self.args())
@@ -9927,8 +9863,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _tmp_157(self) -> Optional[Any]:
-        # _tmp_157: args ','
+    def _tmp_155(self) -> Optional[Any]:
+        # _tmp_155: args ','
         mark = self._mark()
         if (
             (args := self.args())
@@ -9940,8 +9876,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _tmp_158(self) -> Optional[Any]:
-        # _tmp_158: ',' | ')'
+    def _tmp_156(self) -> Optional[Any]:
+        # _tmp_156: ',' | ')'
         mark = self._mark()
         if (
             (literal := self.expect(','))
@@ -9956,8 +9892,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _tmp_159(self) -> Optional[Any]:
-        # _tmp_159: 'True' | 'False' | 'None'
+    def _tmp_157(self) -> Optional[Any]:
+        # _tmp_157: 'True' | 'False' | 'None'
         mark = self._mark()
         if (
             (literal := self.expect('True'))
@@ -9977,8 +9913,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _tmp_160(self) -> Optional[Any]:
-        # _tmp_160: NAME '='
+    def _tmp_158(self) -> Optional[Any]:
+        # _tmp_158: NAME '='
         mark = self._mark()
         if (
             (name := self.name())
@@ -9990,8 +9926,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _tmp_161(self) -> Optional[Any]:
-        # _tmp_161: NAME STRING | SOFT_KEYWORD
+    def _tmp_159(self) -> Optional[Any]:
+        # _tmp_159: NAME STRING | SOFT_KEYWORD
         mark = self._mark()
         if (
             (name := self.name())
@@ -10008,8 +9944,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _tmp_162(self) -> Optional[Any]:
-        # _tmp_162: 'else' | ':'
+    def _tmp_160(self) -> Optional[Any]:
+        # _tmp_160: 'else' | ':'
         mark = self._mark()
         if (
             (literal := self.expect('else'))
@@ -10024,8 +9960,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _tmp_163(self) -> Optional[Any]:
-        # _tmp_163: FSTRING_MIDDLE | fstring_replacement_field
+    def _tmp_161(self) -> Optional[Any]:
+        # _tmp_161: FSTRING_MIDDLE | fstring_replacement_field
         mark = self._mark()
         if (
             (fstring_middle := self.fstring_middle())
@@ -10040,8 +9976,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _tmp_164(self) -> Optional[Any]:
-        # _tmp_164: '=' | ':='
+    def _tmp_162(self) -> Optional[Any]:
+        # _tmp_162: '=' | ':='
         mark = self._mark()
         if (
             (literal := self.expect('='))
@@ -10056,8 +9992,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _tmp_165(self) -> Optional[Any]:
-        # _tmp_165: list | tuple | genexp | 'True' | 'None' | 'False'
+    def _tmp_163(self) -> Optional[Any]:
+        # _tmp_163: list | tuple | genexp | 'True' | 'None' | 'False'
         mark = self._mark()
         if (
             (list := self.list())
@@ -10092,8 +10028,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _tmp_166(self) -> Optional[Any]:
-        # _tmp_166: '=' | ':='
+    def _tmp_164(self) -> Optional[Any]:
+        # _tmp_164: '=' | ':='
         mark = self._mark()
         if (
             (literal := self.expect('='))
@@ -10108,8 +10044,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _loop0_167(self) -> Optional[Any]:
-        # _loop0_167: star_named_expressions
+    def _loop0_165(self) -> Optional[Any]:
+        # _loop0_165: star_named_expressions
         mark = self._mark()
         children = []
         while (
@@ -10121,34 +10057,34 @@ class MacroPythonParser(Parser):
         return children;
 
     @memoize
-    def _loop0_168(self) -> Optional[Any]:
-        # _loop0_168: (star_targets '=')
+    def _loop0_166(self) -> Optional[Any]:
+        # _loop0_166: (star_targets '=')
         mark = self._mark()
         children = []
         while (
-            (_tmp_281 := self._tmp_281())
+            (_tmp_268 := self._tmp_268())
         ):
-            children.append(_tmp_281)
+            children.append(_tmp_268)
             mark = self._mark()
         self._reset(mark)
         return children;
 
     @memoize
-    def _loop0_169(self) -> Optional[Any]:
-        # _loop0_169: (star_targets '=')
+    def _loop0_167(self) -> Optional[Any]:
+        # _loop0_167: (star_targets '=')
         mark = self._mark()
         children = []
         while (
-            (_tmp_282 := self._tmp_282())
+            (_tmp_269 := self._tmp_269())
         ):
-            children.append(_tmp_282)
+            children.append(_tmp_269)
             mark = self._mark()
         self._reset(mark)
         return children;
 
     @memoize
-    def _tmp_170(self) -> Optional[Any]:
-        # _tmp_170: yield_expr | star_expressions
+    def _tmp_168(self) -> Optional[Any]:
+        # _tmp_168: yield_expr | star_expressions
         mark = self._mark()
         if (
             (yield_expr := self.yield_expr())
@@ -10163,8 +10099,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _tmp_171(self) -> Optional[Any]:
-        # _tmp_171: '[' | '(' | '{'
+    def _tmp_169(self) -> Optional[Any]:
+        # _tmp_169: '[' | '(' | '{'
         mark = self._mark()
         if (
             (literal := self.expect('['))
@@ -10184,40 +10120,40 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
+    def _tmp_170(self) -> Optional[Any]:
+        # _tmp_170: '[' | '{'
+        mark = self._mark()
+        if (
+            (literal := self.expect('['))
+        ):
+            return literal;
+        self._reset(mark)
+        if (
+            (literal := self.expect('{'))
+        ):
+            return literal;
+        self._reset(mark)
+        return None;
+
+    @memoize
+    def _tmp_171(self) -> Optional[Any]:
+        # _tmp_171: '[' | '{'
+        mark = self._mark()
+        if (
+            (literal := self.expect('['))
+        ):
+            return literal;
+        self._reset(mark)
+        if (
+            (literal := self.expect('{'))
+        ):
+            return literal;
+        self._reset(mark)
+        return None;
+
+    @memoize
     def _tmp_172(self) -> Optional[Any]:
-        # _tmp_172: '[' | '{'
-        mark = self._mark()
-        if (
-            (literal := self.expect('['))
-        ):
-            return literal;
-        self._reset(mark)
-        if (
-            (literal := self.expect('{'))
-        ):
-            return literal;
-        self._reset(mark)
-        return None;
-
-    @memoize
-    def _tmp_173(self) -> Optional[Any]:
-        # _tmp_173: '[' | '{'
-        mark = self._mark()
-        if (
-            (literal := self.expect('['))
-        ):
-            return literal;
-        self._reset(mark)
-        if (
-            (literal := self.expect('{'))
-        ):
-            return literal;
-        self._reset(mark)
-        return None;
-
-    @memoize
-    def _tmp_174(self) -> Optional[Any]:
-        # _tmp_174: slash_no_default | slash_with_default
+        # _tmp_172: slash_no_default | slash_with_default
         mark = self._mark()
         if (
             (slash_no_default := self.slash_no_default())
@@ -10232,8 +10168,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _loop0_175(self) -> Optional[Any]:
-        # _loop0_175: param_maybe_default
+    def _loop0_173(self) -> Optional[Any]:
+        # _loop0_173: param_maybe_default
         mark = self._mark()
         children = []
         while (
@@ -10245,8 +10181,8 @@ class MacroPythonParser(Parser):
         return children;
 
     @memoize
-    def _loop0_176(self) -> Optional[Any]:
-        # _loop0_176: param_no_default
+    def _loop0_174(self) -> Optional[Any]:
+        # _loop0_174: param_no_default
         mark = self._mark()
         children = []
         while (
@@ -10258,8 +10194,8 @@ class MacroPythonParser(Parser):
         return children;
 
     @memoize
-    def _loop0_177(self) -> Optional[Any]:
-        # _loop0_177: param_no_default
+    def _loop0_175(self) -> Optional[Any]:
+        # _loop0_175: param_no_default
         mark = self._mark()
         children = []
         while (
@@ -10271,8 +10207,8 @@ class MacroPythonParser(Parser):
         return children;
 
     @memoize
-    def _loop1_178(self) -> Optional[Any]:
-        # _loop1_178: param_no_default
+    def _loop1_176(self) -> Optional[Any]:
+        # _loop1_176: param_no_default
         mark = self._mark()
         children = []
         while (
@@ -10284,8 +10220,8 @@ class MacroPythonParser(Parser):
         return children;
 
     @memoize
-    def _tmp_179(self) -> Optional[Any]:
-        # _tmp_179: slash_no_default | slash_with_default
+    def _tmp_177(self) -> Optional[Any]:
+        # _tmp_177: slash_no_default | slash_with_default
         mark = self._mark()
         if (
             (slash_no_default := self.slash_no_default())
@@ -10296,6 +10232,35 @@ class MacroPythonParser(Parser):
             (slash_with_default := self.slash_with_default())
         ):
             return slash_with_default;
+        self._reset(mark)
+        return None;
+
+    @memoize
+    def _loop0_178(self) -> Optional[Any]:
+        # _loop0_178: param_maybe_default
+        mark = self._mark()
+        children = []
+        while (
+            (param_maybe_default := self.param_maybe_default())
+        ):
+            children.append(param_maybe_default)
+            mark = self._mark()
+        self._reset(mark)
+        return children;
+
+    @memoize
+    def _tmp_179(self) -> Optional[Any]:
+        # _tmp_179: ',' | param_no_default
+        mark = self._mark()
+        if (
+            (literal := self.expect(','))
+        ):
+            return literal;
+        self._reset(mark)
+        if (
+            (param_no_default := self.param_no_default())
+        ):
+            return param_no_default;
         self._reset(mark)
         return None;
 
@@ -10313,24 +10278,8 @@ class MacroPythonParser(Parser):
         return children;
 
     @memoize
-    def _tmp_181(self) -> Optional[Any]:
-        # _tmp_181: ',' | param_no_default
-        mark = self._mark()
-        if (
-            (literal := self.expect(','))
-        ):
-            return literal;
-        self._reset(mark)
-        if (
-            (param_no_default := self.param_no_default())
-        ):
-            return param_no_default;
-        self._reset(mark)
-        return None;
-
-    @memoize
-    def _loop0_182(self) -> Optional[Any]:
-        # _loop0_182: param_maybe_default
+    def _loop1_181(self) -> Optional[Any]:
+        # _loop1_181: param_maybe_default
         mark = self._mark()
         children = []
         while (
@@ -10342,21 +10291,8 @@ class MacroPythonParser(Parser):
         return children;
 
     @memoize
-    def _loop1_183(self) -> Optional[Any]:
-        # _loop1_183: param_maybe_default
-        mark = self._mark()
-        children = []
-        while (
-            (param_maybe_default := self.param_maybe_default())
-        ):
-            children.append(param_maybe_default)
-            mark = self._mark()
-        self._reset(mark)
-        return children;
-
-    @memoize
-    def _tmp_184(self) -> Optional[Any]:
-        # _tmp_184: ')' | ','
+    def _tmp_182(self) -> Optional[Any]:
+        # _tmp_182: ')' | ','
         mark = self._mark()
         if (
             (literal := self.expect(')'))
@@ -10371,8 +10307,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _tmp_185(self) -> Optional[Any]:
-        # _tmp_185: ')' | ',' (')' | '**')
+    def _tmp_183(self) -> Optional[Any]:
+        # _tmp_183: ')' | ',' (')' | '**')
         mark = self._mark()
         if (
             (literal := self.expect(')'))
@@ -10382,11 +10318,40 @@ class MacroPythonParser(Parser):
         if (
             (literal := self.expect(','))
             and
-            (_tmp_283 := self._tmp_283())
+            (_tmp_270 := self._tmp_270())
         ):
-            return [literal, _tmp_283];
+            return [literal, _tmp_270];
         self._reset(mark)
         return None;
+
+    @memoize
+    def _tmp_184(self) -> Optional[Any]:
+        # _tmp_184: param_no_default | ','
+        mark = self._mark()
+        if (
+            (param_no_default := self.param_no_default())
+        ):
+            return param_no_default;
+        self._reset(mark)
+        if (
+            (literal := self.expect(','))
+        ):
+            return literal;
+        self._reset(mark)
+        return None;
+
+    @memoize
+    def _loop0_185(self) -> Optional[Any]:
+        # _loop0_185: param_maybe_default
+        mark = self._mark()
+        children = []
+        while (
+            (param_maybe_default := self.param_maybe_default())
+        ):
+            children.append(param_maybe_default)
+            mark = self._mark()
+        self._reset(mark)
+        return children;
 
     @memoize
     def _tmp_186(self) -> Optional[Any]:
@@ -10405,37 +10370,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _loop0_187(self) -> Optional[Any]:
-        # _loop0_187: param_maybe_default
-        mark = self._mark()
-        children = []
-        while (
-            (param_maybe_default := self.param_maybe_default())
-        ):
-            children.append(param_maybe_default)
-            mark = self._mark()
-        self._reset(mark)
-        return children;
-
-    @memoize
-    def _tmp_188(self) -> Optional[Any]:
-        # _tmp_188: param_no_default | ','
-        mark = self._mark()
-        if (
-            (param_no_default := self.param_no_default())
-        ):
-            return param_no_default;
-        self._reset(mark)
-        if (
-            (literal := self.expect(','))
-        ):
-            return literal;
-        self._reset(mark)
-        return None;
-
-    @memoize
-    def _tmp_189(self) -> Optional[Any]:
-        # _tmp_189: '*' | '**' | '/'
+    def _tmp_187(self) -> Optional[Any]:
+        # _tmp_187: '*' | '**' | '/'
         mark = self._mark()
         if (
             (literal := self.expect('*'))
@@ -10455,8 +10391,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _loop1_190(self) -> Optional[Any]:
-        # _loop1_190: param_with_default
+    def _loop1_188(self) -> Optional[Any]:
+        # _loop1_188: param_with_default
         mark = self._mark()
         children = []
         while (
@@ -10468,8 +10404,8 @@ class MacroPythonParser(Parser):
         return children;
 
     @memoize
-    def _tmp_191(self) -> Optional[Any]:
-        # _tmp_191: lambda_slash_no_default | lambda_slash_with_default
+    def _tmp_189(self) -> Optional[Any]:
+        # _tmp_189: lambda_slash_no_default | lambda_slash_with_default
         mark = self._mark()
         if (
             (lambda_slash_no_default := self.lambda_slash_no_default())
@@ -10484,8 +10420,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _loop0_192(self) -> Optional[Any]:
-        # _loop0_192: lambda_param_maybe_default
+    def _loop0_190(self) -> Optional[Any]:
+        # _loop0_190: lambda_param_maybe_default
         mark = self._mark()
         children = []
         while (
@@ -10497,8 +10433,21 @@ class MacroPythonParser(Parser):
         return children;
 
     @memoize
-    def _loop0_193(self) -> Optional[Any]:
-        # _loop0_193: lambda_param_no_default
+    def _loop0_191(self) -> Optional[Any]:
+        # _loop0_191: lambda_param_no_default
+        mark = self._mark()
+        children = []
+        while (
+            (lambda_param_no_default := self.lambda_param_no_default())
+        ):
+            children.append(lambda_param_no_default)
+            mark = self._mark()
+        self._reset(mark)
+        return children;
+
+    @memoize
+    def _loop0_192(self) -> Optional[Any]:
+        # _loop0_192: lambda_param_no_default
         mark = self._mark()
         children = []
         while (
@@ -10511,20 +10460,7 @@ class MacroPythonParser(Parser):
 
     @memoize
     def _loop0_194(self) -> Optional[Any]:
-        # _loop0_194: lambda_param_no_default
-        mark = self._mark()
-        children = []
-        while (
-            (lambda_param_no_default := self.lambda_param_no_default())
-        ):
-            children.append(lambda_param_no_default)
-            mark = self._mark()
-        self._reset(mark)
-        return children;
-
-    @memoize
-    def _loop0_196(self) -> Optional[Any]:
-        # _loop0_196: ',' lambda_param
+        # _loop0_194: ',' lambda_param
         mark = self._mark()
         children = []
         while (
@@ -10538,14 +10474,14 @@ class MacroPythonParser(Parser):
         return children;
 
     @memoize
-    def _gather_195(self) -> Optional[Any]:
-        # _gather_195: lambda_param _loop0_196
+    def _gather_193(self) -> Optional[Any]:
+        # _gather_193: lambda_param _loop0_194
         mark = self._mark()
         if (
             (elem := self.lambda_param())
             is not None
             and
-            (seq := self._loop0_196())
+            (seq := self._loop0_194())
             is not None
         ):
             return [elem] + seq;
@@ -10553,8 +10489,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _tmp_197(self) -> Optional[Any]:
-        # _tmp_197: lambda_slash_no_default | lambda_slash_with_default
+    def _tmp_195(self) -> Optional[Any]:
+        # _tmp_195: lambda_slash_no_default | lambda_slash_with_default
         mark = self._mark()
         if (
             (lambda_slash_no_default := self.lambda_slash_no_default())
@@ -10565,6 +10501,35 @@ class MacroPythonParser(Parser):
             (lambda_slash_with_default := self.lambda_slash_with_default())
         ):
             return lambda_slash_with_default;
+        self._reset(mark)
+        return None;
+
+    @memoize
+    def _loop0_196(self) -> Optional[Any]:
+        # _loop0_196: lambda_param_maybe_default
+        mark = self._mark()
+        children = []
+        while (
+            (lambda_param_maybe_default := self.lambda_param_maybe_default())
+        ):
+            children.append(lambda_param_maybe_default)
+            mark = self._mark()
+        self._reset(mark)
+        return children;
+
+    @memoize
+    def _tmp_197(self) -> Optional[Any]:
+        # _tmp_197: ',' | lambda_param_no_default
+        mark = self._mark()
+        if (
+            (literal := self.expect(','))
+        ):
+            return literal;
+        self._reset(mark)
+        if (
+            (lambda_param_no_default := self.lambda_param_no_default())
+        ):
+            return lambda_param_no_default;
         self._reset(mark)
         return None;
 
@@ -10582,24 +10547,8 @@ class MacroPythonParser(Parser):
         return children;
 
     @memoize
-    def _tmp_199(self) -> Optional[Any]:
-        # _tmp_199: ',' | lambda_param_no_default
-        mark = self._mark()
-        if (
-            (literal := self.expect(','))
-        ):
-            return literal;
-        self._reset(mark)
-        if (
-            (lambda_param_no_default := self.lambda_param_no_default())
-        ):
-            return lambda_param_no_default;
-        self._reset(mark)
-        return None;
-
-    @memoize
-    def _loop0_200(self) -> Optional[Any]:
-        # _loop0_200: lambda_param_maybe_default
+    def _loop1_199(self) -> Optional[Any]:
+        # _loop1_199: lambda_param_maybe_default
         mark = self._mark()
         children = []
         while (
@@ -10611,21 +10560,8 @@ class MacroPythonParser(Parser):
         return children;
 
     @memoize
-    def _loop1_201(self) -> Optional[Any]:
-        # _loop1_201: lambda_param_maybe_default
-        mark = self._mark()
-        children = []
-        while (
-            (lambda_param_maybe_default := self.lambda_param_maybe_default())
-        ):
-            children.append(lambda_param_maybe_default)
-            mark = self._mark()
-        self._reset(mark)
-        return children;
-
-    @memoize
-    def _loop1_202(self) -> Optional[Any]:
-        # _loop1_202: lambda_param_with_default
+    def _loop1_200(self) -> Optional[Any]:
+        # _loop1_200: lambda_param_with_default
         mark = self._mark()
         children = []
         while (
@@ -10637,8 +10573,8 @@ class MacroPythonParser(Parser):
         return children;
 
     @memoize
-    def _tmp_203(self) -> Optional[Any]:
-        # _tmp_203: ':' | ',' (':' | '**')
+    def _tmp_201(self) -> Optional[Any]:
+        # _tmp_201: ':' | ',' (':' | '**')
         mark = self._mark()
         if (
             (literal := self.expect(':'))
@@ -10648,11 +10584,40 @@ class MacroPythonParser(Parser):
         if (
             (literal := self.expect(','))
             and
-            (_tmp_284 := self._tmp_284())
+            (_tmp_271 := self._tmp_271())
         ):
-            return [literal, _tmp_284];
+            return [literal, _tmp_271];
         self._reset(mark)
         return None;
+
+    @memoize
+    def _tmp_202(self) -> Optional[Any]:
+        # _tmp_202: lambda_param_no_default | ','
+        mark = self._mark()
+        if (
+            (lambda_param_no_default := self.lambda_param_no_default())
+        ):
+            return lambda_param_no_default;
+        self._reset(mark)
+        if (
+            (literal := self.expect(','))
+        ):
+            return literal;
+        self._reset(mark)
+        return None;
+
+    @memoize
+    def _loop0_203(self) -> Optional[Any]:
+        # _loop0_203: lambda_param_maybe_default
+        mark = self._mark()
+        children = []
+        while (
+            (lambda_param_maybe_default := self.lambda_param_maybe_default())
+        ):
+            children.append(lambda_param_maybe_default)
+            mark = self._mark()
+        self._reset(mark)
+        return children;
 
     @memoize
     def _tmp_204(self) -> Optional[Any]:
@@ -10671,37 +10636,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _loop0_205(self) -> Optional[Any]:
-        # _loop0_205: lambda_param_maybe_default
-        mark = self._mark()
-        children = []
-        while (
-            (lambda_param_maybe_default := self.lambda_param_maybe_default())
-        ):
-            children.append(lambda_param_maybe_default)
-            mark = self._mark()
-        self._reset(mark)
-        return children;
-
-    @memoize
-    def _tmp_206(self) -> Optional[Any]:
-        # _tmp_206: lambda_param_no_default | ','
-        mark = self._mark()
-        if (
-            (lambda_param_no_default := self.lambda_param_no_default())
-        ):
-            return lambda_param_no_default;
-        self._reset(mark)
-        if (
-            (literal := self.expect(','))
-        ):
-            return literal;
-        self._reset(mark)
-        return None;
-
-    @memoize
-    def _tmp_207(self) -> Optional[Any]:
-        # _tmp_207: '*' | '**' | '/'
+    def _tmp_205(self) -> Optional[Any]:
+        # _tmp_205: '*' | '**' | '/'
         mark = self._mark()
         if (
             (literal := self.expect('*'))
@@ -10721,8 +10657,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _tmp_208(self) -> Optional[Any]:
-        # _tmp_208: ',' | ')' | ':'
+    def _tmp_206(self) -> Optional[Any]:
+        # _tmp_206: ',' | ')' | ':'
         mark = self._mark()
         if (
             (literal := self.expect(','))
@@ -10742,8 +10678,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _loop0_210(self) -> Optional[Any]:
-        # _loop0_210: ',' dotted_name
+    def _loop0_208(self) -> Optional[Any]:
+        # _loop0_208: ',' dotted_name
         mark = self._mark()
         children = []
         while (
@@ -10757,11 +10693,41 @@ class MacroPythonParser(Parser):
         return children;
 
     @memoize
-    def _gather_209(self) -> Optional[Any]:
-        # _gather_209: dotted_name _loop0_210
+    def _gather_207(self) -> Optional[Any]:
+        # _gather_207: dotted_name _loop0_208
         mark = self._mark()
         if (
             (elem := self.dotted_name())
+            is not None
+            and
+            (seq := self._loop0_208())
+            is not None
+        ):
+            return [elem] + seq;
+        self._reset(mark)
+        return None;
+
+    @memoize
+    def _loop0_210(self) -> Optional[Any]:
+        # _loop0_210: ',' (expression ['as' star_target])
+        mark = self._mark()
+        children = []
+        while (
+            (self.expect(','))
+            and
+            (elem := self._tmp_272())
+        ):
+            children.append(elem)
+            mark = self._mark()
+        self._reset(mark)
+        return children;
+
+    @memoize
+    def _gather_209(self) -> Optional[Any]:
+        # _gather_209: (expression ['as' star_target]) _loop0_210
+        mark = self._mark()
+        if (
+            (elem := self._tmp_272())
             is not None
             and
             (seq := self._loop0_210())
@@ -10773,13 +10739,13 @@ class MacroPythonParser(Parser):
 
     @memoize
     def _loop0_212(self) -> Optional[Any]:
-        # _loop0_212: ',' (expression ['as' star_target])
+        # _loop0_212: ',' (expressions ['as' star_target])
         mark = self._mark()
         children = []
         while (
             (self.expect(','))
             and
-            (elem := self._tmp_285())
+            (elem := self._tmp_273())
         ):
             children.append(elem)
             mark = self._mark()
@@ -10788,10 +10754,10 @@ class MacroPythonParser(Parser):
 
     @memoize
     def _gather_211(self) -> Optional[Any]:
-        # _gather_211: (expression ['as' star_target]) _loop0_212
+        # _gather_211: (expressions ['as' star_target]) _loop0_212
         mark = self._mark()
         if (
-            (elem := self._tmp_285())
+            (elem := self._tmp_273())
             is not None
             and
             (seq := self._loop0_212())
@@ -10803,13 +10769,13 @@ class MacroPythonParser(Parser):
 
     @memoize
     def _loop0_214(self) -> Optional[Any]:
-        # _loop0_214: ',' (expressions ['as' star_target])
+        # _loop0_214: ',' (expression ['as' star_target])
         mark = self._mark()
         children = []
         while (
             (self.expect(','))
             and
-            (elem := self._tmp_286())
+            (elem := self._tmp_274())
         ):
             children.append(elem)
             mark = self._mark()
@@ -10818,10 +10784,10 @@ class MacroPythonParser(Parser):
 
     @memoize
     def _gather_213(self) -> Optional[Any]:
-        # _gather_213: (expressions ['as' star_target]) _loop0_214
+        # _gather_213: (expression ['as' star_target]) _loop0_214
         mark = self._mark()
         if (
-            (elem := self._tmp_286())
+            (elem := self._tmp_274())
             is not None
             and
             (seq := self._loop0_214())
@@ -10833,13 +10799,13 @@ class MacroPythonParser(Parser):
 
     @memoize
     def _loop0_216(self) -> Optional[Any]:
-        # _loop0_216: ',' (expression ['as' star_target])
+        # _loop0_216: ',' (expressions ['as' star_target])
         mark = self._mark()
         children = []
         while (
             (self.expect(','))
             and
-            (elem := self._tmp_287())
+            (elem := self._tmp_275())
         ):
             children.append(elem)
             mark = self._mark()
@@ -10848,10 +10814,10 @@ class MacroPythonParser(Parser):
 
     @memoize
     def _gather_215(self) -> Optional[Any]:
-        # _gather_215: (expression ['as' star_target]) _loop0_216
+        # _gather_215: (expressions ['as' star_target]) _loop0_216
         mark = self._mark()
         if (
-            (elem := self._tmp_287())
+            (elem := self._tmp_275())
             is not None
             and
             (seq := self._loop0_216())
@@ -10862,38 +10828,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _loop0_218(self) -> Optional[Any]:
-        # _loop0_218: ',' (expressions ['as' star_target])
-        mark = self._mark()
-        children = []
-        while (
-            (self.expect(','))
-            and
-            (elem := self._tmp_288())
-        ):
-            children.append(elem)
-            mark = self._mark()
-        self._reset(mark)
-        return children;
-
-    @memoize
-    def _gather_217(self) -> Optional[Any]:
-        # _gather_217: (expressions ['as' star_target]) _loop0_218
-        mark = self._mark()
-        if (
-            (elem := self._tmp_288())
-            is not None
-            and
-            (seq := self._loop0_218())
-            is not None
-        ):
-            return [elem] + seq;
-        self._reset(mark)
-        return None;
-
-    @memoize
-    def _tmp_219(self) -> Optional[Any]:
-        # _tmp_219: 'except' | 'finally'
+    def _tmp_217(self) -> Optional[Any]:
+        # _tmp_217: 'except' | 'finally'
         mark = self._mark()
         if (
             (literal := self.expect('except'))
@@ -10908,8 +10844,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _loop0_220(self) -> Optional[Any]:
-        # _loop0_220: block
+    def _loop0_218(self) -> Optional[Any]:
+        # _loop0_218: block
         mark = self._mark()
         children = []
         while (
@@ -10921,8 +10857,8 @@ class MacroPythonParser(Parser):
         return children;
 
     @memoize
-    def _loop1_221(self) -> Optional[Any]:
-        # _loop1_221: except_block
+    def _loop1_219(self) -> Optional[Any]:
+        # _loop1_219: except_block
         mark = self._mark()
         children = []
         while (
@@ -10934,8 +10870,8 @@ class MacroPythonParser(Parser):
         return children;
 
     @memoize
-    def _tmp_222(self) -> Optional[Any]:
-        # _tmp_222: 'as' NAME
+    def _tmp_220(self) -> Optional[Any]:
+        # _tmp_220: 'as' NAME
         mark = self._mark()
         if (
             (literal := self.expect('as'))
@@ -10947,8 +10883,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _loop0_223(self) -> Optional[Any]:
-        # _loop0_223: block
+    def _loop0_221(self) -> Optional[Any]:
+        # _loop0_221: block
         mark = self._mark()
         children = []
         while (
@@ -10960,8 +10896,8 @@ class MacroPythonParser(Parser):
         return children;
 
     @memoize
-    def _loop1_224(self) -> Optional[Any]:
-        # _loop1_224: except_star_block
+    def _loop1_222(self) -> Optional[Any]:
+        # _loop1_222: except_star_block
         mark = self._mark()
         children = []
         while (
@@ -10973,21 +10909,21 @@ class MacroPythonParser(Parser):
         return children;
 
     @memoize
-    def _tmp_225(self) -> Optional[Any]:
-        # _tmp_225: expression ['as' NAME]
+    def _tmp_223(self) -> Optional[Any]:
+        # _tmp_223: expression ['as' NAME]
         mark = self._mark()
         if (
             (expression := self.expression())
             and
-            (opt := self._tmp_289(),)
+            (opt := self._tmp_276(),)
         ):
             return [expression, opt];
         self._reset(mark)
         return None;
 
     @memoize
-    def _tmp_226(self) -> Optional[Any]:
-        # _tmp_226: 'as' NAME
+    def _tmp_224(self) -> Optional[Any]:
+        # _tmp_224: 'as' NAME
         mark = self._mark()
         if (
             (literal := self.expect('as'))
@@ -10995,6 +10931,35 @@ class MacroPythonParser(Parser):
             (name := self.name())
         ):
             return [literal, name];
+        self._reset(mark)
+        return None;
+
+    @memoize
+    def _tmp_225(self) -> Optional[Any]:
+        # _tmp_225: 'as' NAME
+        mark = self._mark()
+        if (
+            (literal := self.expect('as'))
+            and
+            (name := self.name())
+        ):
+            return [literal, name];
+        self._reset(mark)
+        return None;
+
+    @memoize
+    def _tmp_226(self) -> Optional[Any]:
+        # _tmp_226: NEWLINE | ':'
+        mark = self._mark()
+        if (
+            (_newline := self.expect('NEWLINE'))
+        ):
+            return _newline;
+        self._reset(mark)
+        if (
+            (literal := self.expect(':'))
+        ):
+            return literal;
         self._reset(mark)
         return None;
 
@@ -11013,49 +10978,20 @@ class MacroPythonParser(Parser):
 
     @memoize
     def _tmp_228(self) -> Optional[Any]:
-        # _tmp_228: NEWLINE | ':'
+        # _tmp_228: 'as' NAME
         mark = self._mark()
         if (
-            (_newline := self.expect('NEWLINE'))
+            (literal := self.expect('as'))
+            and
+            (name := self.name())
         ):
-            return _newline;
-        self._reset(mark)
-        if (
-            (literal := self.expect(':'))
-        ):
-            return literal;
+            return [literal, name];
         self._reset(mark)
         return None;
 
     @memoize
     def _tmp_229(self) -> Optional[Any]:
-        # _tmp_229: 'as' NAME
-        mark = self._mark()
-        if (
-            (literal := self.expect('as'))
-            and
-            (name := self.name())
-        ):
-            return [literal, name];
-        self._reset(mark)
-        return None;
-
-    @memoize
-    def _tmp_230(self) -> Optional[Any]:
-        # _tmp_230: 'as' NAME
-        mark = self._mark()
-        if (
-            (literal := self.expect('as'))
-            and
-            (name := self.name())
-        ):
-            return [literal, name];
-        self._reset(mark)
-        return None;
-
-    @memoize
-    def _tmp_231(self) -> Optional[Any]:
-        # _tmp_231: positional_patterns ','
+        # _tmp_229: positional_patterns ','
         mark = self._mark()
         if (
             (positional_patterns := self.positional_patterns())
@@ -11067,8 +11003,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _tmp_232(self) -> Optional[Any]:
-        # _tmp_232: '->' expression
+    def _tmp_230(self) -> Optional[Any]:
+        # _tmp_230: '->' expression
         mark = self._mark()
         if (
             (literal := self.expect('->'))
@@ -11080,8 +11016,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _tmp_233(self) -> Optional[Any]:
-        # _tmp_233: '(' arguments? ')'
+    def _tmp_231(self) -> Optional[Any]:
+        # _tmp_231: '(' arguments? ')'
         mark = self._mark()
         if (
             (literal := self.expect('('))
@@ -11095,8 +11031,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _tmp_234(self) -> Optional[Any]:
-        # _tmp_234: '(' arguments? ')'
+    def _tmp_232(self) -> Optional[Any]:
+        # _tmp_232: '(' arguments? ')'
         mark = self._mark()
         if (
             (literal := self.expect('('))
@@ -11110,8 +11046,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _loop0_236(self) -> Optional[Any]:
-        # _loop0_236: ',' double_starred_kvpair
+    def _loop0_234(self) -> Optional[Any]:
+        # _loop0_234: ',' double_starred_kvpair
         mark = self._mark()
         children = []
         while (
@@ -11125,14 +11061,14 @@ class MacroPythonParser(Parser):
         return children;
 
     @memoize
-    def _gather_235(self) -> Optional[Any]:
-        # _gather_235: double_starred_kvpair _loop0_236
+    def _gather_233(self) -> Optional[Any]:
+        # _gather_233: double_starred_kvpair _loop0_234
         mark = self._mark()
         if (
             (elem := self.double_starred_kvpair())
             is not None
             and
-            (seq := self._loop0_236())
+            (seq := self._loop0_234())
             is not None
         ):
             return [elem] + seq;
@@ -11140,40 +11076,40 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
+    def _tmp_235(self) -> Optional[Any]:
+        # _tmp_235: '}' | ','
+        mark = self._mark()
+        if (
+            (literal := self.expect('}'))
+        ):
+            return literal;
+        self._reset(mark)
+        if (
+            (literal := self.expect(','))
+        ):
+            return literal;
+        self._reset(mark)
+        return None;
+
+    @memoize
+    def _tmp_236(self) -> Optional[Any]:
+        # _tmp_236: '}' | ','
+        mark = self._mark()
+        if (
+            (literal := self.expect('}'))
+        ):
+            return literal;
+        self._reset(mark)
+        if (
+            (literal := self.expect(','))
+        ):
+            return literal;
+        self._reset(mark)
+        return None;
+
+    @memoize
     def _tmp_237(self) -> Optional[Any]:
-        # _tmp_237: '}' | ','
-        mark = self._mark()
-        if (
-            (literal := self.expect('}'))
-        ):
-            return literal;
-        self._reset(mark)
-        if (
-            (literal := self.expect(','))
-        ):
-            return literal;
-        self._reset(mark)
-        return None;
-
-    @memoize
-    def _tmp_238(self) -> Optional[Any]:
-        # _tmp_238: '}' | ','
-        mark = self._mark()
-        if (
-            (literal := self.expect('}'))
-        ):
-            return literal;
-        self._reset(mark)
-        if (
-            (literal := self.expect(','))
-        ):
-            return literal;
-        self._reset(mark)
-        return None;
-
-    @memoize
-    def _tmp_239(self) -> Optional[Any]:
-        # _tmp_239: yield_expr | star_expressions
+        # _tmp_237: yield_expr | star_expressions
         mark = self._mark()
         if (
             (yield_expr := self.yield_expr())
@@ -11184,6 +11120,48 @@ class MacroPythonParser(Parser):
             (star_expressions := self.star_expressions())
         ):
             return star_expressions;
+        self._reset(mark)
+        return None;
+
+    @memoize
+    def _tmp_238(self) -> Optional[Any]:
+        # _tmp_238: yield_expr | star_expressions
+        mark = self._mark()
+        if (
+            (yield_expr := self.yield_expr())
+        ):
+            return yield_expr;
+        self._reset(mark)
+        if (
+            (star_expressions := self.star_expressions())
+        ):
+            return star_expressions;
+        self._reset(mark)
+        return None;
+
+    @memoize
+    def _tmp_239(self) -> Optional[Any]:
+        # _tmp_239: '=' | '!' | ':' | '}'
+        mark = self._mark()
+        if (
+            (literal := self.expect('='))
+        ):
+            return literal;
+        self._reset(mark)
+        if (
+            (literal := self.expect('!'))
+        ):
+            return literal;
+        self._reset(mark)
+        if (
+            (literal := self.expect(':'))
+        ):
+            return literal;
+        self._reset(mark)
+        if (
+            (literal := self.expect('}'))
+        ):
+            return literal;
         self._reset(mark)
         return None;
 
@@ -11205,13 +11183,8 @@ class MacroPythonParser(Parser):
 
     @memoize
     def _tmp_241(self) -> Optional[Any]:
-        # _tmp_241: '=' | '!' | ':' | '}'
+        # _tmp_241: '!' | ':' | '}'
         mark = self._mark()
-        if (
-            (literal := self.expect('='))
-        ):
-            return literal;
-        self._reset(mark)
         if (
             (literal := self.expect('!'))
         ):
@@ -11247,60 +11220,23 @@ class MacroPythonParser(Parser):
 
     @memoize
     def _tmp_243(self) -> Optional[Any]:
-        # _tmp_243: '!' | ':' | '}'
+        # _tmp_243: yield_expr | star_expressions
         mark = self._mark()
         if (
-            (literal := self.expect('!'))
+            (yield_expr := self.yield_expr())
         ):
-            return literal;
+            return yield_expr;
         self._reset(mark)
         if (
-            (literal := self.expect(':'))
+            (star_expressions := self.star_expressions())
         ):
-            return literal;
-        self._reset(mark)
-        if (
-            (literal := self.expect('}'))
-        ):
-            return literal;
+            return star_expressions;
         self._reset(mark)
         return None;
 
     @memoize
     def _tmp_244(self) -> Optional[Any]:
-        # _tmp_244: yield_expr | star_expressions
-        mark = self._mark()
-        if (
-            (yield_expr := self.yield_expr())
-        ):
-            return yield_expr;
-        self._reset(mark)
-        if (
-            (star_expressions := self.star_expressions())
-        ):
-            return star_expressions;
-        self._reset(mark)
-        return None;
-
-    @memoize
-    def _tmp_245(self) -> Optional[Any]:
-        # _tmp_245: yield_expr | star_expressions
-        mark = self._mark()
-        if (
-            (yield_expr := self.yield_expr())
-        ):
-            return yield_expr;
-        self._reset(mark)
-        if (
-            (star_expressions := self.star_expressions())
-        ):
-            return star_expressions;
-        self._reset(mark)
-        return None;
-
-    @memoize
-    def _tmp_246(self) -> Optional[Any]:
-        # _tmp_246: '!' NAME
+        # _tmp_244: '!' NAME
         mark = self._mark()
         if (
             (literal := self.expect('!'))
@@ -11312,8 +11248,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _tmp_247(self) -> Optional[Any]:
-        # _tmp_247: ':' | '}'
+    def _tmp_245(self) -> Optional[Any]:
+        # _tmp_245: ':' | '}'
         mark = self._mark()
         if (
             (literal := self.expect(':'))
@@ -11328,8 +11264,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _tmp_248(self) -> Optional[Any]:
-        # _tmp_248: yield_expr | star_expressions
+    def _tmp_246(self) -> Optional[Any]:
+        # _tmp_246: yield_expr | star_expressions
         mark = self._mark()
         if (
             (yield_expr := self.yield_expr())
@@ -11344,8 +11280,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _tmp_249(self) -> Optional[Any]:
-        # _tmp_249: '!' NAME
+    def _tmp_247(self) -> Optional[Any]:
+        # _tmp_247: '!' NAME
         mark = self._mark()
         if (
             (literal := self.expect('!'))
@@ -11357,8 +11293,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _loop0_250(self) -> Optional[Any]:
-        # _loop0_250: fstring_format_spec
+    def _loop0_248(self) -> Optional[Any]:
+        # _loop0_248: fstring_format_spec
         mark = self._mark()
         children = []
         while (
@@ -11370,8 +11306,8 @@ class MacroPythonParser(Parser):
         return children;
 
     @memoize
-    def _tmp_251(self) -> Optional[Any]:
-        # _tmp_251: yield_expr | star_expressions
+    def _tmp_249(self) -> Optional[Any]:
+        # _tmp_249: yield_expr | star_expressions
         mark = self._mark()
         if (
             (yield_expr := self.yield_expr())
@@ -11386,8 +11322,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _tmp_252(self) -> Optional[Any]:
-        # _tmp_252: '!' NAME
+    def _tmp_250(self) -> Optional[Any]:
+        # _tmp_250: '!' NAME
         mark = self._mark()
         if (
             (literal := self.expect('!'))
@@ -11399,8 +11335,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _tmp_253(self) -> Optional[Any]:
-        # _tmp_253: ':' | '}'
+    def _tmp_251(self) -> Optional[Any]:
+        # _tmp_251: ':' | '}'
         mark = self._mark()
         if (
             (literal := self.expect(':'))
@@ -11415,158 +11351,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _loop1_254(self) -> Optional[Any]:
-        # _loop1_254: (!NEWLINE !INDENT !DEDENT ANY)
-        mark = self._mark()
-        children = []
-        while (
-            (_tmp_290 := self._tmp_290())
-        ):
-            children.append(_tmp_290)
-            mark = self._mark()
-        self._reset(mark)
-        return children;
-
-    @memoize
-    def _loop1_255(self) -> Optional[Any]:
-        # _loop1_255: (!braces !NEWLINE ANY)
-        mark = self._mark()
-        children = []
-        while (
-            (_tmp_291 := self._tmp_291())
-        ):
-            children.append(_tmp_291)
-            mark = self._mark()
-        self._reset(mark)
-        return children;
-
-    @memoize
-    def _loop1_256(self) -> Optional[Any]:
-        # _loop1_256: unparsed_block
-        mark = self._mark()
-        children = []
-        while (
-            (unparsed_block := self.unparsed_block())
-        ):
-            children.append(unparsed_block)
-            mark = self._mark()
-        self._reset(mark)
-        return children;
-
-    @memoize
-    def _loop1_257(self) -> Optional[Any]:
-        # _loop1_257: unparsed_block
-        mark = self._mark()
-        children = []
-        while (
-            (unparsed_block := self.unparsed_block())
-        ):
-            children.append(unparsed_block)
-            mark = self._mark()
-        self._reset(mark)
-        return children;
-
-    @memoize
-    def _loop1_258(self) -> Optional[Any]:
-        # _loop1_258: (!braces !':' !NEWLINE ANY)
-        mark = self._mark()
-        children = []
-        while (
-            (_tmp_292 := self._tmp_292())
-        ):
-            children.append(_tmp_292)
-            mark = self._mark()
-        self._reset(mark)
-        return children;
-
-    @memoize
-    def _tmp_259(self) -> Optional[Any]:
-        # _tmp_259: NAME | !forbidden_macro_keywords KEYWORD
-        mark = self._mark()
-        if (
-            (name := self.name())
-        ):
-            return name;
-        self._reset(mark)
-        if (
-            (self.negative_lookahead(self.forbidden_macro_keywords, ))
-            and
-            (KEYWORD := self.KEYWORD())
-        ):
-            return KEYWORD;
-        self._reset(mark)
-        return None;
-
-    @memoize
-    def _tmp_260(self) -> Optional[Any]:
-        # _tmp_260: '(' arguments? ')'
-        mark = self._mark()
-        if (
-            (self.expect('('))
-            and
-            (z := self.arguments(),)
-            and
-            (self.expect(')'))
-        ):
-            return z;
-        self._reset(mark)
-        return None;
-
-    @memoize
-    def _tmp_261(self) -> Optional[Any]:
-        # _tmp_261: '->' expression
-        mark = self._mark()
-        if (
-            (self.expect('->'))
-            and
-            (z := self.expression())
-        ):
-            return z;
-        self._reset(mark)
-        return None;
-
-    @memoize
-    def _tmp_262(self) -> Optional[Any]:
-        # _tmp_262: '->' expression
-        mark = self._mark()
-        if (
-            (self.expect('->'))
-            and
-            (z := self.expression())
-        ):
-            return z;
-        self._reset(mark)
-        return None;
-
-    @memoize
-    def _loop0_263(self) -> Optional[Any]:
-        # _loop0_263: any_except_backtick
-        mark = self._mark()
-        children = []
-        while (
-            (any_except_backtick := self.any_except_backtick())
-        ):
-            children.append(any_except_backtick)
-            mark = self._mark()
-        self._reset(mark)
-        return children;
-
-    @memoize
-    def _loop0_264(self) -> Optional[Any]:
-        # _loop0_264: any_except_backtick
-        mark = self._mark()
-        children = []
-        while (
-            (any_except_backtick := self.any_except_backtick())
-        ):
-            children.append(any_except_backtick)
-            mark = self._mark()
-        self._reset(mark)
-        return children;
-
-    @memoize
-    def _tmp_265(self) -> Optional[Any]:
-        # _tmp_265: star_targets '='
+    def _tmp_252(self) -> Optional[Any]:
+        # _tmp_252: star_targets '='
         mark = self._mark()
         if (
             (z := self.star_targets())
@@ -11578,8 +11364,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _tmp_266(self) -> Optional[Any]:
-        # _tmp_266: '.' | '...'
+    def _tmp_253(self) -> Optional[Any]:
+        # _tmp_253: '.' | '...'
         mark = self._mark()
         if (
             (literal := self.expect('.'))
@@ -11594,8 +11380,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _tmp_267(self) -> Optional[Any]:
-        # _tmp_267: '.' | '...'
+    def _tmp_254(self) -> Optional[Any]:
+        # _tmp_254: '.' | '...'
         mark = self._mark()
         if (
             (literal := self.expect('.'))
@@ -11610,8 +11396,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _tmp_268(self) -> Optional[Any]:
-        # _tmp_268: ',' expression
+    def _tmp_255(self) -> Optional[Any]:
+        # _tmp_255: ',' expression
         mark = self._mark()
         if (
             (self.expect(','))
@@ -11623,8 +11409,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _tmp_269(self) -> Optional[Any]:
-        # _tmp_269: ',' star_expression
+    def _tmp_256(self) -> Optional[Any]:
+        # _tmp_256: ',' star_expression
         mark = self._mark()
         if (
             (self.expect(','))
@@ -11636,8 +11422,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _tmp_270(self) -> Optional[Any]:
-        # _tmp_270: 'or' conjunction
+    def _tmp_257(self) -> Optional[Any]:
+        # _tmp_257: 'or' conjunction
         mark = self._mark()
         if (
             (self.expect('or'))
@@ -11649,8 +11435,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _tmp_271(self) -> Optional[Any]:
-        # _tmp_271: 'and' inversion
+    def _tmp_258(self) -> Optional[Any]:
+        # _tmp_258: 'and' inversion
         mark = self._mark()
         if (
             (self.expect('and'))
@@ -11662,8 +11448,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _tmp_272(self) -> Optional[Any]:
-        # _tmp_272: slice | starred_expression
+    def _tmp_259(self) -> Optional[Any]:
+        # _tmp_259: slice | starred_expression
         mark = self._mark()
         if (
             (slice := self.slice())
@@ -11678,8 +11464,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _tmp_273(self) -> Optional[Any]:
-        # _tmp_273: fstring | STRING
+    def _tmp_260(self) -> Optional[Any]:
+        # _tmp_260: fstring | STRING
         mark = self._mark()
         if (
             (fstring := self.fstring())
@@ -11694,8 +11480,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _tmp_274(self) -> Optional[Any]:
-        # _tmp_274: 'if' disjunction
+    def _tmp_261(self) -> Optional[Any]:
+        # _tmp_261: 'if' disjunction
         mark = self._mark()
         if (
             (self.expect('if'))
@@ -11707,8 +11493,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _tmp_275(self) -> Optional[Any]:
-        # _tmp_275: 'if' disjunction
+    def _tmp_262(self) -> Optional[Any]:
+        # _tmp_262: 'if' disjunction
         mark = self._mark()
         if (
             (self.expect('if'))
@@ -11720,8 +11506,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _tmp_276(self) -> Optional[Any]:
-        # _tmp_276: starred_expression | (assignment_expression | expression !':=') !'='
+    def _tmp_263(self) -> Optional[Any]:
+        # _tmp_263: starred_expression | (assignment_expression | expression !':=') !'='
         mark = self._mark()
         if (
             (starred_expression := self.starred_expression())
@@ -11729,17 +11515,17 @@ class MacroPythonParser(Parser):
             return starred_expression;
         self._reset(mark)
         if (
-            (_tmp_293 := self._tmp_293())
+            (_tmp_277 := self._tmp_277())
             and
             (self.negative_lookahead(self.expect, '='))
         ):
-            return _tmp_293;
+            return _tmp_277;
         self._reset(mark)
         return None;
 
     @memoize
-    def _tmp_277(self) -> Optional[Any]:
-        # _tmp_277: ',' star_target
+    def _tmp_264(self) -> Optional[Any]:
+        # _tmp_264: ',' star_target
         mark = self._mark()
         if (
             (self.expect(','))
@@ -11751,8 +11537,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _tmp_278(self) -> Optional[Any]:
-        # _tmp_278: ',' star_target
+    def _tmp_265(self) -> Optional[Any]:
+        # _tmp_265: ',' star_target
         mark = self._mark()
         if (
             (self.expect(','))
@@ -11764,23 +11550,23 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _tmp_279(self) -> Optional[Any]:
-        # _tmp_279: ','.(starred_expression | (assignment_expression | expression !':=') !'=')+ ',' kwargs
+    def _tmp_266(self) -> Optional[Any]:
+        # _tmp_266: ','.(starred_expression | (assignment_expression | expression !':=') !'=')+ ',' kwargs
         mark = self._mark()
         if (
-            (_gather_294 := self._gather_294())
+            (_gather_278 := self._gather_278())
             and
             (literal := self.expect(','))
             and
             (kwargs := self.kwargs())
         ):
-            return [_gather_294, literal, kwargs];
+            return [_gather_278, literal, kwargs];
         self._reset(mark)
         return None;
 
     @memoize
-    def _tmp_280(self) -> Optional[Any]:
-        # _tmp_280: starred_expression !'='
+    def _tmp_267(self) -> Optional[Any]:
+        # _tmp_267: starred_expression !'='
         mark = self._mark()
         if (
             (starred_expression := self.starred_expression())
@@ -11792,8 +11578,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _tmp_281(self) -> Optional[Any]:
-        # _tmp_281: star_targets '='
+    def _tmp_268(self) -> Optional[Any]:
+        # _tmp_268: star_targets '='
         mark = self._mark()
         if (
             (star_targets := self.star_targets())
@@ -11805,8 +11591,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _tmp_282(self) -> Optional[Any]:
-        # _tmp_282: star_targets '='
+    def _tmp_269(self) -> Optional[Any]:
+        # _tmp_269: star_targets '='
         mark = self._mark()
         if (
             (star_targets := self.star_targets())
@@ -11818,8 +11604,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _tmp_283(self) -> Optional[Any]:
-        # _tmp_283: ')' | '**'
+    def _tmp_270(self) -> Optional[Any]:
+        # _tmp_270: ')' | '**'
         mark = self._mark()
         if (
             (literal := self.expect(')'))
@@ -11834,8 +11620,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _tmp_284(self) -> Optional[Any]:
-        # _tmp_284: ':' | '**'
+    def _tmp_271(self) -> Optional[Any]:
+        # _tmp_271: ':' | '**'
         mark = self._mark()
         if (
             (literal := self.expect(':'))
@@ -11850,60 +11636,60 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _tmp_285(self) -> Optional[Any]:
-        # _tmp_285: expression ['as' star_target]
+    def _tmp_272(self) -> Optional[Any]:
+        # _tmp_272: expression ['as' star_target]
         mark = self._mark()
         if (
             (expression := self.expression())
             and
-            (opt := self._tmp_296(),)
+            (opt := self._tmp_280(),)
         ):
             return [expression, opt];
         self._reset(mark)
         return None;
 
     @memoize
-    def _tmp_286(self) -> Optional[Any]:
-        # _tmp_286: expressions ['as' star_target]
+    def _tmp_273(self) -> Optional[Any]:
+        # _tmp_273: expressions ['as' star_target]
         mark = self._mark()
         if (
             (expressions := self.expressions())
             and
-            (opt := self._tmp_297(),)
+            (opt := self._tmp_281(),)
         ):
             return [expressions, opt];
         self._reset(mark)
         return None;
 
     @memoize
-    def _tmp_287(self) -> Optional[Any]:
-        # _tmp_287: expression ['as' star_target]
+    def _tmp_274(self) -> Optional[Any]:
+        # _tmp_274: expression ['as' star_target]
         mark = self._mark()
         if (
             (expression := self.expression())
             and
-            (opt := self._tmp_298(),)
+            (opt := self._tmp_282(),)
         ):
             return [expression, opt];
         self._reset(mark)
         return None;
 
     @memoize
-    def _tmp_288(self) -> Optional[Any]:
-        # _tmp_288: expressions ['as' star_target]
+    def _tmp_275(self) -> Optional[Any]:
+        # _tmp_275: expressions ['as' star_target]
         mark = self._mark()
         if (
             (expressions := self.expressions())
             and
-            (opt := self._tmp_299(),)
+            (opt := self._tmp_283(),)
         ):
             return [expressions, opt];
         self._reset(mark)
         return None;
 
     @memoize
-    def _tmp_289(self) -> Optional[Any]:
-        # _tmp_289: 'as' NAME
+    def _tmp_276(self) -> Optional[Any]:
+        # _tmp_276: 'as' NAME
         mark = self._mark()
         if (
             (literal := self.expect('as'))
@@ -11915,57 +11701,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _tmp_290(self) -> Optional[Any]:
-        # _tmp_290: !NEWLINE !INDENT !DEDENT ANY
-        mark = self._mark()
-        if (
-            (self.negative_lookahead(self.expect, 'NEWLINE'))
-            and
-            (self.negative_lookahead(self.expect, 'INDENT'))
-            and
-            (self.negative_lookahead(self.expect, 'DEDENT'))
-            and
-            (ANY := self.ANY())
-        ):
-            return ANY;
-        self._reset(mark)
-        return None;
-
-    @memoize
-    def _tmp_291(self) -> Optional[Any]:
-        # _tmp_291: !braces !NEWLINE ANY
-        mark = self._mark()
-        if (
-            (self.negative_lookahead(self.braces, ))
-            and
-            (self.negative_lookahead(self.expect, 'NEWLINE'))
-            and
-            (ANY := self.ANY())
-        ):
-            return ANY;
-        self._reset(mark)
-        return None;
-
-    @memoize
-    def _tmp_292(self) -> Optional[Any]:
-        # _tmp_292: !braces !':' !NEWLINE ANY
-        mark = self._mark()
-        if (
-            (self.negative_lookahead(self.braces, ))
-            and
-            (self.negative_lookahead(self.expect, ':'))
-            and
-            (self.negative_lookahead(self.expect, 'NEWLINE'))
-            and
-            (ANY := self.ANY())
-        ):
-            return ANY;
-        self._reset(mark)
-        return None;
-
-    @memoize
-    def _tmp_293(self) -> Optional[Any]:
-        # _tmp_293: assignment_expression | expression !':='
+    def _tmp_277(self) -> Optional[Any]:
+        # _tmp_277: assignment_expression | expression !':='
         mark = self._mark()
         if (
             (assignment_expression := self.assignment_expression())
@@ -11982,14 +11719,14 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _loop0_295(self) -> Optional[Any]:
-        # _loop0_295: ',' (starred_expression | (assignment_expression | expression !':=') !'=')
+    def _loop0_279(self) -> Optional[Any]:
+        # _loop0_279: ',' (starred_expression | (assignment_expression | expression !':=') !'=')
         mark = self._mark()
         children = []
         while (
             (self.expect(','))
             and
-            (elem := self._tmp_300())
+            (elem := self._tmp_284())
         ):
             children.append(elem)
             mark = self._mark()
@@ -11997,14 +11734,14 @@ class MacroPythonParser(Parser):
         return children;
 
     @memoize
-    def _gather_294(self) -> Optional[Any]:
-        # _gather_294: (starred_expression | (assignment_expression | expression !':=') !'=') _loop0_295
+    def _gather_278(self) -> Optional[Any]:
+        # _gather_278: (starred_expression | (assignment_expression | expression !':=') !'=') _loop0_279
         mark = self._mark()
         if (
-            (elem := self._tmp_300())
+            (elem := self._tmp_284())
             is not None
             and
-            (seq := self._loop0_295())
+            (seq := self._loop0_279())
             is not None
         ):
             return [elem] + seq;
@@ -12012,8 +11749,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _tmp_296(self) -> Optional[Any]:
-        # _tmp_296: 'as' star_target
+    def _tmp_280(self) -> Optional[Any]:
+        # _tmp_280: 'as' star_target
         mark = self._mark()
         if (
             (literal := self.expect('as'))
@@ -12025,8 +11762,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _tmp_297(self) -> Optional[Any]:
-        # _tmp_297: 'as' star_target
+    def _tmp_281(self) -> Optional[Any]:
+        # _tmp_281: 'as' star_target
         mark = self._mark()
         if (
             (literal := self.expect('as'))
@@ -12038,8 +11775,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _tmp_298(self) -> Optional[Any]:
-        # _tmp_298: 'as' star_target
+    def _tmp_282(self) -> Optional[Any]:
+        # _tmp_282: 'as' star_target
         mark = self._mark()
         if (
             (literal := self.expect('as'))
@@ -12051,8 +11788,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _tmp_299(self) -> Optional[Any]:
-        # _tmp_299: 'as' star_target
+    def _tmp_283(self) -> Optional[Any]:
+        # _tmp_283: 'as' star_target
         mark = self._mark()
         if (
             (literal := self.expect('as'))
@@ -12064,8 +11801,8 @@ class MacroPythonParser(Parser):
         return None;
 
     @memoize
-    def _tmp_300(self) -> Optional[Any]:
-        # _tmp_300: starred_expression | (assignment_expression | expression !':=') !'='
+    def _tmp_284(self) -> Optional[Any]:
+        # _tmp_284: starred_expression | (assignment_expression | expression !':=') !'='
         mark = self._mark()
         if (
             (starred_expression := self.starred_expression())
@@ -12073,17 +11810,17 @@ class MacroPythonParser(Parser):
             return starred_expression;
         self._reset(mark)
         if (
-            (_tmp_301 := self._tmp_301())
+            (_tmp_285 := self._tmp_285())
             and
             (self.negative_lookahead(self.expect, '='))
         ):
-            return _tmp_301;
+            return _tmp_285;
         self._reset(mark)
         return None;
 
     @memoize
-    def _tmp_301(self) -> Optional[Any]:
-        # _tmp_301: assignment_expression | expression !':='
+    def _tmp_285(self) -> Optional[Any]:
+        # _tmp_285: assignment_expression | expression !':='
         mark = self._mark()
         if (
             (assignment_expression := self.assignment_expression())
@@ -12099,10 +11836,10 @@ class MacroPythonParser(Parser):
         self._reset(mark)
         return None;
 
-    KEYWORDS = ('False', 'None', 'True', 'and', 'as', 'assert', 'async', 'await', 'break', 'class', 'continue', 'def', 'del', 'elif', 'else', 'except', 'finally', 'for', 'from', 'global', 'if', 'import', 'in', 'is', 'lambda', 'macro', 'nonlocal', 'not', 'or', 'pass', 'raise', 'return', 'try', 'while', 'with', 'yield')
+    KEYWORDS = ('False', 'None', 'True', 'and', 'as', 'assert', 'async', 'await', 'break', 'class', 'continue', 'def', 'del', 'elif', 'else', 'except', 'finally', 'for', 'from', 'global', 'if', 'import', 'in', 'is', 'lambda', 'nonlocal', 'not', 'or', 'pass', 'raise', 'return', 'try', 'while', 'with', 'yield')
     SOFT_KEYWORDS = ('_', 'case', 'match', 'type')
 
 
 if __name__ == '__main__':
     from pegen.parser import simple_parser_main
-    simple_parser_main(MacroPythonParser)
+    simple_parser_main(PythonParser)

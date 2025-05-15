@@ -1,19 +1,30 @@
+# coding: magic.macro
 
 @macro
-def inject(code):
-    return code
+def macro_rules(unparsed_name):
+    # parse name, ensure it is a valid Python identifier
+    name = unparsed_name.to("name").string
+    def parse_rules(rules):
+        from magic_codec.macros.declarative import make_parser
+        parser = make_parser(name, rules.tokens)
+        __make_macro(_CodeArtifact(parser))
+        __make_macro(_CodeArtifact(f"""
+def {name}(code):
+    from magic_codec.macros.declarative import to_tokenizer
+    try:
+        return _CodeArtifact(_{name}_Parser(to_tokenizer(code)).{name}())
+    except StopIteration:
+        raise RuntimeError(f"Invalid declarative macro use: {name}!({{code.string}})")
+"""))
+    return parse_rules
 
-@macro
-def macro_rules(body, name = None):
-    print(body)
-    print("foo")
 
-macro_rules! pretty_print:
+macro_rules! print:
+    | a=STRING { print($a); }
     | a=NUMBER { print(f"0x{$a:x}") }
-    | a=STRING { print($a) }
-    | a=NAME { print(f"{$a=}") }
-    | a=atom { print($a) }
+    | a=atom { print(f"{$a=}") }
 
-x = 3
-pretty_print!(x) # prints "x=3"
-pretty_print!(24) # prints "0x18"
+FOO = 3
+print!(FOO)
+print!("x")
+print!(3)

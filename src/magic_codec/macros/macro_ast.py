@@ -4,24 +4,13 @@ from io import StringIO
 from keyword import iskeyword, issoftkeyword
 import re
 import sys
-from tokenize import TokenInfo, generate_tokens, tokenize, untokenize
+from tokenize import TokenInfo, generate_tokens, untokenize
 from types import NoneType
-from typing import Iterable, Self, TypeVar, Union
+from typing import Iterable, Self
 
 from pegen.tokenizer import Tokenizer
 
 class MacroCall(ast.Call): ...
-
-class MacroStmt(ast.stmt):
-    if sys.version_info >= (3, 10):
-        __match_args__ = ("expr", "body")
-    _fields = ("expr", "body")
-    expr: Union[ast.Name, ast.Call]
-    body: list
-
-    def __init__(self, expr: Union[ast.Name, ast.Call], body: list):
-        self.expr = expr
-        self.body = body
 
 class MacroName(ast.Name):
     @property
@@ -100,6 +89,8 @@ class Code:
     def __init__(self, state: Self | str | Iterable[TokenInfo | tuple[int, str]] | ast.AST | None):
         if isinstance(state, Code):
             self.__current_state = state.__current_state
+        elif isinstance(state, (TokenInfo, tuple)):
+            self.__current_state = [state]
         elif isinstance(state, NoneType):
             self.__current_state = []
         elif isinstance(state, str):
@@ -117,6 +108,7 @@ class Code:
         if isinstance(self.__current_state, str):
             return self.__current_state
         elif isinstance(self.__current_state, ast.AST):
+            self.__current_state = ast.fix_missing_locations(self.__current_state)
             return unparse(self.__current_state)
         elif isinstance(self.__current_state, Iterable):
             return untokenize(self.__current_state)
@@ -127,16 +119,23 @@ class Code:
         if isinstance(self.__current_state, ast.AST):
             return self.__current_state
 
-        with StringIO(self.string) as file:
-            return parse(file)
+        return parse_string(self.string)
 
     @property
     def tokens(self):
         if isinstance(self.__current_state, Iterable) and not isinstance(self.__current_state, str):
-            return self.__current_state
-        # return tokenize(self.string, False)
-        return tokenize(self.string)
+            return list(self.__current_state)
+        code = self.string
+        no_newlines = '\n' not in code
+        token_list = list(generate_tokens(StringIO(self.string).readline))
+        if no_newlines:
+            # drop final newline and eof marker
+            token_list = token_list[:-2]
+        return token_list
     
+    def to(self, grammar_rule: str):
+        return to_ast(self, grammar_rule)
+
     def __repr__(self):
         return f"Code({str(self.tokens)})"
 
@@ -161,16 +160,26 @@ class Unparser(ast._Unparser):
         else:
             assert isinstance(node.args, UnparsedFragment)
             token_list = ', '.join(f"({token.type}, {token.string!r})" for token in node.args)
-        assert isinstance(node.func, str)
-        self.write(f"{mangle(node.func)}(Code([{token_list}]))")
+        
+        if isinstance(node.func, str):
+            self.write(f"{mangle(node.func)}")
+        else:
+            self.visit(node.func)
+        self.write(f"(_CodeArtifact([{token_list}]))")
     
     def visit_UnparsedFragment(self, node: UnparsedFragment):
         token_list = ', '.join(f"({token.type}, {token.string!r})" for token in node.data)
-        self.write(f"[{token_list}]")
+        self.write(f"_CodeArtifact([{token_list}])")
 
     def visit_TokenLiteral(self, node: TokenLiteral):
         self.visit_UnparsedFragment(node)
 
+
+def parse_string(source: str, mode: str = 'file'):
+    from magic_codec.macros.macro_parser import MacroPythonParser
+    tokenizer = Tokenizer(generate_tokens(StringIO(source).readline))
+    parser = MacroPythonParser(tokenizer)
+    return parser.file() if mode == 'file' else parser.eval()
 
 def parse(source, mode: str = 'file'):
     from magic_codec.macros.macro_parser import MacroPythonParser

@@ -22,7 +22,7 @@ KEYWORD: ~ {
     # | 'in' | 'is' | 'lambda' | 'nonlocal' | 'not' | 'or' | 'pass' | 'raise' | 'return' | 'try' | 'while' 
     # | 'with' | 'yield' | 'macro'
 
-ANY: ~ { self._tokenizer.getnext() }
+ANY: !ENDMARKER { self._tokenizer.getnext() }
 # this hack is equivalent to:
 # ANY:
     # | OP | NAME | STRING | NUMBER 
@@ -31,6 +31,8 @@ ANY: ~ { self._tokenizer.getnext() }
     # | TYPE_COMMENT 
     # | FSTRING_START | FSTRING_MIDDLE | FSTRING_END 
 
+
+braces: '(' | ')' | '[' | ']' | '{' | '}'
 
 # GENERAL STATEMENTS
 # ==================
@@ -48,29 +50,52 @@ compound_stmt:
 
 # Unparsed elements
 # -----------------
-unparsed_atoms[list]:
-    | a=unparsed_atom b=unparsed_atoms { UnparsedFragment([*a, *b]) }
-    | a=unparsed_atom { UnparsedFragment([*a])}
 
-unparsed_atom:
-    | a='{' ~atoms=[unparsed_atoms] b='}' { UnparsedFragment([a, *(atoms or []), b])}
-    | a='[' ~atoms=[unparsed_atoms] b=']' { UnparsedFragment([a, *(atoms or []), b])}
-    | a='(' ~atoms=[unparsed_atoms] b=')' { UnparsedFragment([a, *(atoms or []), b])}
-    | a=(NAME | STRING | NUMBER | SOFT_KEYWORD | KEYWORD | NEWLINE | TYPE_COMMENT) { UnparsedFragment([a]) }
-    | a=FSTRING_START b=unparsed_fstring_middle* c=FSTRING_END { UnparsedFragment([a, *b, c]) }
-    | !'}' !']' !')' a=OP { UnparsedFragment([a]) }
+unparsed_atoms:
+    | a=(!NEWLINE !INDENT !DEDENT ANY)+ { a }
 
-unparsed_fstring_middle:
-    | a=FSTRING_MIDDLE { UnparsedFragment([a]) }
-    | a=('{' | '}') { UnparsedFragment([a]) }
-    | unparsed_atom
+unparsed_balanced:
+    | '(' unparsed_balanced? ')' unparsed_balanced?
+    | '[' unparsed_balanced? ']' unparsed_balanced?
+    | '{' unparsed_balanced? '}' unparsed_balanced?
+    | (!braces !NEWLINE ANY)+ unparsed_balanced? 
 
-unparsed_line: a=(!NEWLINE unparsed_atom)* b=NEWLINE { UnparsedFragment([*a, *b]) }
+unparsed_line:
+    | unparsed_atoms NEWLINE
 
-unparsed_block[list] (memo):
-    | a=NEWLINE b=INDENT ~c=unparsed_atoms d=DEDENT { UnparsedFragment([a, b, *c, d]) }
-    | NEWLINE !INDENT { self.raise_indentation_error("expected an indented block") }
-    | a=unparsed_atoms NEWLINE { a }
+unparsed_block:
+    | INDENT unparsed_block+ DEDENT
+    | unparsed_line
+
+# Fragments
+# ---------
+
+args_fragment:
+    | a=unparsed_balanced { self.make_fragment(a) }
+
+suite_fragment:
+    | NEWLINE INDENT a=unparsed_block+ DEDENT { self.make_fragment(a) }
+    | a=unparsed_line { self.make_fragment(a) }
+
+
+# Macro statement
+# ---------------
+raw_macro_stmt_args:
+    | a='(' b=unparsed_balanced? c=')' raw_macro_stmt_args? 
+    | a='[' b=unparsed_balanced? c=']' raw_macro_stmt_args?
+    | a='{' b=unparsed_balanced? c='}' raw_macro_stmt_args?
+    | a=(!braces !':' !NEWLINE ANY)+ raw_macro_stmt_args?
+
+macro_stmt_args:
+    | a=raw_macro_stmt_args { self.make_fragment(a) }
+
+
+macro_stmt[MacroCall]:
+    # | a=macro_name [macro_stmt_args] ':' unparsed_line INDENT { self.raise_indentation_error("unexpected indented block") }
+    | a=macro_name ':' b=suite_fragment { MacroCall(a, args=b, LOCATIONS) }
+    | a=macro_name h=macro_stmt_args ':' b=suite_fragment {
+        MacroCall(MacroCall(a, args=h, LOCATIONS), b, LOCATIONS)
+     }
 
  # Common elements
  # ---------------
@@ -91,7 +116,7 @@ decorator:
         self.check_version((3, 9), "Generic decorator are",  a)
      }
 dec_macro:
-    | a=macro_name '(' args=[unparsed_atoms] ')' {
+    | a=macro_name '(' args=[args_fragment] ')' {
         MacroCall(func=a.id, args=args or [], keywords=[], LOCATIONS)
      }
     | macro_name
@@ -140,7 +165,7 @@ class_def_raw[Union[ClassDef]]:
 
 unparsed_class_def[Union[ClassDef]]:
     | invalid_class_def_raw
-    | 'class' a=maybe_macro t=[type_params] b=['(' z=[arguments] ')' { z }] &&':' c=unparsed_block {
+    | 'class' a=maybe_macro t=[type_params] b=['(' z=[arguments] ')' { z }] &&':' c=suite_fragment {
         (
             ClassDef(
                 a.string,
@@ -235,7 +260,7 @@ function_def_raw[Union[FunctionDef, AsyncFunctionDef]]:
 
 unparsed_function_def[Union[FunctionDef, AsyncFunctionDef]]:
     | invalid_def_raw
-    | 'def' n=maybe_macro t=[type_params] &&'(' params=[params] ')' a=['->' z=expression { z }] &&':' tc=[func_type_comment] b=unparsed_block {
+    | 'def' n=maybe_macro t=[type_params] &&'(' params=[params] ')' a=['->' z=expression { z }] &&':' tc=[func_type_comment] b=suite_fragment {
         (
             FunctionDef(
                 name=n.string,
@@ -259,7 +284,7 @@ unparsed_function_def[Union[FunctionDef, AsyncFunctionDef]]:
             )
         )
      }
-    | 'async' 'def' n=maybe_macro t=[type_params] &&'(' params=[params] ')' a=['->' z=expression { z }] &&':' tc=[func_type_comment] b=unparsed_block {
+    | 'async' 'def' n=maybe_macro t=[type_params] &&'(' params=[params] ')' a=['->' z=expression { z }] &&':' tc=[func_type_comment] b=suite_fragment {
        (
             self.check_version(
                 (3, 5),
@@ -293,19 +318,6 @@ unparsed_function_def[Union[FunctionDef, AsyncFunctionDef]]:
        )
      }
 
-# Macro statement
-# ---------------
-
-macro_stmt_expr:
-    | a=unparsed_atom b=macro_stmt_expr { UnparsedFragment([*a, *b]) }
-    | !NEWLINE !':' unparsed_atom
-
-macro_stmt[MacroStmt]:
-    | a=macro_name ':' b=unparsed_block { MacroStmt(expr=a, body=b) }
-    # | a=macro_name h=macro_stmt_expr ':' b=block {
-    #     MacroStmt(expr=MacroCall(ast.Expr(a.id), args=h, kwargs=[], LOCATIONS),
-    #               body=b)
-    #  }
 
 # If statement
 # ------------
@@ -390,7 +402,7 @@ primary:
 
 atom:
     # macro calls are atoms rather than primary to allow foo!()() etc
-    | a=macro_name '(' args=[unparsed_atoms] ')' {
+    | a=macro_name '(' args=[args_fragment] ')' {
         MacroCall(
             func=a.id,
             args=args or [],
