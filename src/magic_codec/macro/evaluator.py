@@ -1,3 +1,4 @@
+import logging
 import ast
 from io import StringIO
 from pathlib import Path
@@ -13,6 +14,8 @@ from pegen.tokenizer import Tokenizer
 
 from magic_codec.macro.sema import Sema
 
+
+logger = logging.getLogger(__name__)
 
 def macro(fnc=None, /, eval_args=False, **kwargs):
     """ This decorator does nothing. It is only used to flag functions and classes as macros. """

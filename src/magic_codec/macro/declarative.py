@@ -12,7 +12,6 @@ from magic_codec.grammar import parse_grammar, parse_grammar_file
 from magic_codec.grammar.parser_generator import ParserGenerator, PatchParserGenerator
 from magic_codec.grammar.macro_parser import PythonParser
 
-
 class Token(namedtuple("Token", ["type", "string"])):
     start: tuple[int, int]
     end: tuple[int, int]
@@ -55,9 +54,7 @@ class ActionTokenizer(GrammarVisitor):
         if not node.action:
             return
 
-        tokens = list(quote_tokens(Code(node.action)))
-        # print(untokenize(tokens))
-        node.action = untokenize(tokens)
+        node.action = untokenize(quote_tokens(Code(node.action)))
 
 
 def make_parser(name: str, rules: list):
@@ -72,10 +69,7 @@ def make_parser(name: str, rules: list):
         Token(1, name), Token(55, ':'), Token(4, '\n'),
         *rules,
         Token(0, '')]
-    start = time.time()
     grammar = parse_grammar(iter(tokens))
-    end = time.time()
-    print(f"parse time: {end-start:5f}")
     ActionTokenizer().visit(grammar)
 
     grammar.metas["header"] = """

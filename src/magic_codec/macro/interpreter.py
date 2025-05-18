@@ -5,12 +5,9 @@ from tokenize import TokenInfo, tokenize
 from typing import Any, Generator, Iterable, Optional
 from magic_codec.macro.macro_ast import Code
 
-# def synthesize_token_list(tokens: list[TokenInfo], raw = False):
-#     cast_to = "" if raw else "Token"
-#     token_list = ', '.join(f"{cast_to}({token.type},{token.string!r})" for token in tokens)
-#     code = f"[{token_list}]" if raw else f"Code([{token_list}])"
-#     return Code(list(tokenize(code)))
 
+import logging
+logger = logging.getLogger(__name__)
 
 def synthesize_call(function: Code, args: Code) -> Code:
     return Code(f"{function.string}({args.string})")
@@ -82,21 +79,20 @@ class Interpreter:
             self.module.body.append(tree)
 
     def exec(self, code: Code, locals=None, memoize=True):
-        # print("exec: ", code.string)
+        logger.debug(f"EXEC: \n{code.string}")
         if memoize:
             self.push_code(code.ast)
         start = time.time()
         exec(code.string, self.globals, locals or self.globals)
         end = time.time()
-        # print(f"EXEC TIME: {int((end-start)*1000)}")
+        logger.debug(f"FINISHED IN: {int((end-start)*1000)}ms")
 
     def eval(self, code: Code, locals=None):
-        #print("eval: ", code.string) #, end=" -> ")
         start = time.time()
         ret = eval(code.string, self.globals, locals or self.globals)
         end = time.time()
-        # print(f"EVAL: {code.string}\nEVAL TIME: {int((end-start)*1000)}ms")
-        # print(ret)
+        logger.debug(f"EVAL: {code.string}")
+        logger.debug(f"FINISHED IN: {int((end-start)*1000)}ms")
         return ret
 
     def apply_macros(self, code: Code, macros: Iterable[Code]):

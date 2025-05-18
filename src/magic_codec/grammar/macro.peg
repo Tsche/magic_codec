@@ -1,6 +1,5 @@
 # Patch grammar for macro support
 
-# @import "python.peg"
 @class MacroPythonParser
 @extends "python_parser.py"
 @base PythonParser
