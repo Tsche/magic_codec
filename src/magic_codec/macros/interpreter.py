@@ -1,4 +1,5 @@
 import ast
+import time
 from token import NAME, NUMBER, STRING
 from tokenize import TokenInfo, tokenize
 from typing import Any, Generator, Iterable, Optional
@@ -84,11 +85,17 @@ class Interpreter:
         # print("exec: ", code.string)
         if memoize:
             self.push_code(code.ast)
+        start = time.time()
         exec(code.string, self.globals, locals or self.globals)
+        end = time.time()
+        # print(f"EXEC TIME: {int((end-start)*1000)}")
 
     def eval(self, code: Code, locals=None):
-        # print("eval: ", code.string) #, end=" -> ")
+        #print("eval: ", code.string) #, end=" -> ")
+        start = time.time()
         ret = eval(code.string, self.globals, locals or self.globals)
+        end = time.time()
+        # print(f"EVAL: {code.string}\nEVAL TIME: {int((end-start)*1000)}ms")
         # print(ret)
         return ret
 

@@ -341,6 +341,22 @@ class Parser(ParserBase):
         return None
 
     def set_decorators(self,
+        target: Def,
+        decorators: list
+    ) -> Def:
+        """Set the decorators on a function or class definition."""
+        target.decorator_list = decorators
+        return target
+
+    def make_fstring_replacement(self, value, debug_expr: bool, conversion, format_spec, **kwargs):
+        retval: list[ast.AST] = [ast.FormattedValue(value, conversion, format_spec, **kwargs)]
+        if debug_expr:
+            # retval.insert(0, ast.Constant())
+            retval.insert(0, ast.Constant(value=ast.unparse(value) + '=', **kwargs))
+            ...
+        return retval
+
+    def conditional_parse_def(self,
         decorators: list,
         unparsed,
         parsed

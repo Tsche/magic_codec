@@ -45,12 +45,12 @@ simple_stmt (memo):
     | &'return' return_stmt
     | &('import' | 'from') import_stmt
     | &'raise' raise_stmt
-    | 'pass' { ast.Pass(LOCATIONS) }
+    | &'pass' pass_stmt 
     | &'del' del_stmt
     | &'yield' yield_stmt
     | &'assert' assert_stmt
-    | 'break' { ast.Break(LOCATIONS) }
-    | 'continue' { ast.Continue(LOCATIONS) }
+    | &'break' break_stmt
+    | &'continue' continue_stmt
     | &'global' global_stmt
     | &'nonlocal' nonlocal_stmt
 
@@ -102,10 +102,10 @@ assignment:
             )
         )
      }
-    | a=(z=star_targets '=' { z })+ b=(yield_expr | star_expressions) !'=' tc=[TYPE_COMMENT] {
+    | a=(z=star_targets '=' { z })+ b=annotated_rhs !'=' tc=[TYPE_COMMENT] {
          ast.Assign(targets=a, value=b, type_comment=tc, LOCATIONS)
      }
-    | a=single_target b=augassign ~ c=(yield_expr | star_expressions) {
+    | a=single_target b=augassign ~ c=annotated_rhs {
         ast.AugAssign(target = a, op=b, value=c, LOCATIONS)
      }
     | invalid_assignment
@@ -133,6 +133,10 @@ return_stmt[ast.Return]:
 raise_stmt[ast.Raise]:
     | 'raise' a=expression b=['from' z=expression { z }] { ast.Raise(exc=a, cause=b, LOCATIONS) }
     | 'raise' { ast.Raise(exc=None, cause=None, LOCATIONS) }
+
+pass_stmt: 'pass' { ast.Pass(LOCATIONS) }
+break_stmt: 'break' { ast.Break(LOCATIONS) }
+continue_stmt: 'continue' { ast.Continue(LOCATIONS) }
 
 global_stmt[ast.Global]: 'global' a=','.NAME+ {
     ast.Global(names=[n.string for n in a], LOCATIONS)
@@ -214,7 +218,6 @@ dec_maybe_call:
 dec_primary:
     | a=dec_primary '.' b=NAME { ast.Attribute(value=a, attr=b.string, ctx=Load, LOCATIONS) }
     | a=NAME { ast.Name(id=a.string, ctx=Load, LOCATIONS) }
-
 # Class definitions
 # -----------------
 
@@ -224,7 +227,7 @@ class_def[ast.ClassDef]:
 
 class_def_raw[ast.ClassDef]:
     | invalid_class_def_raw
-    | 'class' a=NAME t=[type_params] b=['(' z=[arguments] ')' { z }] &&':' c=block {
+    | 'class' a=NAME t=[type_params] b=['(' z=[arguments] ')' { z }] ':' c=block {
         (
             ast.ClassDef(
                 a.string,
@@ -256,7 +259,7 @@ function_def[Union[ast.FunctionDef, ast.AsyncFunctionDef]]:
 
 function_def_raw[Union[ast.FunctionDef, ast.AsyncFunctionDef]]:
     | invalid_def_raw
-    | 'def' n=NAME t=[type_params] &&'(' params=[params] ')' a=['->' z=expression { z }] &&':' tc=[func_type_comment] b=block {
+    | 'def' n=NAME t=[type_params] '(' params=[params] ')' a=['->' z=expression { z }] ':' tc=[func_type_comment] b=block {
         (
             ast.FunctionDef(
                 name=n.string,
@@ -277,7 +280,7 @@ function_def_raw[Union[ast.FunctionDef, ast.AsyncFunctionDef]]:
             )
         )
      }
-    | 'async' 'def' n=NAME t=[type_params] &&'(' params=[params] ')' a=['->' z=expression { z }] &&':' tc=[func_type_comment] b=block {
+    | 'async' 'def' n=NAME t=[type_params] '(' params=[params] ')' a=['->' z=expression { z }] ':' tc=[func_type_comment] b=block {
        (
             self.check_version(
                 (3, 5),
@@ -419,7 +422,7 @@ while_stmt[ast.While]:
 
 for_stmt[Union[ast.For, ast.AsyncFor]]:
     | invalid_for_stmt
-    | 'for' t=star_targets 'in' ~ ex=star_expressions &&':' tc=[TYPE_COMMENT] b=block el=[else_block] {
+    | 'for' t=star_targets 'in' ~ ex=star_expressions ':' tc=[TYPE_COMMENT] b=block el=[else_block] {
         ast.For(target=t, iter=ex, body=b, orelse=el or [], type_comment=tc, LOCATIONS) }
     | 'async' 'for' t=star_targets 'in' ~ ex=star_expressions ':' tc=[TYPE_COMMENT] b=block el=[else_block] {
         self.check_version(
@@ -433,7 +436,7 @@ for_stmt[Union[ast.For, ast.AsyncFor]]:
 
 with_stmt[Union[ast.With, ast.AsyncWith]]:
     | invalid_with_stmt_indent
-    | 'with' '(' a=','.with_item+ ','? ')' ':' b=block {
+    | 'with' '(' a=','.with_item+ ','? ')' ':' tc=[TYPE_COMMENT] b=block {
         self.check_version(
            (3, 9),
            "Parenthesized with items",
@@ -764,7 +767,9 @@ type_alias["ast.TypeAlias"]:
 # Type parameter declaration
 # --------------------------
 
-type_params[list]: '[' t=type_param_seq  ']' {
+type_params[list]: 
+    | invalid_type_params
+    | '[' t=type_param_seq  ']' {
     self.check_version(
         (3, 12),
         "Type parameter lists are",
@@ -937,6 +942,7 @@ bitwise_and:
 shift_expr:
     | a=shift_expr '<<' b=sum { ast.BinOp(left=a, op=ast.LShift(), right=b, LOCATIONS) }
     | a=shift_expr '>>' b=sum { ast.BinOp(left=a, op=ast.RShift(), right=b, LOCATIONS) }
+    | invalid_arithmetic
     | sum
 
 # Arithmetic operators
@@ -955,6 +961,7 @@ term:
     | a=term '@' b=factor {
         self.check_version((3, 5), "The '@' operator is", ast.BinOp(left=a, op=ast.MatMult(), right=b, LOCATIONS))
      }
+    | invalid_factor
     | factor
 
 factor (memo):
@@ -1127,19 +1134,19 @@ lambda_param[ast.arg]: a=NAME {
 
 fstring_mid:
     | fstring_replacement_field
-    | t=FSTRING_MIDDLE { ast.Constant(value=t.string, LOCATIONS) }
+    | t=FSTRING_MIDDLE { [ast.Constant(value=t.string, LOCATIONS)] }
 fstring_replacement_field:
-    | '{' a=(yield_expr | star_expressions) debug_expr="="? conversion=[fstring_conversion] format=[fstring_full_format_spec] rbrace='}' {
-        ast.FormattedValue(
-            value=a,
+    | '{' a=annotated_rhs debug_expr="="? conversion=[fstring_conversion] format=[fstring_full_format_spec] rbrace='}' {
+        self.make_fstring_replacement(
+            value=a, 
+            debug_expr=debug_expr,
             conversion=(
                 conversion.decode()[0]
                 if conversion else
                 (b'r'[0] if debug_expr else -1)
-            ),
-            format_spec=format,
-            LOCATIONS
-        )
+            ), 
+            format_spec=format, 
+            LOCATIONS)
      }
     | invalid_replacement_field
 fstring_conversion[int]:
@@ -1156,7 +1163,7 @@ fstring_format_spec:
     | fstring_replacement_field
 fstring:
     | a=FSTRING_START b=fstring_mid* c=FSTRING_END {
-        ast.JoinedStr(values=b, LOCATIONS)
+        ast.JoinedStr(values=list(itertools.chain.from_iterable(b)), LOCATIONS)
      }
 
 strings (memo): a=(fstring|STRING)+ {
@@ -1206,6 +1213,7 @@ for_if_clause[ast.comprehension]:
      }
     | 'for' a=star_targets 'in' ~ b=disjunction c=('if' z=disjunction { z })* {
        ast.comprehension(target=a, iter=b, ifs=c, is_async=0) }
+    | invalid_for_if_clause
     | invalid_for_target
 
 listcomp[ast.ListComp]:
@@ -1447,6 +1455,8 @@ invalid_legacy_expression:
         None
      }
 invalid_expression[NoReturn]:
+    |  STRING a=(!STRING expression_without_invalid)+ STRING {
+        self.raise_syntax_error_known_range("invalid syntax. Is this intended to be part of the string?", a[0], a[-1]) }
     # !(NAME STRING) is not matched so we don't show this error with some invalid string prefixes like: kf"dsfsdf"
     # Soft keywords need to also be ignored because they can be parsed as NAME NAME
     | !(NAME STRING | SOFT_KEYWORD) a=disjunction b=expression_without_invalid {
@@ -1459,7 +1469,11 @@ invalid_expression[NoReturn]:
     | a=disjunction 'if' b=disjunction !('else'|':') {
         self.raise_syntax_error_known_range("expected 'else' after 'if' expression", a, b)
      }
-    | a='lambda' [lambda_params] b=':' &(FSTRING_MIDDLE | fstring_replacement_field)  {
+    | a=disjunction 'if' b=disjunction 'else' !expression {
+        self.raise_syntax_error_on_next_token("expected expression after 'else', but statement is given") }
+    | a=(pass_stmt|break_stmt|continue_stmt) 'if' b=disjunction 'else' c=simple_stmt {
+        self.raise_syntax_error_known_location("expected expression before 'if', but statement is given", a) }
+    | a='lambda' [lambda_params] b=':' &FSTRING_MIDDLE  {
         self.raise_syntax_error_known_range(
             "f-string: lambda expressions are not allowed without parentheses", a, b
         )
@@ -1506,7 +1520,7 @@ invalid_assignment[NoReturn]:
     | (star_targets '=')* a=yield_expr '=' {
         self.raise_syntax_error_known_location("assignment to yield expression not possible", a)
      }
-    | a=star_expressions augassign (yield_expr | star_expressions) {
+    | a=star_expressions augassign annotated_rhs {
         self.raise_syntax_error_known_location(
             f"'{self.get_expr_name(a)}' is an illegal expression for augmented assignment", a
         )
@@ -1645,6 +1659,10 @@ invalid_with_item[NoReturn]:
         self.raise_syntax_error_invalid_target(Target.STAR_TARGETS, a)
      }
 
+invalid_for_if_clause:
+    | 'async'? 'for' (bitwise_or (',' bitwise_or)* [',']) !'in' {
+        self.raise_syntax_error("'in' expected after for-loop variables") }
+
 invalid_for_target[NoReturn]:
     | 'async'? 'for' a=star_expressions {
         self.raise_syntax_error_invalid_target(Target.FOR_TARGETS, a)
@@ -1663,14 +1681,18 @@ invalid_import:
             "Did you mean to use 'from ... import ...' instead?", a
         )
      }
+    | 'import' token=NEWLINE {
+        self.raise_syntax_error_starting_from("Expected one or more names after 'import'", token) }
 invalid_import_from_targets[NoReturn]:
     | import_from_as_names ',' NEWLINE {
         self.raise_syntax_error("trailing comma not allowed without surrounding parentheses")
      }
+    | token=NEWLINE {
+        self.raise_syntax_error_starting_from("Expected one or more names after 'import'", token) }
 
 invalid_with_stmt[None]:
-    | ['async'] 'with' ','.(expression ['as' star_target])+ &&':' { UNREACHABLE }
-    | ['async'] 'with' '(' ','.(expressions ['as' star_target])+ ','? ')' &&':' { UNREACHABLE }
+    | ['async'] 'with' ','.(expression ['as' star_target])+ NEWLINE { self.raise_syntax_error("expected ':'") }
+    | ['async'] 'with' '(' ','.(expressions ['as' star_target])+ ','? ')' NEWLINE { self.raise_syntax_error("expected ':'") }
 invalid_with_stmt_indent[NoReturn]:
     | ['async'] a='with' ','.(expression ['as' star_target])+ ':' NEWLINE !INDENT {
         self.raise_indentation_error(
@@ -1793,6 +1815,7 @@ invalid_else_stmt[NoReturn]:
             f"expected an indented block after 'else' statement on line {a.start[0]}"
         )
      }
+    | 'else' ':' block 'elif' { self.raise_syntax_error("'elif' block follows an 'else' block")}
 invalid_while_stmt[NoReturn]:
     | 'while' named_expression NEWLINE { self.raise_syntax_error("expected ':'") }
     | a='while' named_expression ':' NEWLINE !INDENT {
@@ -1813,6 +1836,7 @@ invalid_def_raw[NoReturn]:
             f"expected an indented block after function definition on line {a.start[0]}"
         )
      }
+    | ['async'] 'def' NAME [type_params] &&'(' [params] ')' ['->' expression] &&':' [func_type_comment] block
 invalid_class_def_raw[NoReturn]:
     | 'class' NAME [type_params] ['(' [arguments] ')'] NEWLINE { self.raise_syntax_error("expected ':'") }
     | a='class' NAME  [type_params] ['(' [arguments] ')'] ':' NEWLINE !INDENT {
@@ -1859,27 +1883,36 @@ invalid_replacement_field:
     | '{' a='!' { self.raise_syntax_error_known_location("f-string: valid expression required before '!'", a) }
     | '{' a=':' { self.raise_syntax_error_known_location("f-string: valid expression required before ':'", a) }
     | '{' a='}' { self.raise_syntax_error_known_location("f-string: valid expression required before '}'", a) }
-    | '{' !(yield_expr | star_expressions) {
+    | '{' !annotated_rhs {
         self.raise_syntax_error_on_next_token(
             "f-string: expecting a valid expression after '{'"
         )
      }
-    | '{' (yield_expr | star_expressions) !('=' | '!' | ':' | '}') {
+    | '{' annotated_rhs !('=' | '!' | ':' | '}') {
         self.raise_syntax_error_on_next_token("f-string: expecting '=', or '!', or ':', or '}'") }
-    | '{' (yield_expr | star_expressions) '=' !('!' | ':' | '}') {
+    | '{' annotated_rhs '=' !('!' | ':' | '}') {
        self.raise_syntax_error_on_next_token("f-string: expecting '!', or ':', or '}'")
      }
-    | '{' (yield_expr | star_expressions) '='? invalid_conversion_character
-    | '{' (yield_expr | star_expressions) '='? ['!' NAME] !(':' | '}') {
+    | '{' annotated_rhs '='? invalid_conversion_character
+    | '{' annotated_rhs '='? ['!' NAME] !(':' | '}') {
         self.raise_syntax_error_on_next_token("f-string: expecting ':' or '}'")
      }
-    | '{' (yield_expr | star_expressions) '='? ['!' NAME] ':' fstring_format_spec* !'}' {
+    | '{' annotated_rhs '='? ['!' NAME] ':' fstring_format_spec* !'}' {
         self.raise_syntax_error_on_next_token("f-string: expecting '}', or format specs")
      }
-    | '{' (yield_expr | star_expressions) '='? ['!' NAME] !'}' {
+    | '{' annotated_rhs '='? ['!' NAME] !'}' {
         self.raise_syntax_error_on_next_token("f-string: expecting '}'")
      }
 
 invalid_conversion_character:
     | '!' &(':' | '}') { self.raise_syntax_error_on_next_token("f-string: missing conversion character") }
     | '!' !NAME { self.raise_syntax_error_on_next_token("f-string: invalid conversion character") }
+
+invalid_arithmetic:
+    | sum ('+'|'-'|'*'|'/'|'%'|'//'|'@') a='not' b=inversion { self.raise_syntax_error_known_range("'not' after an operator must be parenthesized", a, b) }
+invalid_factor:
+    | ('+' | '-' | '~') a='not' b=factor { self.raise_syntax_error_known_range("'not' after an operator must be parenthesized", a, b) }
+
+invalid_type_params:
+    | '[' token=']' {
+        self.raise_syntax_error_starting_from("Type parameter list cannot be empty", token)}

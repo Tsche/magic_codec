@@ -176,13 +176,13 @@ class Unparser(ast._Unparser):
 
 
 def parse_string(source: str, mode: str = 'file'):
-    from magic_codec.macros.macro_parser import MacroPythonParser
+    from magic_codec.grammar.macro_parser import MacroPythonParser
     tokenizer = Tokenizer(generate_tokens(StringIO(source).readline))
     parser = MacroPythonParser(tokenizer)
     return parser.file() if mode == 'file' else parser.eval()
 
 def parse(source, mode: str = 'file'):
-    from magic_codec.macros.macro_parser import MacroPythonParser
+    from magic_codec.grammar.macro_parser import MacroPythonParser
     tokenizer = Tokenizer(generate_tokens(source.readline))
     parser = MacroPythonParser(tokenizer)
     return parser.file() if mode == 'file' else parser.eval()
@@ -192,7 +192,7 @@ def unparse(ast_obj):
     return unparser.visit(ast_obj)
 
 def to_ast(source: Code, grammar_rule: str = 'eval'):
-    from magic_codec.macros.macro_parser import MacroPythonParser
+    from magic_codec.grammar.macro_parser import MacroPythonParser
 
     if not isinstance(source, Code):
         source = Code(source)

@@ -1,4 +1,5 @@
-from pegen.python_generator import PythonParserGenerator
+import sys
+import traceback
 from pegen.tokenizer import Tokenizer
 from pegen.grammar import Grammar
 from pegen.grammar_parser import GeneratedParser as GrammarParser
@@ -7,7 +8,7 @@ import tokenize
 from typing import Iterable
 from io import StringIO
 from pathlib import Path
-
+from pegen.python_generator import PythonParserGenerator
 from .parser_generator import ParserGenerator
 
 def parse_grammar(tokens: Iterable, grammar_file = "<unknown>", verbose=False) -> Grammar:
@@ -15,7 +16,9 @@ def parse_grammar(tokens: Iterable, grammar_file = "<unknown>", verbose=False) -
     parser = GrammarParser(tokenizer, verbose=verbose)
     grammar = parser.start()
     if not grammar:
-        raise parser.make_syntax_error(grammar_file)
+        err = parser.make_syntax_error(grammar_file)
+        traceback.print_exception(err.__class__, err, None)
+        sys.exit(1)
 
     validate_grammar(grammar)
     return grammar
@@ -25,27 +28,25 @@ def parse_grammar_file(grammar_file: str) -> Grammar:
         return parse_grammar(tokenize.generate_tokens(file.readline), grammar_file)
 
 def generate_python(grammar):
-    file = StringIO()
-    gen = PythonParserGenerator(grammar, file)
-    gen.generate("")
-    return file.getvalue()
+    gen = ParserGenerator(grammar)    
+    return gen.generate("")
 
-def expand_patch(grammar_path: Path, grammar: Grammar):
-    grammar_folder = grammar_path.parent
+# def expand_patch(grammar_path: Path, grammar: Grammar):
+#     grammar_folder = grammar_path.parent
     
-    if not (parent := grammar.metas.get("import")):
-        # cannot expand further
-        return grammar
+#     if not (parent := grammar.metas.get("import")):
+#         # cannot expand further
+#         return grammar
     
-    parent: Path = Path(parent)
-    assert isinstance(parent, Path)
+#     parent: Path = Path(parent)
+#     assert isinstance(parent, Path)
     
-    if not parent.is_absolute():
-        parent = grammar_folder / parent
+#     if not parent.is_absolute():
+#         parent = grammar_folder / parent
     
-    parent_grammar = parse_grammar_file(parent)
-    expand_patch(parent, parent_grammar)
+#     parent_grammar = parse_grammar_file(parent)
+#     expand_patch(parent, parent_grammar)
 
-    # only take rules/metas from parent if they weren't overridden
-    grammar.rules = parent_grammar.rules | grammar.rules
-    grammar.metas = parent_grammar.metas | grammar.metas
+#     # only take rules/metas from parent if they weren't overridden
+#     grammar.rules = parent_grammar.rules | grammar.rules
+#     grammar.metas = parent_grammar.metas | grammar.metas

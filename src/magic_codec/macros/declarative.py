@@ -1,5 +1,6 @@
 from collections import namedtuple
 from pathlib import Path
+import time
 from token import DEDENT, ENDMARKER, INDENT, NAME, NEWLINE, NL, NUMBER, OP, STRING
 from tokenize import TokenInfo, untokenize
 from typing import Iterable
@@ -9,7 +10,7 @@ from pegen.tokenizer import Tokenizer
 from magic_codec.macros.macro_ast import Code
 from magic_codec.grammar import parse_grammar, parse_grammar_file
 from magic_codec.grammar.parser_generator import ParserGenerator, PatchParserGenerator
-from magic_codec.macros.macro_parser import MacroPythonParser
+from magic_codec.grammar.macro_parser import PythonParser
 
 
 class Token(namedtuple("Token", ["type", "string"])):
@@ -71,8 +72,10 @@ def make_parser(name: str, rules: list):
         Token(1, name), Token(55, ':'), Token(4, '\n'),
         *rules,
         Token(0, '')]
+    start = time.time()
     grammar = parse_grammar(iter(tokens))
-
+    end = time.time()
+    print(f"parse time: {end-start:5f}")
     ActionTokenizer().visit(grammar)
 
     grammar.metas["header"] = """
@@ -84,13 +87,10 @@ from pegen.parser import memoize, memoize_left_rec, logger
 from magic_codec.grammar.python_parser import PythonParser
 """
     grammar.metas["trailer"] = ""
-    grammar.metas["class"] = f"_{name}_Parser (PythonParser): # "
+    grammar.metas["class"] = f"_{name}_Parser"
+    grammar.metas["base"] = "PythonParser"
 
-
-    base_grammar_file = Path(__file__).parent.parent / 'grammar' / 'python.peg'
-    base_grammar = parse_grammar_file(str(base_grammar_file))
-
-    generator = PatchParserGenerator(grammar, base_grammar)
+    generator = PatchParserGenerator(grammar, PythonParser)
     return generator.generate()
 
 

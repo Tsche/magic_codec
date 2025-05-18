@@ -1,10 +1,14 @@
 # Patch grammar for macro support
 
-@import "python.peg"
+# @import "python.peg"
 @class MacroPythonParser
+@extends "python_parser.py"
+@base PythonParser
 @subheader'''
 from magic_codec.macros.parser import *
 from magic_codec.macros.macro_ast import *
+from token import NAME, ENDMARKER
+from magic_codec.grammar.python_parser import PythonParser
 '''
 
 # META RULES
@@ -12,24 +16,24 @@ from magic_codec.macros.macro_ast import *
 
 KEYWORD: ~ { 
         (self._tokenizer.getnext() 
-        if (tok := self._tokenizer.peek()).type == token.NAME 
+        if (tok := self._tokenizer.peek()).type == NAME 
         and tok.string in self.KEYWORDS else None)
     }
 # this hack is equivalent to:
 # KEYWORD:
-    # | 'False' | 'None' | 'True' | 'and' | 'as' | 'assert' | 'async' | 'await' | 'break' | 'class' | 'continue' 
-    # | 'def' | 'del' | 'elif' | 'else' | 'except' | 'finally' | 'for' | 'from' | 'global' | 'if' | 'import' 
-    # | 'in' | 'is' | 'lambda' | 'nonlocal' | 'not' | 'or' | 'pass' | 'raise' | 'return' | 'try' | 'while' 
-    # | 'with' | 'yield' | 'macro'
+#     | 'False' | 'None' | 'True' | 'and' | 'as' | 'assert' | 'async' | 'await' | 'break' | 'class' | 'continue' 
+#     | 'def' | 'del' | 'elif' | 'else' | 'except' | 'finally' | 'for' | 'from' | 'global' | 'if' | 'import' 
+#     | 'in' | 'is' | 'lambda' | 'nonlocal' | 'not' | 'or' | 'pass' | 'raise' | 'return' | 'try' | 'while' 
+#     | 'with' | 'yield' | 'macro'
 
-ANY: !ENDMARKER { self._tokenizer.getnext() }
+ANY: ~ { t if (t:=self._tokenizer.getnext()).type != 0 else None }
 # this hack is equivalent to:
 # ANY:
-    # | OP | NAME | STRING | NUMBER 
-    # | keyword | SOFT_KEYWORD 
-    # | NEWLINE 
-    # | TYPE_COMMENT 
-    # | FSTRING_START | FSTRING_MIDDLE | FSTRING_END 
+#     | OP | NAME | STRING | NUMBER 
+#     | keyword | SOFT_KEYWORD 
+#     | NEWLINE 
+#     | TYPE_COMMENT 
+#     | FSTRING_START | FSTRING_MIDDLE | FSTRING_END 
 
 
 braces: '(' | ')' | '[' | ']' | '{' | '}'
@@ -112,9 +116,7 @@ maybe_macro:
 decorator:
     | a=('@' f=dec_macro NEWLINE { f }) { a }
     | a=('@' f=dec_maybe_call NEWLINE { f }) { a }
-    | a=('@' f=named_expression NEWLINE { f }) {
-        self.check_version((3, 9), "Generic decorator are",  a)
-     }
+    | a=('@' f=named_expression NEWLINE { f }) { self.check_version((3, 9), "Generic decorator are",  a) }
 dec_macro:
     | a=macro_name '(' args=[args_fragment] ')' {
         MacroCall(func=a.id, args=args or [], keywords=[], LOCATIONS)
@@ -132,13 +134,13 @@ dec_macro:
 
 class_def[Union[ClassDef]]:
     | a=decorators &'class' {
-        self.set_decorators(a, self.unparsed_class_def, self.class_def_raw)
+        self.conditional_parse_def(a, self.unparsed_class_def, self.class_def_raw)
      }
     | class_def_raw
 
 class_def_raw[Union[ClassDef]]:
     | invalid_class_def_raw
-    | 'class' a=maybe_macro t=[type_params] b=['(' z=[arguments] ')' { z }] &&':' c=block {
+    | 'class' a=maybe_macro t=[type_params] b=['(' z=[arguments] ')' { z }] ':' c=block {
         (
             ClassDef(
                 a.string,
@@ -165,7 +167,7 @@ class_def_raw[Union[ClassDef]]:
 
 unparsed_class_def[Union[ClassDef]]:
     | invalid_class_def_raw
-    | 'class' a=maybe_macro t=[type_params] b=['(' z=[arguments] ')' { z }] &&':' c=suite_fragment {
+    | 'class' a=maybe_macro t=[type_params] b=['(' z=[arguments] ')' { z }] ':' c=suite_fragment {
         (
             ClassDef(
                 a.string,
@@ -194,12 +196,12 @@ unparsed_class_def[Union[ClassDef]]:
 # --------------------
 
 function_def[Union[FunctionDef, AsyncFunctionDef]]:
-    | d=decorators &('def'|'async') { self.set_decorators(d, self.unparsed_function_def, self.function_def_raw) }
+    | d=decorators &('def'|'async') { self.conditional_parse_def(d, self.unparsed_function_def, self.function_def_raw) }
     | function_def_raw
 
 function_def_raw[Union[FunctionDef, AsyncFunctionDef]]:
     | invalid_def_raw
-    | 'def' n=maybe_macro t=[type_params] &&'(' params=[params] ')' a=['->' z=expression { z }] &&':' tc=[func_type_comment] b=block {
+    | 'def' n=maybe_macro t=[type_params] '(' params=[params] ')' a=['->' z=expression { z }] ':' tc=[func_type_comment] b=block {
         (
             FunctionDef(
                 name=n.string,
@@ -224,7 +226,7 @@ function_def_raw[Union[FunctionDef, AsyncFunctionDef]]:
             )
         )
      }
-    | 'async' 'def' n=maybe_macro t=[type_params] &&'(' params=[params] ')' a=['->' z=expression { z }] &&':' tc=[func_type_comment] b=block {
+    | 'async' 'def' n=maybe_macro t=[type_params] '(' params=[params] ')' a=['->' z=expression { z }] ':' tc=[func_type_comment] b=block {
        (
             self.check_version(
                 (3, 5),
@@ -260,7 +262,7 @@ function_def_raw[Union[FunctionDef, AsyncFunctionDef]]:
 
 unparsed_function_def[Union[FunctionDef, AsyncFunctionDef]]:
     | invalid_def_raw
-    | 'def' n=maybe_macro t=[type_params] &&'(' params=[params] ')' a=['->' z=expression { z }] &&':' tc=[func_type_comment] b=suite_fragment {
+    | 'def' n=maybe_macro t=[type_params] '(' params=[params] ')' a=['->' z=expression { z }] ':' tc=[func_type_comment] b=suite_fragment {
         (
             FunctionDef(
                 name=n.string,
@@ -284,7 +286,7 @@ unparsed_function_def[Union[FunctionDef, AsyncFunctionDef]]:
             )
         )
      }
-    | 'async' 'def' n=maybe_macro t=[type_params] &&'(' params=[params] ')' a=['->' z=expression { z }] &&':' tc=[func_type_comment] b=suite_fragment {
+    | 'async' 'def' n=maybe_macro t=[type_params] &&'(' params=[params] ')' a=['->' z=expression { z }] ':' tc=[func_type_comment] b=suite_fragment {
        (
             self.check_version(
                 (3, 5),
@@ -402,15 +404,7 @@ primary:
 
 atom:
     # macro calls are atoms rather than primary to allow foo!()() etc
-    | a=macro_name '(' args=[args_fragment] ')' {
-        MacroCall(
-            func=a.id,
-            args=args or [],
-            keywords=[],
-            LOCATIONS,
-        )
-     }
-    | a=NAME { ast.Name(id=a.string, ctx=Load, LOCATIONS) }
+    | a=NAME !'!' { ast.Name(id=a.string, ctx=Load, LOCATIONS) }
     | 'True' {
         ast.Constant(value=True, LOCATIONS)
         if sys.version_info >= (3, 9) else
@@ -439,6 +433,14 @@ atom:
         ast.Constant(value=Ellipsis, LOCATIONS)
         if sys.version_info >= (3, 9) else
         ast.Constant(value=Ellipsis, kind=None, LOCATIONS)
+     }
+    | a=macro_name '(' args=[args_fragment] ')' {
+        MacroCall(
+            func=a.id,
+            args=args or [],
+            keywords=[],
+            LOCATIONS,
+        )
      }
     | token_literal
 

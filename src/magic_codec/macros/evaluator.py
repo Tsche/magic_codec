@@ -143,8 +143,7 @@ class MacroEvaluator(TreePass):
             self.report_error(f"Macro evaluation failed!\n\n{traceback.format_exc()}", node)
 
         if not result: return
-        # statements =  to_ast(result, 'statements')
-        statements = ast.parse(result.string).body
+        statements =  to_ast(result, 'statements')
         if statements:
             yield from self.visit_multiple(statements)
 
@@ -197,13 +196,15 @@ class MacroEvaluator(TreePass):
 
 
 def parse(source: str, source_file: Path) -> ast.AST:
-    from magic_codec.macros.macro_parser import MacroPythonParser
+    from magic_codec.grammar.macro_parser import MacroPythonParser
     with StringIO(source) as file:
         tokenizer = Tokenizer(generate_tokens(file.readline))
         parser = MacroPythonParser(tokenizer, verbose=False, filename=str(source_file))
         result = parser.start()
         if result is None:
-            raise RuntimeError("Parsing failed")
+            err = parser.make_syntax_error(str(source_file))
+            traceback.print_exception(err.__class__, err, None)
+            sys.exit(1)
         assert isinstance(result, ast.AST)
         return result, parser
 
