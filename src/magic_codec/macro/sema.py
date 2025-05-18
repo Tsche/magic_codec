@@ -1,9 +1,9 @@
 import ast
 import warnings
 
-from magic_codec.macros.evaluator import Def
-from magic_codec.macros.macro_ast import AsyncFunctionDef, ClassDef, FunctionDef, Import, ImportFrom, MacroCall
-from magic_codec.macros.parser import Parser
+from magic_codec.macro.evaluator import Def
+from magic_codec.macro.macro_ast import AsyncFunctionDef, ClassDef, FunctionDef, Import, ImportFrom, MacroCall
+from magic_codec.macro.parser import Parser
 
 
 class Sema(ast.NodeVisitor):

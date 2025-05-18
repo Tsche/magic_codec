@@ -559,8 +559,8 @@
 -        next_token = self._tokenizer.peek()
 -        raise self._build_syntax_error(message, next_token.start, next_token.end)
 -
-+from magic_codec.macros.parser import *
-+from magic_codec.macros.macro_ast import *
++from magic_codec.macro.parser import *
++from magic_codec.macro.macro_ast import *
  '''
  
  

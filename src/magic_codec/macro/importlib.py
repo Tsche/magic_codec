@@ -3,8 +3,8 @@ import marshal
 from pathlib import Path
 from tokenize import detect_encoding
 
-from magic_codec.macros.evaluator import transform
-from magic_codec.macros.macro_ast import MACRO_PREFIX, Code, demangle
+from magic_codec.macro.evaluator import transform
+from magic_codec.macro.macro_ast import MACRO_PREFIX, Code, demangle
 
 
 class MacroFileLoader(SourceFileLoader):

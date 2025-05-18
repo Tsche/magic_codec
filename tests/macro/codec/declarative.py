@@ -5,12 +5,12 @@ def macro_rules(unparsed_name):
     # parse name, ensure it is a valid Python identifier
     name = unparsed_name.to("name").string
     def parse_rules(rules):
-        from magic_codec.macros.declarative import make_parser
+        from magic_codec.macro.declarative import make_parser
         parser = make_parser(name, rules.tokens)
         __make_macro(_CodeArtifact(parser))
         __make_macro(_CodeArtifact(f"""
 def {name}(code):
-    from magic_codec.macros.declarative import to_tokenizer
+    from magic_codec.macro.declarative import to_tokenizer
     try:
         return _CodeArtifact(_{name}_Parser(to_tokenizer(code)).{name}())
     except StopIteration:

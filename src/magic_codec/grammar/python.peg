@@ -3,8 +3,8 @@
 @class PythonParser
 
 @subheader'''
-from magic_codec.macros.parser import *
-from magic_codec.macros.macro_ast import *
+from magic_codec.macro.parser import *
+from magic_codec.macro.macro_ast import *
 '''
 
 

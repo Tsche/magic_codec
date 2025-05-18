@@ -7,7 +7,7 @@ from typing import Iterable
 from pegen.grammar import GrammarVisitor, Alt, NamedItem
 from pegen.tokenizer import Tokenizer
 
-from magic_codec.macros.macro_ast import Code
+from magic_codec.macro.macro_ast import Code
 from magic_codec.grammar import parse_grammar, parse_grammar_file
 from magic_codec.grammar.parser_generator import ParserGenerator, PatchParserGenerator
 from magic_codec.grammar.macro_parser import PythonParser

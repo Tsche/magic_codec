@@ -1,15 +1,15 @@
 import argparse
 from pathlib import Path
-from magic_codec.macros.evaluator import transform
-from magic_codec.macros.macro_ast import unparse
+from magic_codec.macro.evaluator import transform
+from magic_codec.macro.macro_ast import unparse
 from magic_codec.isolation import Isolation
 
 def run_isolated(source_path):
     with Isolation() as interp:
         interp.exec("""
 from pathlib import Path
-from magic_codec.macros.evaluator import transform
-from magic_codec.macros.macro_ast import unparse
+from magic_codec.macro.evaluator import transform
+from magic_codec.macro.macro_ast import unparse
 """)
         return interp.eval("unparse(transform(_code, Path(_path))[0])", {
             '_code': Path(source_path).read_text(), 

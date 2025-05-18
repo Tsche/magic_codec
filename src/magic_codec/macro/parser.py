@@ -14,7 +14,7 @@ from typing import (
     Any, Callable, Iterator, List, Literal, NoReturn, Optional, Sequence, Tuple, TypeVar, Union
 )
 
-from magic_codec.macros.macro_ast import (
+from magic_codec.macro.macro_ast import (
    MacroCall, Def, MacroName, UnparsedFragment
 )
 

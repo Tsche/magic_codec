@@ -5,13 +5,13 @@ import sys
 from tokenize import TokenInfo, untokenize, tokenize, generate_tokens
 import traceback
 from typing import Optional
-from magic_codec.macros.macro_ast import (MACRO_PREFIX, AsyncFunctionDef, ClassDef, Code, FunctionDef, Import,
+from magic_codec.macro.macro_ast import (MACRO_PREFIX, AsyncFunctionDef, ClassDef, Code, FunctionDef, Import,
                                           ImportFrom, MacroCall, MacroName, TokenLiteral, UnparsedFragment, 
                                           mangle, to_ast, Def)
-from magic_codec.macros.interpreter import Interpreter, synthesize_call
+from magic_codec.macro.interpreter import Interpreter, synthesize_call
 from pegen.tokenizer import Tokenizer
 
-from magic_codec.macros.sema import Sema
+from magic_codec.macro.sema import Sema
 
 
 def macro(fnc=None, /, eval_args=False, **kwargs):
@@ -92,7 +92,7 @@ class MacroEvaluator(TreePass):
     #     return super().generic_visit(copy.deepcopy(node))
 
     # def visit_Module(self, node: ast.Module):
-    #     fixup_builtins = Code("import magic_codec.macros.hooks.register_builtins").to("import_stmt")
+    #     fixup_builtins = Code("import magic_codec.macro.hooks.register_builtins").to("import_stmt")
     #     body = [fixup_builtins, *self.visit_multiple(node.body)]
     #     yield ast.Module(body, node.type_ignores)
         
@@ -227,7 +227,7 @@ def transform(source: str, source_file: Path) -> tuple[ast.AST, ast.AST]:
     # Sema(parser).visit(tree)
 
     interpreter = Interpreter(__default_globals)
-    interpreter.exec(Code("from magic_codec.macros.hooks import register_builtins, register_imports"))
+    interpreter.exec(Code("from magic_codec.macro.hooks import register_builtins, register_imports"))
     # interpreter.execute_fnc(install_import_hook)
 
     evaluator = MacroEvaluator(interpreter)

@@ -3,7 +3,7 @@ import time
 from token import NAME, NUMBER, STRING
 from tokenize import TokenInfo, tokenize
 from typing import Any, Generator, Iterable, Optional
-from magic_codec.macros.macro_ast import Code
+from magic_codec.macro.macro_ast import Code
 
 # def synthesize_token_list(tokens: list[TokenInfo], raw = False):
 #     cast_to = "" if raw else "Token"

@@ -9,8 +9,8 @@ from typing import Any, Optional
 
 from pegen.parser import memoize, memoize_left_rec, logger, Parser
 
-from magic_codec.macros.parser import *
-from magic_codec.macros.macro_ast import *
+from magic_codec.macro.parser import *
+from magic_codec.macro.macro_ast import *
 
 class PythonParser(Parser, ):
 

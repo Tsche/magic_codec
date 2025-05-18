@@ -1,4 +1,4 @@
 import builtins
 
-from magic_codec.macros.macro_ast import Code
+from magic_codec.macro.macro_ast import Code
 setattr(builtins, '_CodeArtifact', Code)

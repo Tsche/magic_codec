@@ -5,8 +5,8 @@
 @extends "python_parser.py"
 @base PythonParser
 @subheader'''
-from magic_codec.macros.parser import *
-from magic_codec.macros.macro_ast import *
+from magic_codec.macro.parser import *
+from magic_codec.macro.macro_ast import *
 from token import NAME, ENDMARKER
 from magic_codec.grammar.python_parser import PythonParser
 '''
@@ -384,6 +384,10 @@ dotted_as_name[ast.alias]:
     | a=dotted_name m=['!'] b=['as' z=NAME n=['!'] { maybe_macro(n, z.string) }] { 
         ast.alias(name=maybe_macro(m, a), asname=b, LOCATIONS) 
      }
+# allow "macro" in imports
+dotted_name[str]:
+    | a=dotted_name '.' b=(NAME | 'macro') { a + "." + b.string }
+    | a=(NAME | 'macro') { a.string }
 
 # Primary elements
 # ----------------
