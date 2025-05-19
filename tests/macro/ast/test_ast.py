@@ -39,7 +39,6 @@ def test_ast_output(name, py_path: Path, ast_path: Path):
     expected_ast = ast_path.read_text().rstrip()
     
     if actual_ast != expected_ast:
-        # diff = ''.join(difflib.unified_diff(expected_ast, actual_ast, fromfile='expected', tofile='actual'))
         diff = colored_diff(expected_ast, actual_ast)
         pytest.fail(f"AST mismatch in {name}:{RESET}\nActual:\n{actual_ast}\nExpected:\n{actual_ast}\nDiff:\n{diff}")
 
