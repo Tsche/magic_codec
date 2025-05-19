@@ -6,7 +6,14 @@
 from magic_codec.macro.parser import *
 from magic_codec.macro.macro_ast import *
 '''
-
+@trailer'''
+    def __init__(self, 
+            tokenizer: Tokenizer, *,
+            verbose: bool = False,
+            filename: str = "<unknown>",
+            py_version: Optional[tuple] = None):
+        super().__init__(tokenizer, verbose=verbose, filename=filename, py_version=py_version)
+'''
 
 # STARTING RULES
 # ==============

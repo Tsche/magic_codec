@@ -1874,7 +1874,9 @@ class MacroPythonParser(PythonParser, ):
     SOFT_KEYWORDS = tuple(set([*(), *getattr(PythonParser, 'SOFT_KEYWORDS', [])]))
     RULES = tuple(set(['KEYWORD', 'ANY', 'braces', 'compound_stmt', 'unparsed_atoms', 'unparsed_balanced', 'unparsed_line', 'unparsed_block', 'args_fragment', 'suite_fragment', 'raw_macro_stmt_args', 'macro_stmt_args', 'macro_stmt', 'forbidden_macro_keywords', 'macro_name', 'maybe_macro', 'decorator', 'dec_macro', 'class_def', 'class_def_raw', 'unparsed_class_def', 'function_def', 'function_def_raw', 'unparsed_function_def', 'else_block', 'try_stmt', 'finally_block', 'import_name', 'import_from', 'import_from_as_name', 'dotted_as_name', 'dotted_name', 'primary', 'atom', 'any_except_backtick', 'token_literal', 'invalid_def_raw', 'invalid_class_def_raw', *getattr(PythonParser, 'KEYWORDS', [])]))
 
-
-if __name__ == '__main__':
-    from pegen.parser import simple_parser_main
-    simple_parser_main(MacroPythonParser)
+    def __init__(self, 
+            tokenizer: Tokenizer, *,
+            verbose: bool = False,
+            filename: str = "<unknown>",
+            py_version: Optional[tuple] = None):
+        super().__init__(tokenizer, verbose=verbose, filename=filename, py_version=py_version)

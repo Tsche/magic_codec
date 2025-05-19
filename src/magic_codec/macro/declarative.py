@@ -1,15 +1,12 @@
 from collections import namedtuple
-from pathlib import Path
-import time
-from token import DEDENT, ENDMARKER, INDENT, NAME, NEWLINE, NL, NUMBER, OP, STRING
+from token import DEDENT, INDENT, NAME, NEWLINE, NL, NUMBER, OP, STRING
 from tokenize import TokenInfo, untokenize
-from typing import Iterable
-from pegen.grammar import GrammarVisitor, Alt, NamedItem
+from pegen.grammar import GrammarVisitor, Alt
 from pegen.tokenizer import Tokenizer
 
-from magic_codec.macro.macro_ast import Code
-from magic_codec.grammar import parse_grammar, parse_grammar_file
-from magic_codec.grammar.parser_generator import ParserGenerator, PatchParserGenerator
+from magic_codec.macro.code import Code
+from magic_codec.grammar import parse_grammar
+from magic_codec.grammar.parser_generator import PatchParserGenerator
 from magic_codec.grammar.macro_parser import PythonParser
 
 class Token(namedtuple("Token", ["type", "string"])):

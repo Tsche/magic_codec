@@ -5,7 +5,7 @@ import re
 # from magic_codec.legacy_macro import transform
 # from magic_codec.util import untokenize
 
-from magic_codec.macro.macro_ast import Code
+from magic_codec.macro.code import Code
 from magic_codec.macro.evaluator import transform
 
 

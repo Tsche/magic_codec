@@ -4,8 +4,8 @@ from pathlib import Path
 from tokenize import detect_encoding
 
 from magic_codec.macro.evaluator import transform
-from magic_codec.macro.macro_ast import MACRO_PREFIX, Code, demangle
-
+from magic_codec.macro.macro_ast import MACRO_PREFIX, demangle
+from magic_codec.macro.code import Code
 
 class MacroFileLoader(SourceFileLoader):
     def __init__(self, fullname: str, path: str, macro_only: bool = False) -> None:

@@ -7,8 +7,8 @@ def macro_rules(unparsed_name):
     def parse_rules(rules):
         from magic_codec.macro.declarative import make_parser
         parser = make_parser(name, rules.tokens)
-        __make_macro(_CodeArtifact(parser))
-        __make_macro(_CodeArtifact(f"""
+        _make_macro(_CodeArtifact(parser))
+        _make_macro(_CodeArtifact(f"""
 def {name}(code):
     from magic_codec.macro.declarative import to_tokenizer
     try:

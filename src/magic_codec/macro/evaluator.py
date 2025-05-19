@@ -3,19 +3,20 @@ import ast
 from io import StringIO
 from pathlib import Path
 import sys
+import time
 from tokenize import TokenInfo, untokenize, tokenize, generate_tokens
 import traceback
-from typing import Optional
-from magic_codec.macro.macro_ast import (MACRO_PREFIX, AsyncFunctionDef, ClassDef, Code, FunctionDef, Import,
-                                          ImportFrom, MacroCall, MacroName, TokenLiteral, UnparsedFragment, 
-                                          mangle, to_ast, Def)
-from magic_codec.macro.interpreter import Interpreter, synthesize_call
-from pegen.tokenizer import Tokenizer
+from typing import Any, Generator, Iterable, Optional
+from magic_codec.macro.macro_ast import (MACRO_PREFIX, AsyncFunctionDef, ClassDef, FunctionDef, Import,
+                                         ImportFrom, MacroCall, MacroName, TokenLiteral, UnparsedFragment,
+                                         mangle, Def)
 
-from magic_codec.macro.sema import Sema
+from magic_codec.macro.code import Code, to_ast
+from pegen.tokenizer import Tokenizer
 
 
 logger = logging.getLogger(__name__)
+
 
 def macro(fnc=None, /, eval_args=False, **kwargs):
     """ This decorator does nothing. It is only used to flag functions and classes as macros. """
@@ -35,6 +36,7 @@ def macro(fnc=None, /, eval_args=False, **kwargs):
             return self.fnc(*args, **kwds)
 
     return Macro(fnc) if fnc else Macro
+
 
 class TreePass:
     def evaluate(self, tree):
@@ -80,25 +82,76 @@ class TreePass:
             else:
                 yield ast.Expr(replacement)
 
+
+def synthesize_call(function: Code, args: Code) -> Code:
+    return Code(f"{function.string}({args.string})")
+
+
+def synthesize_call_chain(calls: Iterable[Code], args: Code, convert_to: Optional[str] = None) -> Code:
+    calls = list(calls)
+    if not calls:
+        return args
+    call = synthesize_call(calls[0], synthesize_call_chain(calls[1:], args, convert_to)) if calls else args
+    return synthesize_call(Code(convert_to), call) if convert_to else call
+
+
 class MacroEvaluator(TreePass):
-    def __init__(self, interpreter: Interpreter):
-        self.interpreter = interpreter
-        self.interpreter.globals["__make_macro"] = self.make_macro
+    def __init__(self):
+        self.globals: dict[str, Any] = {
+            '__name__': "__main__",
+            'Token': TokenInfo,
+            'macro': macro,
+            'tokenize': macro(tokenize, eval_args=True),
+            'untokenize': macro(untokenize, eval_args=True),
+            '_make_macro': self.make_macro,
+            '_CodeArtifact': Code
+        }
+
+        self.module = ast.Module()
+        self.exec(Code("from magic_codec.macro.hooks import register_imports"))
 
     def make_macro(self, code: Code):
         # statements = code.to("statements")
         # preprocessed = Code(self.visit_multiple(statements))
-        self.interpreter.exec(code)
+        self.exec(code)
 
-    # def generic_visit(self, node):
-    #     # do not modify tree in place
-    #     return super().generic_visit(copy.deepcopy(node))
+    def push_code(self, tree: ast.AST):
+        if isinstance(tree, ast.Module):
+            self.module.body.extend(tree.body)
+        else:
+            self.module.body.append(tree)
 
-    # def visit_Module(self, node: ast.Module):
-    #     fixup_builtins = Code("import magic_codec.macro.hooks.register_builtins").to("import_stmt")
-    #     body = [fixup_builtins, *self.visit_multiple(node.body)]
-    #     yield ast.Module(body, node.type_ignores)
-        
+    def exec(self, code: Code, locals=None, memoize=True):
+        logger.debug(f"EXEC: \n{code.string}")
+        if memoize:
+            self.push_code(code.ast)
+        start = time.time()
+        exec(code.string, self.globals, locals or self.globals)
+        end = time.time()
+        logger.debug(f"FINISHED IN: {int((end - start) * 1000)}ms")
+
+    def eval(self, code: Code, locals=None):
+        start = time.time()
+        ret = eval(code.string, self.globals, locals or self.globals)
+        end = time.time()
+        logger.debug(f"EVAL: {code.string}")
+        logger.debug(f"FINISHED IN: {int((end - start) * 1000)}ms")
+        return ret
+
+    def apply_macros(self, code: Code, macros: Iterable[Code]):
+        call = synthesize_call_chain(macros, args=Code("__magic_macro_code_object"), convert_to="_CodeArtifact")
+        call_locals = {'__magic_macro_code_object': Code(code)}
+        return self.eval(call, call_locals)
+
+    def visit_Module(self, node: ast.Module):
+        stmts: list[ast.stmt] = []
+        for statement in node.body:
+            if isinstance(statement, (FunctionDef, AsyncFunctionDef, ClassDef)):
+                # only allow macro definitions at module scope
+                stmts.extend(self.act_on_definition(statement, allow_macros=True))
+            else:
+                stmts.extend(self.visit(statement))
+        yield ast.Module(body=stmts, type_ignores=node.type_ignores)
 
     def visit_FunctionDef(self, node: FunctionDef):
         yield from self.act_on_definition(node)
@@ -109,7 +162,10 @@ class MacroEvaluator(TreePass):
     def visit_ClassDef(self, node: ClassDef):
         yield from self.act_on_definition(node)
 
-    def act_on_definition(self, node: Def) -> Optional[Def]:
+    def act_on_definition(self, node: Def, allow_macros=False) -> Generator[Def]:
+        if node.is_macro and not allow_macros:
+            self.report_error("Macro definitions are only allowed at module scope")
+
         if isinstance(node.body, UnparsedFragment):
             # must evaluate
             macro_decorators = [Code(decorator)
@@ -128,7 +184,7 @@ class MacroEvaluator(TreePass):
         if node.is_macro:
             # evaluate macros, ensure names are mangled
             node.name = mangle(node.name)
-            self.interpreter.exec(Code(node))
+            self.exec(Code(node))
 
             # discard the current node
             return
@@ -139,25 +195,27 @@ class MacroEvaluator(TreePass):
         print(message)
         sys.exit()
 
-    def visit_MacroCall(self, node: MacroCall) -> list[ast.stmt]:
+    def visit_MacroCall(self, node: MacroCall) -> Generator[ast.stmt]:
         try:
-            result = self.interpreter.eval(Code(node))
+            result = self.eval(Code(node))
         except Exception:
             self.report_error(f"Macro evaluation failed!\n\n{traceback.format_exc()}", node)
 
-        if not result: return
-        statements =  to_ast(result, 'statements')
+        if not result:
+            return
+        statements = to_ast(result, 'statements')
         if statements:
             yield from self.visit_multiple(statements)
 
     def visit_MacroName(self, node: MacroName):
         raise RuntimeError("Macro names cannot appear in this context")
 
-    def visit_TokenLiteral(self, node: TokenLiteral) -> ast.List:
+    def visit_TokenLiteral(self, node: TokenLiteral) -> Generator[ast.List]:
         tokens = ', '.join(f"({token.type}, {token.string!r})" for token in node.data)
         yield Code(f"_CodeArtifact([{tokens}])").to("primary")
 
     def visit_Import(self, node: Import):
+        # TODO implement
         if not node.is_macro:
             # also check module, names and aliases
             yield node
@@ -167,7 +225,7 @@ class MacroEvaluator(TreePass):
         module[-1] = f"{MACRO_PREFIX}{module[-1]}"
         return '.'.join(module)
 
-    def visit_ImportFrom(self, node: ImportFrom) -> Optional[ast.ImportFrom]:
+    def visit_ImportFrom(self, node: ImportFrom) -> Generator[ast.ImportFrom]:
         if isinstance(node.module, MacroName):
             # we are only allowed to import macros in preprocessor context
             node.module = self.target_macro_module(node.module.string)
@@ -187,14 +245,14 @@ class MacroEvaluator(TreePass):
                                      col_offset=node.col_offset,
                                      end_lineno=node.end_lineno,
                                      end_col_offset=node.end_col_offset)
-            self.interpreter.exec(Code(import_))
+            self.exec(Code(import_))
 
         if names:
             yield ast.ImportFrom(node.module, names, node.level,
-                                  lineno=node.lineno,
-                                  col_offset=node.col_offset,
-                                  end_lineno=node.end_lineno,
-                                  end_col_offset=node.end_col_offset)
+                                 lineno=node.lineno,
+                                 col_offset=node.col_offset,
+                                 end_lineno=node.end_lineno,
+                                 end_col_offset=node.end_col_offset)
         return
 
 
@@ -212,27 +270,8 @@ def parse(source: str, source_file: Path) -> ast.AST:
         return result
 
 
-__default_globals = {
-    '__name__': "__main__",
-    'Token': TokenInfo,
-    'macro': macro,
-    'tokenize': macro(tokenize, eval_args=True),
-    'untokenize': macro(untokenize, eval_args=True),
-}
-
-
 def transform(source: str, source_file: Path) -> tuple[ast.AST, ast.AST]:
     tree = parse(source, source_file)
-    # print("=================== TREE ===================")
-    # print(ast.dump(tree, indent=2))
-   
-    # # perform semantic analysis - this is mostly for good diagnostics
-    # Sema(parser).visit(tree)
-
-    interpreter = Interpreter(__default_globals)
-    interpreter.exec(Code("from magic_codec.macro.hooks import register_builtins, register_imports"))
-    # interpreter.execute_fnc(install_import_hook)
-
-    evaluator = MacroEvaluator(interpreter)
+    evaluator = MacroEvaluator()
     evaluated_tree = evaluator.evaluate(tree)
-    return evaluated_tree, interpreter.module
+    return evaluated_tree, evaluator.module
