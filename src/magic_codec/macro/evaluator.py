@@ -209,7 +209,7 @@ def parse(source: str, source_file: Path) -> ast.AST:
             traceback.print_exception(err.__class__, err, None)
             sys.exit(1)
         assert isinstance(result, ast.AST)
-        return result, parser
+        return result
 
 
 __default_globals = {
@@ -222,7 +222,7 @@ __default_globals = {
 
 
 def transform(source: str, source_file: Path) -> tuple[ast.AST, ast.AST]:
-    tree, parser = parse(source, source_file)
+    tree = parse(source, source_file)
     # print("=================== TREE ===================")
     # print(ast.dump(tree, indent=2))
    
