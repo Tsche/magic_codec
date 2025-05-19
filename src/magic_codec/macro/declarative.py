@@ -4,23 +4,10 @@ from tokenize import TokenInfo, untokenize
 from pegen.grammar import GrammarVisitor, Alt
 from pegen.tokenizer import Tokenizer
 
-from magic_codec.macro.code import Code
+from magic_codec.macro.code import Code, Token
 from magic_codec.grammar import parse_grammar
 from magic_codec.grammar.parser_generator import PatchParserGenerator
-from magic_codec.grammar.macro_parser import PythonParser
-
-class Token(namedtuple("Token", ["type", "string"])):
-    start: tuple[int, int]
-    end: tuple[int, int]
-    line: str
-
-    def __new__(cls, type: int, string: str):
-        obj = super().__new__(cls, type, string)
-        obj.start = (0, 0)
-        obj.end = (0, 1)
-        obj.line = ""
-        return obj
-
+from magic_codec.parser.python import PythonParser
 
 def quote_tokens(action: Code):
     tokenizer = Tokenizer(iter(action.tokens))
@@ -34,7 +21,7 @@ def quote_tokens(action: Code):
                     raise RuntimeError("Invalid token stream")
                 tokenizer.getnext()
                 yield from [(OP, ']'), (OP, ','), 
-                            (OP, '*'), (NAME, '_CodeArtifact'), (OP, '('), (NAME, next.string), (OP, ')'), (OP, '.'), (NAME, 'tokens'), 
+                            (OP, '*'), (NAME, '_Code'), (OP, '('), (NAME, next.string), (OP, ')'), (OP, '.'), (NAME, 'tokens'), 
                             (OP, ','), (OP, '*'), (OP, '[')]
                 continue
 
@@ -75,7 +62,7 @@ import sys
 import tokenize
 from typing import Any, Optional
 from pegen.parser import memoize, memoize_left_rec, logger
-from magic_codec.grammar.python_parser import PythonParser
+from magic_codec.parser.python import PythonParser
 """
     grammar.metas["trailer"] = ""
     grammar.metas["class"] = f"_{name}_Parser"

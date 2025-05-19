@@ -1,0 +1,12 @@
+Module(
+  body=[
+    Expr(
+      value=MacroCall(func='foo')),
+    Expr(
+      value=MacroCall(
+        func='foo',
+        args=UnparsedFragment(
+          data=[
+            TokenInfo(type=1 (NAME), string='unparsed', start=(2, 5), end=(2, 13), line='foo!(unparsed argument list)'),
+            TokenInfo(type=1 (NAME), string='argument', start=(2, 14), end=(2, 22), line='foo!(unparsed argument list)'),
+            TokenInfo(type=1 (NAME), string='list', start=(2, 23), end=(2, 27), line='foo!(unparsed argument list)')])))])

@@ -1,4 +1,5 @@
 
+from collections import namedtuple
 from io import StringIO
 from tokenize import TokenInfo, generate_tokens, untokenize
 import ast
@@ -7,6 +8,18 @@ from typing import Iterable, Self
 
 from magic_codec.macro.macro_ast import parse_string, unparse
 from pegen.tokenizer import Tokenizer
+
+class Token(namedtuple("Token", ["type", "string"])):
+    start: tuple[int, int]
+    end: tuple[int, int]
+    line: str
+
+    def __new__(cls, type: int, string: str):
+        obj = super().__new__(cls, type, string)
+        obj.start = (0, 0)
+        obj.end = (0, 1)
+        obj.line = ""
+        return obj
 
 class Code:
     __current_state: str | list[TokenInfo] | list[tuple[int, str]] | ast.AST
@@ -65,7 +78,7 @@ class Code:
         return f"Code({str(self.tokens)})"
     
 def to_ast(source: Code, grammar_rule: str = 'eval'):
-    from magic_codec.grammar.macro_parser import MacroPythonParser
+    from magic_codec.parser.macro import MacroParser
 
     if not isinstance(source, Code):
         source = Code(source)
@@ -73,7 +86,7 @@ def to_ast(source: Code, grammar_rule: str = 'eval'):
     # TODO make source.tokens usable directly
     with StringIO(source.string) as code:
         tokenizer = Tokenizer(generate_tokens(code.readline))
-        parser = MacroPythonParser(tokenizer)
+        parser = MacroParser(tokenizer)
         if grammar_rule == 'eval':
             return parser.eval().body
 

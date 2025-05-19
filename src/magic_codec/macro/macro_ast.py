@@ -92,6 +92,50 @@ def mangle(name: str, force: bool = False) -> str:
 def demangle(text):
     return re.sub(f"{MACRO_PREFIX}(\\w+)", "\\1!", text)
 
+class TreePass:
+    def evaluate(self, tree):
+        result = list(self.visit(tree))
+        assert len(result) == 1
+        return ast.fix_missing_locations(result[0])
+
+    def visit(self, node):
+        """Visit a node."""
+        method = 'visit_' + node.__class__.__name__
+        visitor = getattr(self, method, self.generic_visit)
+        yield from visitor(node)
+
+    def visit_multiple(self, nodes: list):
+        for node in nodes:
+            yield from self.visit(node)
+
+    def generic_visit(self, node):
+        """Called if no explicit visitor function exists for a node."""
+        if node is None:
+            return
+
+        new_fields = {}
+        for field, value in ast.iter_fields(node):
+            if isinstance(value, list):
+                new_fields[field] = list(self.visit_multiple(value))
+            elif isinstance(value, ast.AST):
+                new_value = list(self.visit(value))
+                if not new_value:
+                    continue
+                assert len(new_value) == 1, f"Expected only one subtree, got {len(new_value)}"
+                new_fields[field] = new_value[0]
+            else:
+                new_fields[field] = value
+
+        yield type(node)(**new_fields)
+
+    def visit_Expr(self, node):
+        # ensure empty expressions are removed and nested exprs expanded
+        for replacement in self.visit(node.value):
+            if isinstance(replacement, ast.Expr):
+                yield replacement
+            else:
+                yield ast.Expr(replacement)
+
 class Unparser(ast._Unparser):
     def visit_MacroName(self, node: MacroName):
         self.write(mangle(node.id))
@@ -107,26 +151,26 @@ class Unparser(ast._Unparser):
             self.write(f"{mangle(node.func)}")
         else:
             self.visit(node.func)
-        self.write(f"(_CodeArtifact([{token_list}]))")
+        self.write(f"(_Code([{token_list}]))")
     
     def visit_UnparsedFragment(self, node: UnparsedFragment):
         token_list = ', '.join(f"({token.type}, {token.string!r})" for token in node.data)
-        self.write(f"_CodeArtifact([{token_list}])")
+        self.write(f"_Code([{token_list}])")
 
     def visit_TokenLiteral(self, node: TokenLiteral):
         self.visit_UnparsedFragment(node)
 
 
 def parse_string(source: str, mode: str = 'file'):
-    from magic_codec.grammar.macro_parser import MacroPythonParser
+    from magic_codec.parser.macro import MacroParser
     tokenizer = Tokenizer(generate_tokens(StringIO(source).readline))
-    parser = MacroPythonParser(tokenizer)
+    parser = MacroParser(tokenizer)
     return parser.file() if mode == 'file' else parser.eval()
 
 def parse(source, mode: str = 'file'):
-    from magic_codec.grammar.macro_parser import MacroPythonParser
+    from magic_codec.parser.macro import MacroParser
     tokenizer = Tokenizer(generate_tokens(source.readline))
-    parser = MacroPythonParser(tokenizer)
+    parser = MacroParser(tokenizer)
     return parser.file() if mode == 'file' else parser.eval()
 
 def unparse(ast_obj):

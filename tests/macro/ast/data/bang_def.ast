@@ -1,0 +1,16 @@
+Module(
+  body=[
+    FunctionDef(
+      name='foo',
+      args=arguments(),
+      body=[
+        Expr(
+          value=Constant(value=Ellipsis))],
+      is_macro=True),
+    FunctionDef(
+      name='foo',
+      args=arguments(),
+      body=[
+        Expr(
+          value=Constant(value=Ellipsis))],
+      is_macro=True)])

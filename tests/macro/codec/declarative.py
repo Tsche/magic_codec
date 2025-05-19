@@ -1,22 +1,22 @@
 # coding: magic.macro
 
-@macro
-def macro_rules(unparsed_name):
-    # parse name, ensure it is a valid Python identifier
-    name = unparsed_name.to("name").string
-    def parse_rules(rules):
-        from magic_codec.macro.declarative import make_parser
-        parser = make_parser(name, rules.tokens)
-        _make_macro(_CodeArtifact(parser))
-        _make_macro(_CodeArtifact(f"""
-def {name}(code):
-    from magic_codec.macro.declarative import to_tokenizer
-    try:
-        return _CodeArtifact(_{name}_Parser(to_tokenizer(code)).{name}())
-    except StopIteration:
-        raise RuntimeError(f"Invalid declarative macro use: {name}!({{code.string}})")
-"""))
-    return parse_rules
+# @macro
+# def macro_rules(unparsed_name):
+#     # parse name, ensure it is a valid Python identifier
+#     name = unparsed_name.to("name").string
+#     def parse_rules(rules):
+#         from magic_codec.macro.declarative import make_parser
+#         parser = make_parser(name, rules.tokens)
+#         _make_macro(_Code(parser))
+#         _make_macro(_Code(f"""
+# def {name}(code):
+#     from magic_codec.macro.declarative import to_tokenizer
+#     try:
+#         return _Code(_{name}_Parser(to_tokenizer(code)).{name}())
+#     except StopIteration:
+#         raise RuntimeError(f"Invalid declarative macro use: {name}!({{code.string}})")
+# """))
+#     return parse_rules
 
 
 macro_rules! print:

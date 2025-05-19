@@ -9,9 +9,9 @@ import traceback
 from typing import Any, Generator, Iterable, Optional
 from magic_codec.macro.macro_ast import (MACRO_PREFIX, AsyncFunctionDef, ClassDef, FunctionDef, Import,
                                          ImportFrom, MacroCall, MacroName, TokenLiteral, UnparsedFragment,
-                                         mangle, Def)
+                                         mangle, Def, TreePass)
 
-from magic_codec.macro.code import Code, to_ast
+from magic_codec.macro.code import Code, Token, to_ast
 from pegen.tokenizer import Tokenizer
 
 
@@ -38,51 +38,6 @@ def macro(fnc=None, /, eval_args=False, **kwargs):
     return Macro(fnc) if fnc else Macro
 
 
-class TreePass:
-    def evaluate(self, tree):
-        result = list(self.visit(tree))
-        assert len(result) == 1
-        return ast.fix_missing_locations(result[0])
-
-    def visit(self, node):
-        """Visit a node."""
-        method = 'visit_' + node.__class__.__name__
-        visitor = getattr(self, method, self.generic_visit)
-        yield from visitor(node)
-
-    def visit_multiple(self, nodes: list):
-        for node in nodes:
-            yield from self.visit(node)
-
-    def generic_visit(self, node):
-        """Called if no explicit visitor function exists for a node."""
-        if node is None:
-            return
-
-        new_fields = {}
-        for field, value in ast.iter_fields(node):
-            if isinstance(value, list):
-                new_fields[field] = list(self.visit_multiple(value))
-            elif isinstance(value, ast.AST):
-                new_value = list(self.visit(value))
-                if not new_value:
-                    continue
-                assert len(new_value) == 1, f"Expected only one subtree, got {len(new_value)}"
-                new_fields[field] = new_value[0]
-            else:
-                new_fields[field] = value
-
-        yield type(node)(**new_fields)
-
-    def visit_Expr(self, node):
-        # ensure empty expressions are removed and nested exprs expanded
-        for replacement in self.visit(node.value):
-            if isinstance(replacement, ast.Expr):
-                yield replacement
-            else:
-                yield ast.Expr(replacement)
-
-
 def synthesize_call(function: Code, args: Code) -> Code:
     return Code(f"{function.string}({args.string})")
 
@@ -99,12 +54,13 @@ class MacroEvaluator(TreePass):
     def __init__(self):
         self.globals: dict[str, Any] = {
             '__name__': "__main__",
-            'Token': TokenInfo,
             'macro': macro,
-            'tokenize': macro(tokenize, eval_args=True),
-            'untokenize': macro(untokenize, eval_args=True),
+            # 'tokenize': macro(tokenize, eval_args=True),
+            # 'untokenize': macro(untokenize, eval_args=True),
+            'macro_rules': self.macro_rules,
             '_make_macro': self.make_macro,
-            '_CodeArtifact': Code
+            '_Token': Token,
+            '_Code': Code
         }
 
         self.module = ast.Module()
@@ -114,6 +70,24 @@ class MacroEvaluator(TreePass):
         # statements = code.to("statements")
         # preprocessed = Code(self.visit_multiple(statements))
         self.exec(code)
+
+    def macro_rules(self, unparsed_name):
+        # parse name, ensure it is a valid Python identifier
+        name = unparsed_name.to("name").string
+        def parse_rules(rules):
+            from magic_codec.macro.declarative import make_parser
+            parser = make_parser(name, rules.tokens)
+            self.make_macro(Code(parser))
+            self.make_macro(Code(f"""
+def {name}(code):
+    from magic_codec.macro.declarative import to_tokenizer
+    try:
+        return _Code(_{name}_Parser(to_tokenizer(code)).{name}())
+    except StopIteration:
+        raise RuntimeError(f"Invalid declarative macro use: {name}!({{code.string}})")
+"""))
+        return parse_rules
+
 
     def push_code(self, tree: ast.AST):
         if isinstance(tree, ast.Module):
@@ -139,7 +113,7 @@ class MacroEvaluator(TreePass):
         return ret
 
     def apply_macros(self, code: Code, macros: Iterable[Code]):
-        call = synthesize_call_chain(macros, args=Code("__magic_macro_code_object"), convert_to="_CodeArtifact")
+        call = synthesize_call_chain(macros, args=Code("__magic_macro_code_object"), convert_to="_Code")
         call_locals = {'__magic_macro_code_object': Code(code)}
         return self.eval(call, call_locals)
 
@@ -212,7 +186,7 @@ class MacroEvaluator(TreePass):
 
     def visit_TokenLiteral(self, node: TokenLiteral) -> Generator[ast.List]:
         tokens = ', '.join(f"({token.type}, {token.string!r})" for token in node.data)
-        yield Code(f"_CodeArtifact([{tokens}])").to("primary")
+        yield Code(f"_Code([{tokens}])").to("primary")
 
     def visit_Import(self, node: Import):
         # TODO implement
@@ -256,21 +230,21 @@ class MacroEvaluator(TreePass):
         return
 
 
-def parse(source: str, source_file: Path) -> ast.AST:
-    from magic_codec.grammar.macro_parser import MacroPythonParser
+def parse(source: str, source_file: Path | None) -> ast.AST:
+    from magic_codec.parser.macro import MacroParser
     with StringIO(source) as file:
         tokenizer = Tokenizer(generate_tokens(file.readline))
-        parser = MacroPythonParser(tokenizer, verbose=False, filename=str(source_file))
+        parser = MacroParser(tokenizer, verbose=False, filename=str(source_file) if source_file else "")
         result = parser.start()
         if result is None:
-            err = parser.make_syntax_error(str(source_file))
+            err = parser.make_syntax_error(str(source_file or "<src>"))
             traceback.print_exception(err.__class__, err, None)
             sys.exit(1)
         assert isinstance(result, ast.AST)
         return result
 
 
-def transform(source: str, source_file: Path) -> tuple[ast.AST, ast.AST]:
+def transform(source: str, source_file: Path | None) -> tuple[ast.AST, ast.AST]:
     tree = parse(source, source_file)
     evaluator = MacroEvaluator()
     evaluated_tree = evaluator.evaluate(tree)

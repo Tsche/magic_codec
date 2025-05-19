@@ -5,7 +5,7 @@ import argparse
 import importlib.util
 from pathlib import Path
 
-from magic_codec.grammar import generate_python, parse_grammar_file, Grammar
+from magic_codec.grammar import parse_grammar_file, Grammar
 from magic_codec.grammar.parser_generator import ParserGenerator, PatchParserGenerator
 
 def get_parent(grammar_path: Path, grammar: Grammar):   

@@ -42,7 +42,7 @@ def main():
     if args.syntax_only:       
         tree = evaluator.parse(source, source_file)
         if args.tree:
-            print(ast.dump(tree, indent=4))
+            print(ast.dump(tree, indent=2))
         else:
             # todo implement unparser for syntax highlighting
             print("unimplemented")
@@ -52,12 +52,12 @@ def main():
     source, macro = evaluator.transform(source, source_file)
     if args.preprocessor:
         if args.tree:
-            print(ast.dump(macro, indent=4))
+            print(ast.dump(macro, indent=2))
         else:
             print(unparse(macro))
     else:
         if args.tree:
-            print(ast.dump(source, indent=4))
+            print(ast.dump(source, indent=2))
         else:
             print(unparse(source))
 

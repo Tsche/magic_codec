@@ -1,13 +1,13 @@
 # Patch grammar for macro support
 
-@class MacroPythonParser
-@extends "python_parser.py"
+@class MacroParser
+@extends "python.py"
 @base PythonParser
 @subheader'''
 from magic_codec.macro.parser import *
 from magic_codec.macro.macro_ast import *
 from token import NAME, ENDMARKER
-from magic_codec.grammar.python_parser import PythonParser
+from magic_codec.parser.python import PythonParser
 '''
 @trailer'''
     def __init__(self, 
