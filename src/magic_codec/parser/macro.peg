@@ -47,6 +47,31 @@ braces: '(' | ')' | '[' | ']' | '{' | '}'
 
 # GENERAL STATEMENTS
 # ==================
+simple_stmt (memo):
+    | assignment
+    | &"type" type_alias
+    # macro call statement
+    | a=macro_name '(' args=[args_fragment] ')' {
+        MacroCall(
+            func=a.id,
+            args=args or [],
+            keywords=[],
+            expand_as_stmts=True,
+            LOCATIONS,
+        )
+     }
+    | e=star_expressions { ast.Expr(value=e, LOCATIONS) }
+    | &'return' return_stmt
+    | &('import' | 'from') import_stmt
+    | &'raise' raise_stmt
+    | &'pass' pass_stmt 
+    | &'del' del_stmt
+    | &'yield' yield_stmt
+    | &'assert' assert_stmt
+    | &'break' break_stmt
+    | &'continue' continue_stmt
+    | &'global' global_stmt
+    | &'nonlocal' nonlocal_stmt
 
 compound_stmt:
     | macro_stmt
@@ -102,10 +127,10 @@ macro_stmt_args:
 
 
 macro_stmt[MacroCall]:
-    # | a=macro_name [macro_stmt_args] ':' unparsed_line INDENT { self.raise_indentation_error("unexpected indented block") }
-    | a=macro_name ':' b=suite_fragment { MacroCall(a, args=b, LOCATIONS) }
+    | a=macro_name [macro_stmt_args] ':' unparsed_line INDENT { self.raise_indentation_error("unexpected indented block") }
+    | a=macro_name ':' b=suite_fragment { MacroCall(a, args=b, expand_as_stmts=True, LOCATIONS) }
     | a=macro_name h=macro_stmt_args ':' b=suite_fragment {
-        MacroCall(MacroCall(a, args=h, LOCATIONS), b, LOCATIONS)
+        MacroCall(MacroCall(a, args=h, LOCATIONS), b, expand_as_stmts=True, LOCATIONS)
      }
 
  # Common elements
@@ -131,7 +156,7 @@ dec_macro:
     | macro_name
     # this makes `macro` a keyword that's only usable in decorators
     | a='macro' '(' z=[arguments] ')' {
-        ast.Call(func=a, args=z[0] if z else [], keywords=z[1] if z else [], LOCATIONS)
+        ast.Call(func=ast.Name(id=a.string, ctx=Load, LOCATIONS), args=z[0] if z else [], keywords=z[1] if z else [], LOCATIONS)
      }
     | a='macro' { ast.Name(id=a.string, ctx=Load, LOCATIONS) }
 
@@ -414,7 +439,6 @@ primary:
     | atom
 
 atom:
-    # macro calls are atoms rather than primary to allow foo!()() etc
     | a=NAME !'!' { ast.Name(id=a.string, ctx=Load, LOCATIONS) }
     | 'True' {
         ast.Constant(value=True, LOCATIONS)
@@ -445,6 +469,7 @@ atom:
         if sys.version_info >= (3, 9) else
         ast.Constant(value=Ellipsis, kind=None, LOCATIONS)
      }
+    # macro call expressions are atoms rather than primary to allow foo!()() etc
     | a=macro_name '(' args=[args_fragment] ')' {
         MacroCall(
             func=a.id,

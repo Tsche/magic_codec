@@ -8,7 +8,15 @@ from tokenize import TokenInfo, generate_tokens
 
 from pegen.tokenizer import Tokenizer
 
-class MacroCall(ast.Call): ...
+class MacroCall(ast.Call):
+    if sys.version_info >= (3, 10):
+        __match_args__ = [*ast.Call.__match_args__, 'expand_as_stmts']
+    expand_as_stmts: bool
+    _fields = (*ast.Call._fields, 'expand_as_stmts')
+
+    def __init__(self, *args, expand_as_stmts: bool = False, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.expand_as_stmts = expand_as_stmts
 
 class MacroName(ast.Name):
     @property
@@ -129,7 +137,6 @@ class TreePass:
         yield type(node)(**new_fields)
 
     def visit_Expr(self, node):
-        # ensure empty expressions are removed and nested exprs expanded
         for replacement in self.visit(node.value):
             if isinstance(replacement, ast.Expr):
                 yield replacement

@@ -10,10 +10,13 @@ DATA_DIR = Path(__file__).parent / "data"
 def get_test_cases():
     py_files = sorted(DATA_DIR.rglob("*.py"))
     for py_file in py_files:
-        ast_file = py_file.with_suffix(".ast")
-        if ast_file.exists():
+        if len(py_file.suffixes) != 1:
+            continue
+
+        result_file = py_file.with_suffix(".out.py")
+        if result_file.exists():
             test_id = str(py_file.relative_to(DATA_DIR))
-            yield pytest.param(test_id, py_file, ast_file, id=test_id)
+            yield pytest.param(test_id, py_file, result_file, id=test_id)
         else:
             print(f"Missing test result {result_file}")
 
@@ -33,17 +36,17 @@ def colored_diff(a, b):
                 yield line
     return '\n'.join(process_lines())
 
+from pathlib import Path
 
-@pytest.mark.parametrize("name, py_path, ast_path", get_test_cases())
-def test_ast_output(name, py_path: Path, ast_path: Path):
-    tree = evaluator.parse(py_path.read_text(), py_path)
-    actual_ast = ast.dump(tree, indent=2).rstrip()
-    expected_ast = ast_path.read_text().rstrip()
+@pytest.mark.parametrize("name, py_path, expected_path", get_test_cases())
+def test_codec(name, py_path: Path, expected_path: Path):
+    actual = py_path.read_text(encoding="magic.macro").strip()
+    expected = expected_path.read_text().strip()
     
-    if actual_ast != expected_ast:
-        diff = colored_diff(expected_ast, actual_ast)
-        pytest.fail(f"AST mismatch in {name}:{RESET}\nActual:\n{actual_ast}\nExpected:\n{actual_ast}\nDiff:\n{diff}")
+    if actual != expected:
+        diff = colored_diff(expected, actual)
+        pytest.fail(f"Code mismatch in {name}:{RESET}\nActual:\n{actual}\nExpected:\n{actual}\nDiff:\n{diff}")
 
 if __name__ == "__main__":
     for param in get_test_cases():
-        test_ast_output(*param.values)
+        test_codec(*param.values)

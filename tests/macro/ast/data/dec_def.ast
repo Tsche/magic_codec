@@ -26,12 +26,12 @@ Module(
           value=Constant(value=Ellipsis))],
       decorator_list=[
         Call(
-          func=TokenInfo(type=1 (NAME), string='macro', start=(8, 1), end=(8, 6), line='@macro(eval_args=True)\n'),
+          func=Name(id='macro', ctx=Load()),
           keywords=[
             keyword(
               arg='eval_args',
               value=Constant(value=True))])],
-      is_macro=False),
+      is_macro=True),
     FunctionDef(
       name='foo',
       args=arguments(),
@@ -40,12 +40,12 @@ Module(
           value=Constant(value=Ellipsis))],
       decorator_list=[
         Call(
-          func=TokenInfo(type=1 (NAME), string='macro', start=(11, 1), end=(11, 6), line='@macro(eval_args=True)\n'),
+          func=Name(id='macro', ctx=Load()),
           keywords=[
             keyword(
               arg='eval_args',
               value=Constant(value=True))])],
-      is_macro=False),
+      is_macro=True),
     ClassDef(
       name='foo',
       body=[
@@ -69,12 +69,12 @@ Module(
           value=Constant(value=Ellipsis))],
       decorator_list=[
         Call(
-          func=TokenInfo(type=1 (NAME), string='macro', start=(22, 1), end=(22, 6), line='@macro(eval_args=True)\n'),
+          func=Name(id='macro', ctx=Load()),
           keywords=[
             keyword(
               arg='eval_args',
               value=Constant(value=True))])],
-      is_macro=False),
+      is_macro=True),
     ClassDef(
       name='foo',
       body=[
@@ -82,9 +82,9 @@ Module(
           value=Constant(value=Ellipsis))],
       decorator_list=[
         Call(
-          func=TokenInfo(type=1 (NAME), string='macro', start=(25, 1), end=(25, 6), line='@macro(eval_args=True)\n'),
+          func=Name(id='macro', ctx=Load()),
           keywords=[
             keyword(
               arg='eval_args',
               value=Constant(value=True))])],
-      is_macro=False)])
+      is_macro=True)])
