@@ -1,0 +1,21 @@
+Module(
+  body=[
+    MacroCall(
+      func=MacroName(id='foo', ctx=Load()),
+      parse_as='statements'),
+    MacroCall(
+      func=MacroName(id='foo', ctx=Load()),
+      args=[
+        UnparsedFragment(
+          data=[
+            TokenInfo(type=1 (NAME), string='unparsed', start=(2, 5), end=(2, 13), line='foo!(unparsed argument list)\n'),
+            TokenInfo(type=1 (NAME), string='argument', start=(2, 14), end=(2, 22), line='foo!(unparsed argument list)\n'),
+            TokenInfo(type=1 (NAME), string='list', start=(2, 23), end=(2, 27), line='foo!(unparsed argument list)\n')])],
+      parse_as='statements'),
+    Expr(
+      value=Call(
+        func=Name(id='foo', ctx=Load()),
+        args=[
+          MacroCall(
+            func=MacroName(id='foo', ctx=Load()),
+            parse_as='expression')]))])

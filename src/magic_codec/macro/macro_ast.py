@@ -10,13 +10,13 @@ from pegen.tokenizer import Tokenizer
 
 class MacroCall(ast.Call):
     if sys.version_info >= (3, 10):
-        __match_args__ = [*ast.Call.__match_args__, 'expand_as_stmts']
-    expand_as_stmts: bool
-    _fields = (*ast.Call._fields, 'expand_as_stmts')
+        __match_args__ = [*ast.Call.__match_args__, 'parse_as']
+    parse_as: str
+    _fields = (*ast.Call._fields, 'parse_as')
 
-    def __init__(self, *args, expand_as_stmts: bool = False, **kwargs):
+    def __init__(self, *args, parse_as: str = "expression", **kwargs):
         super().__init__(*args, **kwargs)
-        self.expand_as_stmts = expand_as_stmts
+        self.parse_as = parse_as
 
 class MacroName(ast.Name):
     @property
@@ -34,8 +34,6 @@ class UnparsedFragment(UserList, ast.AST):
 
     data: list[TokenInfo]
     _fields = ("data",)
-
-class TokenLiteral(UnparsedFragment): ...
 
 class FunctionDef(ast.FunctionDef):
     if sys.version_info >= (3, 10):
@@ -143,29 +141,25 @@ class TreePass:
             else:
                 yield ast.Expr(replacement)
 
-class Unparser(ast._Unparser):
+
+from ast import _Unparser as _Unparser
+from ast import _Precedence as _Precedence
+
+class Unparser(_Unparser):
     def visit_MacroName(self, node: MacroName):
         self.write(mangle(node.id))
 
     def visit_MacroCall(self, node: MacroCall):
-        if not node.args:
-            token_list = ""
-        else:
-            assert isinstance(node.args, UnparsedFragment)
-            token_list = ', '.join(f"({token.type}, {token.string!r})" for token in node.args)
-        
+        self.set_precedence(_Precedence.ATOM, node.func)
         if isinstance(node.func, str):
-            self.write(f"{mangle(node.func)}")
-        else:
-            self.visit(node.func)
-        self.write(f"(_Code([{token_list}]))")
+            raise 3
+        self.traverse(node.func)
+        with self.delimit("(", ")"):
+            self.interleave(lambda: self.write(", "), self.traverse, node.args)
     
     def visit_UnparsedFragment(self, node: UnparsedFragment):
         token_list = ', '.join(f"({token.type}, {token.string!r})" for token in node.data)
         self.write(f"_Code([{token_list}])")
-
-    def visit_TokenLiteral(self, node: TokenLiteral):
-        self.visit_UnparsedFragment(node)
 
 
 def parse_string(source: str, mode: str = 'file'):

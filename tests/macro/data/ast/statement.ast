@@ -1,0 +1,53 @@
+Module(
+  body=[
+    MacroCall(
+      func=MacroName(id='foo', ctx=Load()),
+      args=[
+        UnparsedFragment(
+          data=[
+            TokenInfo(type=1 (NAME), string='unparsed', start=(1, 6), end=(1, 14), line='foo!: unparsed++\n'),
+            TokenInfo(type=55 (OP), string='+', start=(1, 14), end=(1, 15), line='foo!: unparsed++\n'),
+            TokenInfo(type=55 (OP), string='+', start=(1, 15), end=(1, 16), line='foo!: unparsed++\n'),
+            TokenInfo(type=4 (NEWLINE), string='\n', start=(1, 16), end=(1, 17), line='foo!: unparsed++\n')])],
+      parse_as='statements'),
+    MacroCall(
+      func=MacroName(id='foo', ctx=Load()),
+      args=[
+        UnparsedFragment(
+          data=[
+            TokenInfo(type=1 (NAME), string='unparsed', start=(4, 4), end=(4, 12), line='    unparsed indented++\n'),
+            TokenInfo(type=1 (NAME), string='indented', start=(4, 13), end=(4, 21), line='    unparsed indented++\n'),
+            TokenInfo(type=55 (OP), string='+', start=(4, 21), end=(4, 22), line='    unparsed indented++\n'),
+            TokenInfo(type=55 (OP), string='+', start=(4, 22), end=(4, 23), line='    unparsed indented++\n'),
+            TokenInfo(type=4 (NEWLINE), string='\n', start=(4, 23), end=(4, 24), line='    unparsed indented++\n')])],
+      parse_as='statements'),
+    MacroCall(
+      func=MacroName(id='foo', ctx=Load()),
+      args=[
+        UnparsedFragment(
+          data=[
+            TokenInfo(type=1 (NAME), string='unparsed', start=(6, 25), end=(6, 33), line='foo! with unparsed args: unparsed++\n'),
+            TokenInfo(type=55 (OP), string='+', start=(6, 33), end=(6, 34), line='foo! with unparsed args: unparsed++\n'),
+            TokenInfo(type=55 (OP), string='+', start=(6, 34), end=(6, 35), line='foo! with unparsed args: unparsed++\n'),
+            TokenInfo(type=4 (NEWLINE), string='\n', start=(6, 35), end=(6, 36), line='foo! with unparsed args: unparsed++\n')]),
+        UnparsedFragment(
+          data=[
+            TokenInfo(type=1 (NAME), string='with', start=(6, 5), end=(6, 9), line='foo! with unparsed args: unparsed++\n'),
+            TokenInfo(type=1 (NAME), string='unparsed', start=(6, 10), end=(6, 18), line='foo! with unparsed args: unparsed++\n'),
+            TokenInfo(type=1 (NAME), string='args', start=(6, 19), end=(6, 23), line='foo! with unparsed args: unparsed++\n')])],
+      parse_as='statements'),
+    MacroCall(
+      func=MacroName(id='foo', ctx=Load()),
+      args=[
+        UnparsedFragment(
+          data=[
+            TokenInfo(type=1 (NAME), string='unparsed', start=(9, 4), end=(9, 12), line='    unparsed++'),
+            TokenInfo(type=55 (OP), string='+', start=(9, 12), end=(9, 13), line='    unparsed++'),
+            TokenInfo(type=55 (OP), string='+', start=(9, 13), end=(9, 14), line='    unparsed++'),
+            TokenInfo(type=4 (NEWLINE), string='', start=(9, 14), end=(9, 15), line='    unparsed++')]),
+        UnparsedFragment(
+          data=[
+            TokenInfo(type=1 (NAME), string='with', start=(8, 5), end=(8, 9), line='foo! with unparsed args:\n'),
+            TokenInfo(type=1 (NAME), string='unparsed', start=(8, 10), end=(8, 18), line='foo! with unparsed args:\n'),
+            TokenInfo(type=1 (NAME), string='args', start=(8, 19), end=(8, 23), line='foo! with unparsed args:\n')])],
+      parse_as='statements')])

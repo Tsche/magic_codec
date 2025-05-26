@@ -333,6 +333,10 @@ class Parser(ParserBase):
                 level += 3
         return level
 
+    def set_macro_stmt_mode(self, target: MacroCall, parse_mode: str):
+        target.parse_as = parse_mode
+        return target
+
     def find_macro_decorator(self, target: Def) -> Optional[ast.expr]:
         for decorator in target.decorator_list:
             if ((isinstance(decorator, ast.Name) and decorator.id == "macro") or

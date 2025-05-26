@@ -10,8 +10,8 @@ import traceback
 from types import GeneratorType
 from typing import Any, Generator, Iterable, Optional
 from magic_codec.macro.macro_ast import (MACRO_PREFIX, AsyncFunctionDef, ClassDef, FunctionDef, Import,
-                                         ImportFrom, MacroCall, MacroName, TokenLiteral, UnparsedFragment,
-                                         mangle, Def, TreePass)
+                                         ImportFrom, MacroCall, MacroName, UnparsedFragment, Def,
+                                         mangle, TreePass)
 
 from magic_codec.macro.code import Code, Token, to_ast
 from pegen.tokenizer import Tokenizer
@@ -51,44 +51,30 @@ def synthesize_call_chain(calls: Iterable[Code], args: Code, convert_to: Optiona
     call = synthesize_call(calls[0], synthesize_call_chain(calls[1:], args, convert_to)) if calls else args
     return synthesize_call(Code(convert_to), call) if convert_to else call
 
-def synthesize_constant(value: Any):
-    if value is None:
-        return
-    elif isinstance(value, TokenInfo):
-        if value.string == "None":
-            return
-        yield value
-    elif isinstance(value, tuple):
-        if len(value) != 2:
-            raise RuntimeError("Can only return (str, int) 2-tuples in place of tokens")
-        if value[1] == "None":
-            return
-        yield (int(value[0]), str(value[1]))
-    elif isinstance(value, bool):
-        yield (NAME, str(value))
-    elif isinstance(value, (int, float)):
-        yield (NUMBER, str(value))
-    elif isinstance(value, str):
-        try:
-            node = ast.parse(value, mode="eval")
-            if isinstance(node.body, ast.Constant):
-                yield (STRING, value)
-            elif isinstance(node.body, ast.Name):
-                yield (NAME, value)
-            else:
-                # string contains more than one token - insert all of them into the token stream
-                raise RuntimeError
-        except RuntimeError:
-            yield from tokenize(value)
-    elif isinstance(value, (list, Generator)):
-        # directly inject tokens into token stream
-        for item in value:
-            if not isinstance(item, (TokenInfo, tuple)):
-                raise RuntimeError("Expected list or generator of tokens to directly inject into the token stream")
-            yield from synthesize_constant(item)
-    else:
-        # couldn't find something to replace the constant with
-        raise RuntimeError(f"Unexpected macro return value {type(value)}")
+# def synthesize_constant(value: Any):
+#     if value is None:
+#         return
+#     elif isinstance(value, tuple) and len(value) == 2:
+#         yield Token(value[0], value[1])
+#     elif isinstance(value, (Token, TokenInfo)):
+#         yield Token(value.type, value.string)
+#     elif isinstance(value, bool):
+#         yield Token(NAME, repr(value))
+#     elif isinstance(value, (int, float)):
+#         yield Token(NUMBER, repr(value))
+#     elif isinstance(value, str):
+#         yield from Code(value).tokens
+#     elif isinstance(value, ast.AST):
+#         yield from Code(value).tokens
+#     elif isinstance(value, Code):
+#         yield from value.tokens
+#     elif isinstance(value, (list, Generator)):
+#         # directly inject tokens into token stream
+#         for item in value:
+#             yield from synthesize_constant(item)
+#     else:
+#         # couldn't find something to replace the constant with
+#         raise RuntimeError(f"Unexpected macro return value {type(value)}")
 
 class MacroEvaluator(TreePass):
     def __init__(self):
@@ -103,6 +89,7 @@ class MacroEvaluator(TreePass):
             '_Code': Code
         }
 
+        self.in_macro_context = False
         self.module = ast.Module()
         self.exec(Code("from magic_codec.macro.hooks import register_imports"))
 
@@ -111,14 +98,13 @@ class MacroEvaluator(TreePass):
         # preprocessed = Code(self.visit_multiple(statements))
         self.exec(code)
 
-    def macro_rules(self, unparsed_name):
+    def macro_rules(self, rules, unparsed_name):
+        from magic_codec.macro.declarative import make_parser
         # parse name, ensure it is a valid Python identifier
         name = unparsed_name.to("name").string
-        def parse_rules(rules):
-            from magic_codec.macro.declarative import make_parser
-            parser = make_parser(name, rules.tokens)
-            self.make_macro(Code(parser))
-            self.make_macro(Code(f"""
+        parser = make_parser(name, rules.tokens)
+        self.make_macro(Code(parser))
+        self.make_macro(Code(f"""
 def {name}(code):
     from magic_codec.macro.declarative import to_tokenizer
     try:
@@ -126,7 +112,6 @@ def {name}(code):
     except StopIteration:
         raise RuntimeError(f"Invalid declarative macro use: {name}!({{code.string}})")
 """))
-        return parse_rules
 
 
     def push_code(self, tree: ast.AST):
@@ -183,8 +168,10 @@ def {name}(code):
         yield from self.act_on_definition(node)
 
     def act_on_definition(self, node: Def, allow_macros=False) -> Generator[Def]:
-        if node.is_macro and not allow_macros:
-            self.report_error("Macro definitions are only allowed at module scope")
+        if node.is_macro:
+            if not allow_macros:
+                self.report_error("Macro definitions are only allowed at module scope")
+            self.in_macro_context = True
 
         if isinstance(node.body, UnparsedFragment):
             # must evaluate
@@ -204,7 +191,7 @@ def {name}(code):
             # evaluate macros, ensure names are mangled
             node.name = mangle(node.name)
             self.exec(Code(node))
-
+            self.in_macro_context = False
             # discard the current node
             return
 
@@ -227,20 +214,23 @@ def {name}(code):
         if not result:
             return
 
-        if node.expand_as_stmts:
-            statements = to_ast(result, 'statements')
-            if statements:
-                yield from self.visit_multiple(statements)
+        #! workaround
+        # token = Code(result).tokens
+        # print(token)
+        if node.parse_as == "expression":
+            yield Code(result).to('expression')
         else:
-            result = Code(synthesize_constant(result))
-            yield to_ast(result, 'expression')
+            try:
+                statements = to_ast(result, node.parse_as)
+                if statements:
+                    yield from self.visit_multiple(statements)    
+            except SyntaxError:
+                statements = to_ast(result, 'statements')
+                if statements:
+                    yield from self.visit_multiple(statements)
 
     def visit_MacroName(self, node: MacroName):
         raise RuntimeError("Macro names cannot appear in this context")
-
-    def visit_TokenLiteral(self, node: TokenLiteral) -> Generator[ast.List]:
-        tokens = ', '.join(f"({token.type}, {token.string!r})" for token in node.data)
-        yield Code(f"_Code([{tokens}]).tokens").to("primary")
 
     def visit_Import(self, node: Import):
         # TODO implement

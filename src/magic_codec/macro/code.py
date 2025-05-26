@@ -10,34 +10,69 @@ from magic_codec.macro.macro_ast import parse_string, unparse
 from pegen.tokenizer import Tokenizer
 
 class Token(namedtuple("Token", ["type", "string"])):
-    start: tuple[int, int]
-    end: tuple[int, int]
-    line: str
+    type: int
+    string: str
 
-    def __new__(cls, type: int, string: str):
-        obj = super().__new__(cls, type, string)
-        obj.start = (0, 0)
-        obj.end = (0, 1)
-        obj.line = ""
-        return obj
+    @property
+    def start(self):
+        return (0, 0)
+    
+    @property
+    def end(self):
+        return (0, 1)
+    
+    @property
+    def line(self):
+        return ""
+
+    def __new__(cls, type_or_obj: int | Self | tuple | TokenInfo, string: str = ""):
+        type_: int
+        string_: str
+        if isinstance(type_or_obj, int):
+            type_ = type_or_obj
+            string_ = string
+        elif isinstance(type_or_obj, tuple) and len(type_or_obj) == 2:
+            type_ = int(type_or_obj[0])
+            string_ = str(type_or_obj[1])
+        elif isinstance(type_or_obj,  (TokenInfo, Token)):
+            type_ = type_or_obj.type
+            string_ = type_or_obj.string
+        else:
+            raise TypeError(f"Cannot construct a Token object from {type(type_or_obj)}{f', {string}' if string else ''}")
+        
+        return super().__new__(cls, type_, string_)
 
 class Code:
-    __current_state: str | list[TokenInfo] | list[tuple[int, str]] | ast.AST
+    __current_state: str | list[Token] | ast.AST
 
     def __init__(self, state: Self | str | Iterable[TokenInfo | tuple[int, str]] | ast.AST | None):
         if isinstance(state, Code):
             self.__current_state = state.__current_state
-        elif isinstance(state, (TokenInfo, tuple)):
-            self.__current_state = [state]
-        elif isinstance(state, NoneType):
-            self.__current_state = []
         elif isinstance(state, str):
             self.__current_state = state
-        elif isinstance(state, Iterable):
-            self.__current_state = [(int(token.type), str(token.string)) if isinstance(token, TokenInfo) else (int(token[0]), str(token[1])) 
-                                    for token in state]
         elif isinstance(state, ast.AST):
             self.__current_state = state
+        elif isinstance(state, NoneType):
+            self.__current_state = []
+        elif isinstance(state, (Token, TokenInfo, tuple)):
+            self.__current_state = [Token(state)]
+        elif isinstance(state, Iterable):
+            self.__current_state = []
+            for token in state:
+                if isinstance(token, (Token, TokenInfo, tuple)):
+                    self.__current_state.append(Token(token))
+                elif isinstance(token, NoneType):
+                    continue
+                elif isinstance(token, str):
+                    self.__current_state.extend(Code(token).tokens)
+                elif isinstance(token, ast.AST):
+                    self.__current_state.extend(Code(token).tokens)
+                elif isinstance(token, Code):
+                    self.__current_state.extend(token.tokens)
+                elif isinstance(token, Iterable):
+                    self.__current_state.extend(Code(token).tokens)
+                else:
+                    raise TypeError(f"Cannot construct a Code object from {type(token)}")
         else:
             raise TypeError(f"Cannot construct a Code object from {type(state)}")
 
@@ -48,7 +83,7 @@ class Code:
         elif isinstance(self.__current_state, ast.AST):
             self.__current_state = ast.fix_missing_locations(self.__current_state)
             return unparse(self.__current_state)
-        elif isinstance(self.__current_state, Iterable):
+        elif isinstance(self.__current_state, list):
             return untokenize(self.__current_state)
         raise TypeError(f"Current state has invalid type {type(self.__current_state)}")
 
@@ -61,14 +96,15 @@ class Code:
 
     @property
     def tokens(self):
-        if isinstance(self.__current_state, Iterable) and not isinstance(self.__current_state, str):
-            return list(self.__current_state)
+        if isinstance(self.__current_state, list):
+            return self.__current_state
+
         code = self.string
         no_newlines = '\n' not in code
         token_list = list(generate_tokens(StringIO(self.string).readline))
-        if no_newlines:
-            # drop final newline and eof marker
-            token_list = token_list[:-2]
+        
+        # remove eof marker (and possibly final newline)
+        token_list = token_list[:-2 if no_newlines else -1]
         return token_list
     
     def to(self, grammar_rule: str):

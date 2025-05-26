@@ -53,10 +53,10 @@ simple_stmt (memo):
     # macro call statement
     | a=macro_name '(' args=[args_fragment] ')' {
         MacroCall(
-            func=a.id,
+            func=a,
             args=args or [],
             keywords=[],
-            expand_as_stmts=True,
+            parse_as="statements",
             LOCATIONS,
         )
      }
@@ -107,7 +107,7 @@ unparsed_block:
 # ---------
 
 args_fragment:
-    | a=unparsed_balanced { self.make_fragment(a) }
+    | a=unparsed_balanced { [self.make_fragment(a)] }
 
 suite_fragment:
     | NEWLINE INDENT a=unparsed_block+ DEDENT { self.make_fragment(a) }
@@ -128,9 +128,9 @@ macro_stmt_args:
 
 macro_stmt[MacroCall]:
     | a=macro_name [macro_stmt_args] ':' unparsed_line INDENT { self.raise_indentation_error("unexpected indented block") }
-    | a=macro_name ':' b=suite_fragment { MacroCall(a, args=b, expand_as_stmts=True, LOCATIONS) }
+    | a=macro_name ':' b=suite_fragment { MacroCall(func=a, args=[b], parse_as="statements", LOCATIONS) }
     | a=macro_name h=macro_stmt_args ':' b=suite_fragment {
-        MacroCall(MacroCall(a, args=h, LOCATIONS), b, expand_as_stmts=True, LOCATIONS)
+        MacroCall(func=a, args=[b, h], parse_as="statements", LOCATIONS)
      }
 
  # Common elements
@@ -151,7 +151,7 @@ decorator:
     | a=('@' f=named_expression NEWLINE { f }) { self.check_version((3, 9), "Generic decorator are",  a) }
 dec_macro:
     | a=macro_name '(' args=[args_fragment] ')' {
-        MacroCall(func=a.id, args=args or [], keywords=[], LOCATIONS)
+        MacroCall(func=a, args=args or [], keywords=[], LOCATIONS)
      }
     | macro_name
     # this makes `macro` a keyword that's only usable in decorators
@@ -358,14 +358,14 @@ unparsed_function_def[Union[FunctionDef, AsyncFunctionDef]]:
 
 else_block[list]:
     | invalid_else_stmt
-    | &'else' a=macro_stmt { a }
+    | &'else' a=macro_stmt { self.set_macro_stmt_mode(a, "try_stmt") }
     | 'else' &&':' b=block { b }
 
 # Try statement
 # -------------
 try_stmt[ast.Try]:
     | invalid_try_stmt
-    | &'try' a=macro_stmt { a }
+    | &'try' a=macro_stmt { self.set_macro_stmt_mode(a, "try_stmt") }
     | 'try' &&':' b=block f=finally_block{
         ast.Try(body=b, handlers=[], orelse=[], finalbody=f, LOCATIONS)
      }
@@ -388,7 +388,7 @@ try_stmt[ast.Try]:
 # ----------------
 finally_block[list]:
     | invalid_finally_stmt
-    | &'finally' a=macro_stmt { a }
+    | &'finally' a=macro_stmt { self.set_macro_stmt_mode(a, "finally_block") }
     | 'finally' &&':' a=block { a }
 
 
@@ -472,23 +472,12 @@ atom:
     # macro call expressions are atoms rather than primary to allow foo!()() etc
     | a=macro_name '(' args=[args_fragment] ')' {
         MacroCall(
-            func=a.id,
+            func=a,
             args=args or [],
             keywords=[],
             LOCATIONS,
         )
      }
-    | token_literal
-
-# Token Literal
-# -------------
-
-any_except_backtick: !'`' ANY
-
-token_literal:
-    | '`' '`' '`' tokens=any_except_backtick* '`' '`' '`' { TokenLiteral(tokens) }
-    | '`' tokens=any_except_backtick* '`' { TokenLiteral(tokens) }
-
 
 # Invalid Rules
 # -------------

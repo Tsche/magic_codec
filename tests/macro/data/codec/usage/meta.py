@@ -2,8 +2,9 @@
 
 @macro
 def define_macro(name: str, fnc):
-    from magic_codec.legacy_macro import mangle
-    globals()[mangle(name)] = fnc
+    # injects a function into the preprocessor
+    # however, these macros will not get cached for imports
+    globals()[name] = fnc
 
 @macro(eval_args=True)
 def foo():
