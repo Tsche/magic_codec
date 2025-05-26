@@ -16,9 +16,6 @@ def bar(tokens):
 @bar!
 def target():
     ...
-
-
-
     
 target()
 target()

@@ -48,6 +48,12 @@ class Code:
     def __init__(self, state: Self | str | Iterable[TokenInfo | tuple[int, str]] | ast.AST | None):
         if isinstance(state, Code):
             self.__current_state = state.__current_state
+        elif isinstance(state, (int, float, bool)):
+            # allow turning literal into code
+            self.__current_state = repr(state)
+        elif isinstance(state, type(...)):
+            # allow turning literal into code
+            self.__current_state = "..."
         elif isinstance(state, str):
             self.__current_state = state
         elif isinstance(state, ast.AST):

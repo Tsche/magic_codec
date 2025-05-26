@@ -151,8 +151,6 @@ class Unparser(_Unparser):
 
     def visit_MacroCall(self, node: MacroCall):
         self.set_precedence(_Precedence.ATOM, node.func)
-        if isinstance(node.func, str):
-            raise 3
         self.traverse(node.func)
         with self.delimit("(", ")"):
             self.interleave(lambda: self.write(", "), self.traverse, node.args)

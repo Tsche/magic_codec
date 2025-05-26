@@ -89,7 +89,6 @@ class MacroEvaluator(TreePass):
             '_Code': Code
         }
 
-        self.in_macro_context = False
         self.module = ast.Module()
         self.exec(Code("from magic_codec.macro.hooks import register_imports"))
 
@@ -171,15 +170,14 @@ def {name}(code):
         if node.is_macro:
             if not allow_macros:
                 self.report_error("Macro definitions are only allowed at module scope")
-            self.in_macro_context = True
 
         if isinstance(node.body, UnparsedFragment):
             # must evaluate
             macro_decorators = [Code(decorator)
                                 for decorator in node.decorator_list if isinstance(decorator, (MacroCall, MacroName))]
             node.decorator_list = [decorator for decorator in node.decorator_list if not isinstance(decorator, (MacroCall, MacroName))]
-            transformed = self.apply_macros(Code(node.body), macro_decorators)
-            node.body = to_ast(transformed, "block")
+            transformed: Code = self.apply_macros(Code(node.body.data), macro_decorators)
+            node.body = transformed.to("block")
 
         assert not isinstance(node.body, UnparsedFragment)
 
@@ -191,7 +189,6 @@ def {name}(code):
             # evaluate macros, ensure names are mangled
             node.name = mangle(node.name)
             self.exec(Code(node))
-            self.in_macro_context = False
             # discard the current node
             return
 

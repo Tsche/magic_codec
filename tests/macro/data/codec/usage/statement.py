@@ -2,6 +2,8 @@
 
 @macro
 def with_args(code, unparsed_args):
+    from token import NL
+
     yield unparsed_args
     yield '\n'
     yield code
