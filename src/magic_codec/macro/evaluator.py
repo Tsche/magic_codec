@@ -167,9 +167,8 @@ def {name}(code):
         yield from self.act_on_definition(node)
 
     def act_on_definition(self, node: Def, allow_macros=False) -> Generator[Def]:
-        if node.is_macro:
-            if not allow_macros:
-                self.report_error("Macro definitions are only allowed at module scope")
+        if node.is_macro and not allow_macros:
+            self.report_error("Macro definitions are only allowed at module scope")
 
         if isinstance(node.body, UnparsedFragment):
             # must evaluate

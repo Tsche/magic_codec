@@ -10,9 +10,10 @@ from pegen.tokenizer import Tokenizer
 
 class MacroCall(ast.Call):
     if sys.version_info >= (3, 10):
-        __match_args__ = [*ast.Call.__match_args__, 'parse_as']
+        __match_args__ = (*ast.Call.__match_args__, 'parse_as')
     parse_as: str
     _fields = (*ast.Call._fields, 'parse_as')
+    _field_types = ast.Call._field_types | {'parse_as': str}
 
     def __init__(self, *args, parse_as: str = "expression", **kwargs):
         super().__init__(*args, **kwargs)
@@ -34,12 +35,14 @@ class UnparsedFragment(UserList, ast.AST):
 
     data: list[TokenInfo]
     _fields = ("data",)
+    _field_types = {'data': list[TokenInfo]}
 
 class FunctionDef(ast.FunctionDef):
     if sys.version_info >= (3, 10):
-        __match_args__ = [*ast.FunctionDef.__match_args__, 'is_macro']
+        __match_args__ = (*ast.FunctionDef.__match_args__, 'is_macro')
     is_macro: bool
     _fields = (*ast.FunctionDef._fields, 'is_macro')
+    _field_types = ast.FunctionDef._field_types | {'is_macro': bool}
 
     def __init__(self, *args, is_macro: bool = False, **kwargs):
         super().__init__(*args, **kwargs)
@@ -47,9 +50,10 @@ class FunctionDef(ast.FunctionDef):
 
 class AsyncFunctionDef(ast.AsyncFunctionDef):
     if sys.version_info >= (3, 10):
-        __match_args__ = [*ast.AsyncFunctionDef.__match_args__, 'is_macro']
+        __match_args__ = (*ast.AsyncFunctionDef.__match_args__, 'is_macro')
     is_macro: bool
     _fields = (*ast.AsyncFunctionDef._fields, 'is_macro')
+    _field_types = ast.AsyncFunctionDef._field_types | {'is_macro': bool}
 
     def __init__(self, *args, is_macro: bool = False, **kwargs):
         super().__init__(*args, **kwargs)
@@ -57,9 +61,10 @@ class AsyncFunctionDef(ast.AsyncFunctionDef):
 
 class ClassDef(ast.ClassDef): 
     if sys.version_info >= (3, 10):
-        __match_args__ = [*ast.ClassDef.__match_args__, 'is_macro']
+        __match_args__ = (*ast.ClassDef.__match_args__, 'is_macro')
     is_macro: bool
     _fields = (*ast.ClassDef._fields, 'is_macro')
+    _field_types = ast.ClassDef._field_types | {'is_macro': bool}
 
     def __init__(self, *args, is_macro: bool = False, **kwargs):
         super().__init__(*args, **kwargs)
@@ -69,9 +74,10 @@ type Def = FunctionDef | AsyncFunctionDef | ClassDef
 
 class Import(ast.Import):
     if sys.version_info >= (3, 10):
-        __match_args__ = [*ast.Import.__match_args__, 'is_macro']
+        __match_args__ = (*ast.Import.__match_args__, 'is_macro')
     is_macro: bool
     _fields = (*ast.Import._fields, 'is_macro')
+    _field_types = ast.Import._field_types | {'is_macro': bool}
 
     def __init__(self, *args, is_macro: bool = False, **kwargs):
         super().__init__(*args, **kwargs)
@@ -79,9 +85,10 @@ class Import(ast.Import):
 
 class ImportFrom(ast.ImportFrom):
     if sys.version_info >= (3, 10):
-        __match_args__ = [*ast.ImportFrom.__match_args__, 'is_macro']
+        __match_args__ = (*ast.ImportFrom.__match_args__, 'is_macro')
     is_macro: bool
     _fields = (*ast.ImportFrom._fields, 'is_macro')
+    _field_types = ast.ImportFrom._field_types | {'is_macro': bool}
 
     def __init__(self, *args, is_macro: bool = False, **kwargs):
         super().__init__(*args, **kwargs)
