@@ -1,7 +1,7 @@
 # coding: magic.macro
 
 macro_rules! print:
-    | a=STRING { print($a); }
+    | a=STRING { print($a) }
     | a=NUMBER { print(f"0x{$a:x}") }
     | a=atom   { print(f"{$a=}") }
 

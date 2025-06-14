@@ -51,31 +51,6 @@ def synthesize_call_chain(calls: Iterable[Code], args: Code, convert_to: Optiona
     call = synthesize_call(calls[0], synthesize_call_chain(calls[1:], args, convert_to)) if calls else args
     return synthesize_call(Code(convert_to), call) if convert_to else call
 
-# def synthesize_constant(value: Any):
-#     if value is None:
-#         return
-#     elif isinstance(value, tuple) and len(value) == 2:
-#         yield Token(value[0], value[1])
-#     elif isinstance(value, (Token, TokenInfo)):
-#         yield Token(value.type, value.string)
-#     elif isinstance(value, bool):
-#         yield Token(NAME, repr(value))
-#     elif isinstance(value, (int, float)):
-#         yield Token(NUMBER, repr(value))
-#     elif isinstance(value, str):
-#         yield from Code(value).tokens
-#     elif isinstance(value, ast.AST):
-#         yield from Code(value).tokens
-#     elif isinstance(value, Code):
-#         yield from value.tokens
-#     elif isinstance(value, (list, Generator)):
-#         # directly inject tokens into token stream
-#         for item in value:
-#             yield from synthesize_constant(item)
-#     else:
-#         # couldn't find something to replace the constant with
-#         raise RuntimeError(f"Unexpected macro return value {type(value)}")
-
 class MacroEvaluator(TreePass):
     def __init__(self):
         self.globals: dict[str, Any] = {
@@ -101,6 +76,8 @@ class MacroEvaluator(TreePass):
         from magic_codec.macro.declarative import make_parser
         # parse name, ensure it is a valid Python identifier
         name = unparsed_name.to("name").string
+        print(rules.string)
+        sys.exit()
         parser = make_parser(name, rules.tokens)
         self.make_macro(Code(parser))
         self.make_macro(Code(f"""

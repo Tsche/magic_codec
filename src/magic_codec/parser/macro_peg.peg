@@ -1,0 +1,44 @@
+# Minimal patch grammar for declarative macros
+
+@class MacroPegParser
+@extends "peg.py"
+@base PegParser
+@subheader"""
+from magic_codec.parser.peg import *
+
+class Fragment:
+    def __init__(self, *args):
+        self.args = args
+
+    def __repr__(self):
+        return ', '.join(repr(arg) for arg in self.args)
+"""
+@trailer''
+
+ANY: ~ { t if (t:=self._tokenizer.getnext()).type != 0 else None }
+braces: '(' | ')' | '[' | ']' | '{' | '}'
+
+action[list]: '{' ~ t=fragment '}' { t }
+
+# TODO
+replacement: a='$' b=NAME { [a, b] }
+
+
+fragment[str]:
+    | fragment_atom b=fragment { Fragment(LOCATIONS, next_frag=b) }
+    | fragment_atom { Fragment(LOCATIONS) }
+
+fragment_atom[str]:
+    | a="{" ~ atoms=fragment? b="}" 
+    | a="[" ~ atoms=fragment? b="]" 
+    | NAME 
+    | NUMBER 
+    | STRING 
+    | l=FSTRING_START m=fragment_fstring_middle* r=FSTRING_END 
+    | !"}" !"]" OP 
+
+fragment_fstring_middle[str]:
+    | FSTRING_MIDDLE
+    | "{" 
+    | "}" 
+    | fragment_atom

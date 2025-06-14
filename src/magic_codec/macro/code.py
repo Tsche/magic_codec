@@ -13,34 +13,48 @@ class Token(namedtuple("Token", ["type", "string"])):
     type: int
     string: str
 
+    _sloc: tuple[tuple[int, int], tuple[int, int], str] | None
+
     @property
     def start(self):
-        return (0, 0)
+        if not self._sloc:
+            return (0, 0)
     
     @property
     def end(self):
-        return (0, 1)
+        if not self._sloc:
+            return (0, 1)
     
     @property
     def line(self):
-        return ""
+        if not self._sloc:
+            return ""
 
-    def __new__(cls, type_or_obj: int | Self | tuple | TokenInfo, string: str = ""):
+    def __new__(cls, other: int | Self | tuple | TokenInfo, string: str = ""):
         type_: int
         string_: str
-        if isinstance(type_or_obj, int):
-            type_ = type_or_obj
+        sloc: tuple[tuple[int, int], tuple[int, int], str] | None = None
+
+        if isinstance(other, int):
+            type_ = other
             string_ = string
-        elif isinstance(type_or_obj, tuple) and len(type_or_obj) == 2:
-            type_ = int(type_or_obj[0])
-            string_ = str(type_or_obj[1])
-        elif isinstance(type_or_obj,  (TokenInfo, Token)):
-            type_ = type_or_obj.type
-            string_ = type_or_obj.string
+        elif isinstance(other, tuple) and len(other) == 2:
+            type_ = int(other[0])
+            string_ = str(other[1])
+        elif isinstance(other,  TokenInfo):
+            type_ = other.type
+            string_ = other.string
+            sloc = other.start, other.end, other.line
+        elif isinstance(other,  Token):
+            type_ = other.type
+            string_ = other.string
+            sloc = other._sloc
         else:
-            raise TypeError(f"Cannot construct a Token object from {type(type_or_obj)}{f', {string}' if string else ''}")
+            raise TypeError(f"Cannot construct a Token object from {type(other)}{f', {string}' if string else ''}")
         
-        return super().__new__(cls, type_, string_)
+        obj = super().__new__(cls, type_, string_)
+        obj._sloc = sloc
+        return obj
 
 class Code:
     __current_state: str | list[Token] | ast.AST
