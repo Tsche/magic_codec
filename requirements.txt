@@ -1,2 +1,2 @@
 colorama==0.4.6
-pegen[peg]==0.3.0
+pegen==0.3.0

@@ -76,8 +76,6 @@ class MacroEvaluator(TreePass):
         from magic_codec.macro.declarative import make_parser
         # parse name, ensure it is a valid Python identifier
         name = unparsed_name.to("name").string
-        print(rules.string)
-        sys.exit()
         parser = make_parser(name, rules.tokens)
         self.make_macro(Code(parser))
         self.make_macro(Code(f"""

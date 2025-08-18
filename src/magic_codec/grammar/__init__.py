@@ -1,3 +1,4 @@
+from io import StringIO
 import sys
 import traceback
 from pegen.tokenizer import Tokenizer
@@ -6,9 +7,7 @@ from pegen.grammar_parser import GeneratedParser as GrammarParser
 from pegen.validator import validate_grammar
 import tokenize
 from typing import Iterable
-from io import StringIO
-from pathlib import Path
-from pegen.python_generator import PythonParserGenerator
+from pegen.tokenizer import Tokenizer
 from .parser_generator import ParserGenerator
 
 def parse_grammar(tokens: Iterable, grammar_file = "<unknown>", verbose=False) -> Grammar:
@@ -26,6 +25,9 @@ def parse_grammar(tokens: Iterable, grammar_file = "<unknown>", verbose=False) -
 def parse_grammar_file(grammar_file: str) -> Grammar:
     with open(grammar_file) as file:
         return parse_grammar(tokenize.generate_tokens(file.readline), grammar_file)
+
+def parse_grammar_str(grammar: str, verbose=False):
+    return parse_grammar(tokenize.generate_tokens(StringIO(grammar).readline))
 
 def generate_python(grammar):
     gen = ParserGenerator(grammar)    

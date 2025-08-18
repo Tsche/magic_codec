@@ -6,13 +6,17 @@ from pegen.grammar import GrammarVisitor, Alt
 from pegen.tokenizer import Tokenizer
 
 from magic_codec.macro.code import Code, Token
-from magic_codec.grammar import parse_grammar
 from magic_codec.grammar.parser_generator import PatchParserGenerator
-from magic_codec.parser.macro_peg import MacroPegParser
 from magic_codec.parser.python import PythonParser
 
-def quote_tokens(action: Code):
-    tokenizer = Tokenizer(iter(action.tokens))
+# TODO drop
+from magic_codec.parser.macro_peg import Fragment, MacroPegParser
+
+def quote_tokens(action: Fragment):
+    # This could instead be done by introducing replacements in peg's action grammar
+    # TODO decide whether to do this token or tree based
+    
+    tokenizer = Tokenizer(iter(action.data))
     yield from [(OP, '['), (OP, '*'), (OP, '[')]
     try:
         while (tok := tokenizer.getnext()):
@@ -39,8 +43,7 @@ class ActionTokenizer(GrammarVisitor):
     def visit_Alt(self, node: Alt):
         if not node.action:
             return
-        print("!!", (node.action))
-        node.action = untokenize(quote_tokens(Code(node.action)))
+        node.action = untokenize(quote_tokens(node.action))
 
 
 def make_parser(name: str, rules: list):
@@ -55,31 +58,27 @@ def make_parser(name: str, rules: list):
         Token(1, name), Token(55, ':'), Token(4, '\n'),
         *rules,
         Token(0, '')]
-
-    tokenizer = Tokenizer(iter(rules))
-    parser = MacroPegParser(tokenizer)
+    tokenizer = Tokenizer(iter(tokens))
+    parser = MacroPegParser(tokenizer, verbose=True)
     grammar = parser.start()
-    print(grammar)
-    sys.exit()
+    assert grammar
+
+    ActionTokenizer().visit(grammar)
     
-    # assert grammar
+    grammar.metas["header"] = """
+import ast
+import sys
+import tokenize
+from typing import Any, Optional
+from pegen.parser import memoize, memoize_left_rec, logger
+from magic_codec.parser.python import PythonParser
+"""
+    grammar.metas["trailer"] = ""
+    grammar.metas["class"] = f"_{name}_Parser"
+    grammar.metas["base"] = "PythonParser"
 
-    # ActionTokenizer().visit(grammar)
-
-#     grammar.metas["header"] = """
-# import ast
-# import sys
-# import tokenize
-# from typing import Any, Optional
-# from pegen.parser import memoize, memoize_left_rec, logger
-# from magic_codec.parser.python import PythonParser
-# """
-#     grammar.metas["trailer"] = ""
-#     grammar.metas["class"] = f"_{name}_Parser"
-#     grammar.metas["base"] = "PythonParser"
-
-#     generator = PatchParserGenerator(grammar, PythonParser)
-#     return generator.generate()
+    generator = PatchParserGenerator(grammar, PythonParser)
+    return generator.generate()
 
 
 def to_tokenizer(code: Code):

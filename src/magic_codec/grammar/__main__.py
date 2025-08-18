@@ -13,7 +13,7 @@ def get_parent(grammar_path: Path, grammar: Grammar):
         # cannot expand further
         return None
     
-    module_path = Path(grammar_path.parent / parent)
+    module_path = Path(grammar_path.parent.parent / "parser" / parent)
     spec = importlib.util.spec_from_file_location(module_path.stem, module_path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
