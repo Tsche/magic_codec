@@ -4,108 +4,21 @@
 @extends "peg.py"
 @base PegParser
 @subheader"""
+import textwrap
 from magic_codec.parser.peg import *
 from tokenize import TokenInfo
 
-class Replacement:
-    if sys.version_info >= (3, 10):
-        __match_args__ = ("name")
+def source_range(tokenizer, lineno, col_offset, end_lineno, end_col_offset):
+    lines = tokenizer.get_lines(list(range(lineno, end_lineno + 1)))
+    lines[-1] = lines[-1][:end_col_offset - 1]
+    lines[0] = lines[0][col_offset + 1:]
 
-    name: str
-    _fields = ("name",)
-    _field_types = {'name': str}
-
-    def __init__(self, name: str):
-        self.name = name
-    
-    def __repr__(self):
-        return f"{self.name}"
-
-    __str__ = __repr__
-
-class Fragment:
-    if sys.version_info >= (3, 10):
-        __match_args__ = ("data")
-
-    data: list[TokenInfo | Replacement]
-    _fields = ("data",)
-    _field_types = {'data': list[TokenInfo | Replacement]}
-
-    def __init__(self, *args):
-        self.data = self.flatten(args)
-
-    def __repr__(self):
-        return ', '.join(repr(arg) for arg in self.data)
-
-    __str__ = __repr__
-
-    def flatten(self, nested_list):
-        for item in nested_list:
-            if item is None:
-                continue
-            if isinstance(item, list):
-                yield from self.flatten(item)
-            else:
-                yield item
-
+    # strip leading whitespace
+    data = ''.join(lines).lstrip(' ')
+    if data[0] == '\\n':
+        data = data[1:]
+    return textwrap.dedent(data)
 """
 @trailer''
 
-ANY: ~ { t if (t:=self._tokenizer.getnext()).type != 0 else None }
-braces: '(' | ')' | '[' | ']' | '{' | '}'
-
-unparsed_atom:
-    | '$' a=NAME { Replacement(a) }
-    | a=(!braces !NEWLINE !'$' ANY) { Fragment(a) }
-
-unparsed_balanced:
-    | a='(' b=unparsed_balanced? c=')' d=unparsed_balanced? { Fragment(a, b, c, d) } 
-    | a='[' b=unparsed_balanced? c=']' d=unparsed_balanced? { Fragment(a, b, c, d) }
-    | a='{' b=unparsed_balanced? c='}' d=unparsed_balanced? { Fragment(a, b, c, d) }
-    | a=INDENT NEWLINE b=unparsed_balanced c=DEDENT { Fragment(a, b, c) }
-    | a=unparsed_atom b=unparsed_balanced? { Fragment(a, b) }
-
-unparsed_line:
-    | !INDENT !DEDENT a=unparsed_balanced b=NEWLINE { Fragment(a, b) }
-
-unparsed_block:
-    | a=INDENT ~ b=unparsed_block+ c=DEDENT { Fragment(a, b, c) }
-    | a=unparsed_line { Fragment(a) }
-
-suite_fragment:
-    | NEWLINE INDENT ~ a=unparsed_block+ DEDENT { Fragment(a) }
-    | a=unparsed_line { Fragment(a) }
-
-# This changes action syntax to allow for multi-statement replacements
-# For example:
-# macro_rules! print:
-#    | a=NUMBER:
-#        if $a > 3:
-#            print(f"0x{$a:x}") 
-#        else:
-#            print("123")
-#    | a=STRING: print($a)
-
-action[list]: 
-    | ':' ~ a=suite_fragment { a }
-    | !':' "{" ~ a=unparsed_balanced "}" { Fragment(a) }
-
-# action[str]: 
-#     | ':' a=target_atoms { a }
-#     | "{" ~ target_atoms "}" { target_atoms }
-
-# target_atoms[str]:
-#     | target_atom target_atoms { target_atom + " " + target_atoms }
-#     | target_atom { target_atom }
-
-# target_atom[str]:
-#     | "{" ~ atoms=target_atoms? "}" { "{" + (atoms or "") + "}" }
-#     | "[" ~ atoms=target_atoms? "]" { "[" + (atoms or "") + "]" }
-#     | NAME "*" { name.string + "*" }
-#     | NAME { name.string }
-#     | NUMBER { number.string }
-#     | STRING { string.string }
-#     | l=FSTRING_START m=target_fstring_middle* r=FSTRING_END { l.string + "".join(m) + r.string }
-#     | "?" { "?" }
-#     | ":" { ":" }
-#     | !"}" !"]" OP { op.string }
+action[str]: a="{" ~ target_atoms b="}" { source_range(self._tokenizer, LOCATIONS) }

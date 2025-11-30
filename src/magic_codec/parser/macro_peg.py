@@ -9,325 +9,48 @@ from typing import Any, Optional
 
 from pegen.parser import memoize, memoize_left_rec, logger, Parser
 
+import textwrap
 from magic_codec.parser.peg import *
 from tokenize import TokenInfo
 
-class Replacement:
-    if sys.version_info >= (3, 10):
-        __match_args__ = ("name")
+def source_range(tokenizer, lineno, col_offset, end_lineno, end_col_offset):
+    lines = tokenizer.get_lines(list(range(lineno, end_lineno + 1)))
+    lines[-1] = lines[-1][:end_col_offset - 1]
+    lines[0] = lines[0][col_offset + 1:]
 
-    name: str
-    _fields = ("name",)
-    _field_types = {'name': str}
-
-    def __init__(self, name: str):
-        self.name = name
-    
-    def __repr__(self):
-        return f"{self.name}"
-
-    __str__ = __repr__
-
-class Fragment:
-    if sys.version_info >= (3, 10):
-        __match_args__ = ("data")
-
-    data: list[TokenInfo | Replacement]
-    _fields = ("data",)
-    _field_types = {'data': list[TokenInfo | Replacement]}
-
-    def __init__(self, *args):
-        self.data = self.flatten(args)
-
-    def __repr__(self):
-        return ', '.join(repr(arg) for arg in self.data)
-
-    __str__ = __repr__
-
-    def flatten(self, nested_list):
-        for item in nested_list:
-            if item is None:
-                continue
-            if isinstance(item, list):
-                yield from self.flatten(item)
-            else:
-                yield item
-
+    # strip leading whitespace
+    data = ''.join(lines).lstrip(' ')
+    if data[0] == '\n':
+        data = data[1:]
+    return textwrap.dedent(data)
 
 class MacroPegParser(PegParser, ):
 
     @memoize
-    def ANY(self) -> Optional[Any]:
-        # ANY: ~
+    def action(self) -> Optional[str]:
+        # action: "{" ~ target_atoms "}"
         mark = self._mark()
+        tok = self._tokenizer.peek()
+        start_lineno, start_col_offset = tok.start
         cut = False
         if (
-            (cut := True)
-        ):
-            return t if ( t := self . _tokenizer . getnext ( ) ) . type != 0 else None;
-        self._reset(mark)
-        if cut:
-            return None;
-        return None;
-
-    @memoize
-    def braces(self) -> Optional[Any]:
-        # braces: '(' | ')' | '[' | ']' | '{' | '}'
-        mark = self._mark()
-        if (
-            (literal := self.expect('('))
-        ):
-            return literal;
-        self._reset(mark)
-        if (
-            (literal := self.expect(')'))
-        ):
-            return literal;
-        self._reset(mark)
-        if (
-            (literal := self.expect('['))
-        ):
-            return literal;
-        self._reset(mark)
-        if (
-            (literal := self.expect(']'))
-        ):
-            return literal;
-        self._reset(mark)
-        if (
-            (literal := self.expect('{'))
-        ):
-            return literal;
-        self._reset(mark)
-        if (
-            (literal := self.expect('}'))
-        ):
-            return literal;
-        self._reset(mark)
-        return None;
-
-    @memoize
-    def unparsed_atom(self) -> Optional[Any]:
-        # unparsed_atom: '$' NAME | (!braces !NEWLINE !'$' ANY)
-        mark = self._mark()
-        if (
-            (self.expect('$'))
-            and
-            (a := self.name())
-        ):
-            return Replacement ( a );
-        self._reset(mark)
-        if (
-            (a := self._tmp_1001())
-        ):
-            return Fragment ( a );
-        self._reset(mark)
-        return None;
-
-    @memoize
-    def unparsed_balanced(self) -> Optional[Any]:
-        # unparsed_balanced: '(' unparsed_balanced? ')' unparsed_balanced? | '[' unparsed_balanced? ']' unparsed_balanced? | '{' unparsed_balanced? '}' unparsed_balanced? | INDENT NEWLINE unparsed_balanced DEDENT | unparsed_atom unparsed_balanced?
-        mark = self._mark()
-        if (
-            (a := self.expect('('))
-            and
-            (b := self.unparsed_balanced(),)
-            and
-            (c := self.expect(')'))
-            and
-            (d := self.unparsed_balanced(),)
-        ):
-            return Fragment ( a , b , c , d );
-        self._reset(mark)
-        if (
-            (a := self.expect('['))
-            and
-            (b := self.unparsed_balanced(),)
-            and
-            (c := self.expect(']'))
-            and
-            (d := self.unparsed_balanced(),)
-        ):
-            return Fragment ( a , b , c , d );
-        self._reset(mark)
-        if (
-            (a := self.expect('{'))
-            and
-            (b := self.unparsed_balanced(),)
-            and
-            (c := self.expect('}'))
-            and
-            (d := self.unparsed_balanced(),)
-        ):
-            return Fragment ( a , b , c , d );
-        self._reset(mark)
-        if (
-            (a := self.expect('INDENT'))
-            and
-            (self.expect('NEWLINE'))
-            and
-            (b := self.unparsed_balanced())
-            and
-            (c := self.expect('DEDENT'))
-        ):
-            return Fragment ( a , b , c );
-        self._reset(mark)
-        if (
-            (a := self.unparsed_atom())
-            and
-            (b := self.unparsed_balanced(),)
-        ):
-            return Fragment ( a , b );
-        self._reset(mark)
-        return None;
-
-    @memoize
-    def unparsed_line(self) -> Optional[Any]:
-        # unparsed_line: !INDENT !DEDENT unparsed_balanced NEWLINE
-        mark = self._mark()
-        if (
-            (self.negative_lookahead(self.expect, 'INDENT'))
-            and
-            (self.negative_lookahead(self.expect, 'DEDENT'))
-            and
-            (a := self.unparsed_balanced())
-            and
-            (b := self.expect('NEWLINE'))
-        ):
-            return Fragment ( a , b );
-        self._reset(mark)
-        return None;
-
-    @memoize
-    def unparsed_block(self) -> Optional[Any]:
-        # unparsed_block: INDENT ~ unparsed_block+ DEDENT | unparsed_line
-        mark = self._mark()
-        cut = False
-        if (
-            (a := self.expect('INDENT'))
-            and
-            (cut := True)
-            and
-            (b := self._loop1_1002())
-            and
-            (c := self.expect('DEDENT'))
-        ):
-            return Fragment ( a , b , c );
-        self._reset(mark)
-        if cut:
-            return None;
-        if (
-            (a := self.unparsed_line())
-        ):
-            return Fragment ( a );
-        self._reset(mark)
-        return None;
-
-    @memoize
-    def suite_fragment(self) -> Optional[Any]:
-        # suite_fragment: NEWLINE INDENT ~ unparsed_block+ DEDENT | unparsed_line
-        mark = self._mark()
-        cut = False
-        if (
-            (self.expect('NEWLINE'))
-            and
-            (self.expect('INDENT'))
-            and
-            (cut := True)
-            and
-            (a := self._loop1_1003())
-            and
-            (self.expect('DEDENT'))
-        ):
-            return Fragment ( a );
-        self._reset(mark)
-        if cut:
-            return None;
-        if (
-            (a := self.unparsed_line())
-        ):
-            return Fragment ( a );
-        self._reset(mark)
-        return None;
-
-    @memoize
-    def action(self) -> Optional[list]:
-        # action: ':' ~ suite_fragment | !':' "{" ~ unparsed_balanced "}"
-        mark = self._mark()
-        cut = False
-        if (
-            (self.expect(':'))
-            and
-            (cut := True)
-            and
-            (a := self.suite_fragment())
-        ):
-            return a;
-        self._reset(mark)
-        if cut:
-            return None;
-        cut = False
-        if (
-            (self.negative_lookahead(self.expect, ':'))
-            and
             (self.expect("{"))
             and
             (cut := True)
             and
-            (a := self.unparsed_balanced())
+            (self.target_atoms())
             and
             (self.expect("}"))
         ):
-            return Fragment ( a );
+            tok = self._tokenizer.get_last_non_whitespace_token()
+            end_lineno, end_col_offset = tok.end
+            return source_range ( self . _tokenizer , lineno=start_lineno, col_offset=start_col_offset, end_lineno=end_lineno, end_col_offset=end_col_offset );
         self._reset(mark)
         if cut:
             return None;
         return None;
 
-    @memoize
-    def _tmp_1001(self) -> Optional[Any]:
-        # _tmp_1001: !braces !NEWLINE !'$' ANY
-        mark = self._mark()
-        if (
-            (self.negative_lookahead(self.braces, ))
-            and
-            (self.negative_lookahead(self.expect, 'NEWLINE'))
-            and
-            (self.negative_lookahead(self.expect, '$'))
-            and
-            (ANY := self.ANY())
-        ):
-            return ANY;
-        self._reset(mark)
-        return None;
-
-    @memoize
-    def _loop1_1002(self) -> Optional[Any]:
-        # _loop1_1002: unparsed_block
-        mark = self._mark()
-        children = []
-        while (
-            (unparsed_block := self.unparsed_block())
-        ):
-            children.append(unparsed_block)
-            mark = self._mark()
-        self._reset(mark)
-        return children;
-
-    @memoize
-    def _loop1_1003(self) -> Optional[Any]:
-        # _loop1_1003: unparsed_block
-        mark = self._mark()
-        children = []
-        while (
-            (unparsed_block := self.unparsed_block())
-        ):
-            children.append(unparsed_block)
-            mark = self._mark()
-        self._reset(mark)
-        return children;
-
     KEYWORDS = tuple(set([*(), *getattr(PegParser, 'KEYWORDS', [])]))
     SOFT_KEYWORDS = tuple(set([*(), *getattr(PegParser, 'SOFT_KEYWORDS', [])]))
-    RULES = tuple(set(['ANY', 'braces', 'unparsed_atom', 'unparsed_balanced', 'unparsed_line', 'unparsed_block', 'suite_fragment', 'action', *getattr(PegParser, 'KEYWORDS', [])]))
+    RULES = tuple(set(['action', *getattr(PegParser, 'KEYWORDS', [])]))
 

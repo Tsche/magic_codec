@@ -73,14 +73,14 @@ class MacroEvaluator(TreePass):
         self.exec(code)
 
     def macro_rules(self, rules, unparsed_name):
-        from magic_codec.macro.declarative import make_parser
+        from magic_codec.macro.builtin.declarative import make_parser
         # parse name, ensure it is a valid Python identifier
         name = unparsed_name.to("name").string
-        parser = make_parser(name, rules.tokens)
+        parser = make_parser(name, rules)
         self.make_macro(Code(parser))
         self.make_macro(Code(f"""
 def {name}(code):
-    from magic_codec.macro.declarative import to_tokenizer
+    from magic_codec.macro.builtin.declarative import to_tokenizer
     try:
         return _Code(_{name}_Parser(to_tokenizer(code)).{name}())
     except StopIteration:
@@ -177,6 +177,7 @@ def {name}(code):
             yield from self.visit(node)
 
     def visit_MacroCall(self, node: MacroCall) -> Generator[ast.stmt]:
+        print(Code(node).string)
         try:
             result = self.eval(Code(node))
         except Exception:

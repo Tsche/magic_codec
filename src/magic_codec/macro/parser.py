@@ -15,7 +15,7 @@ from typing import (
 )
 
 from magic_codec.macro.macro_ast import (
-   MacroCall, Def, MacroName, UnparsedFragment
+    MacroCall, Def, MacroName, UnparsedFragment, UnparsedSource
 )
 
 from pegen.tokenizer import Tokenizer
@@ -61,22 +61,24 @@ class Target(enum.Enum):
     STAR_TARGETS = enum.auto()
     DEL_TARGETS = enum.auto()
 
+
 # inject imaginary token type
 # this enables us to write a parsing rule that matches keywords
 KEYWORD = 255
 tokenize.tok_name[KEYWORD] = "KEYWORD"
 
+
 class Parser(ParserBase):
 
     #: Name of the source file, used in error reports
-    filename : str
+    filename: str
 
     def __init__(self,
-        tokenizer: Tokenizer, *,
-        verbose: bool = False,
-        filename: str = "<unknown>",
-        py_version: Optional[tuple] = None,
-    ) -> None:
+                 tokenizer: Tokenizer, *,
+                 verbose: bool = False,
+                 filename: str = "<unknown>",
+                 py_version: Optional[tuple] = None,
+                 ) -> None:
         super().__init__(tokenizer, verbose=verbose)
         self.filename = filename
         self.py_version = min(py_version, sys.version_info) if py_version else sys.version_info
@@ -340,14 +342,14 @@ class Parser(ParserBase):
     def find_macro_decorator(self, target: Def) -> Optional[ast.expr]:
         for decorator in target.decorator_list:
             if ((isinstance(decorator, ast.Name) and decorator.id == "macro") or
-                (isinstance(decorator, ast.Call) and isinstance(decorator.func, ast.Name) and decorator.func.id == "macro")):
+                    (isinstance(decorator, ast.Call) and isinstance(decorator.func, ast.Name) and decorator.func.id == "macro")):
                 return decorator
         return None
 
     def set_decorators(self,
-        target: Def,
-        decorators: list
-    ) -> Def:
+                       target: Def,
+                       decorators: list
+                       ) -> Def:
         """Set the decorators on a function or class definition."""
         target.decorator_list = decorators
         return target
@@ -361,21 +363,21 @@ class Parser(ParserBase):
         return retval
 
     def conditional_parse_def(self,
-        decorators: list,
-        unparsed,
-        parsed
-    ) -> Optional[Def]:
+                              decorators: list,
+                              unparsed,
+                              parsed
+                              ) -> Optional[Def]:
         """Set the decorators on a function or class definition."""
         def get_target():
             if any(isinstance(e, (MacroName, MacroCall)) for e in decorators):
                 return unparsed()
             return parsed()
-        
+
         target = get_target()
         if target is None:
             # TODO parsing body failed - fail hard?
             return None
-        
+
         target.decorator_list = decorators
         if self.find_macro_decorator(target):
             target.is_macro = True
@@ -408,16 +410,31 @@ class Parser(ParserBase):
             else:
                 yield item
 
+    def source_range(self, first: tokenize.TokenInfo, last: tokenize.TokenInfo):
+        first_line, first_column = first.start
+        last_line, last_column = last.end
+        line_numbers = list(range(first_line, last_line + 1))
+        lines = []
+        for line in line_numbers:
+            if line in self._tokenizer._lines:
+                lines.append(self._tokenizer._lines[line])
+        # trim columns
+        lines[-1] = lines[-1][:last_column]
+        lines[0] = lines[0][first_column:]
+        return UnparsedSource(''.join(lines))
+
     def make_fragment(self, *captures):
-        return UnparsedFragment(self.flatten(captures))
+        flattened = list(self.flatten(captures))
+        return self.source_range(flattened[0], flattened[-1])
+        # return UnparsedFragment(self.flatten(captures))
 
     def make_arguments(self,
-        pos_only: Optional[List[Tuple[ast.arg, None]]],
-        pos_only_with_default: List[Tuple[ast.arg, Any]],
-        param_no_default: Optional[List[Tuple[ast.arg, None]]],
-        param_default: Optional[List[Tuple[ast.arg, Any]]],
-        after_star: Optional[Tuple[Optional[ast.arg], List[Tuple[ast.arg, Any]], Optional[ast.arg]]]
-    ) -> ast.arguments:
+                       pos_only: Optional[List[Tuple[ast.arg, None]]],
+                       pos_only_with_default: List[Tuple[ast.arg, Any]],
+                       param_no_default: Optional[List[Tuple[ast.arg, None]]],
+                       param_default: Optional[List[Tuple[ast.arg, Any]]],
+                       after_star: Optional[Tuple[Optional[ast.arg], List[Tuple[ast.arg, Any]], Optional[ast.arg]]]
+                       ) -> ast.arguments:
         """Build a function definition arguments."""
         defaults = (
             [d for _, d in pos_only_with_default if d is not None]
@@ -578,4 +595,3 @@ class Parser(ParserBase):
     def raise_syntax_error_on_next_token(self, message: str) -> NoReturn:
         next_token = self._tokenizer.peek()
         raise self._build_syntax_error(message, next_token.start, next_token.end)
-    

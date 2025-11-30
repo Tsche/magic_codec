@@ -29,6 +29,14 @@ def maybe_macro(condition: bool, name: str):
         return MacroName(name)
     return name
 
+class UnparsedSource(ast.AST):
+    if sys.version_info >= (3, 10):
+        __match_args__ = ("data")
+
+    data: str
+    _fields = ("data",)
+    _field_types = {'data': str}
+
 class UnparsedFragment(UserList, ast.AST):
     if sys.version_info >= (3, 10):
         __match_args__ = ("data")
@@ -161,6 +169,9 @@ class Unparser(_Unparser):
         with self.delimit("(", ")"):
             self.interleave(lambda: self.write(", "), self.traverse, node.args)
     
+    def visit_UnparsedSource(self, node: UnparsedSource):
+        self.write(f"_Code(\"\"\"{node.data.replace('"', '\"')}\"\"\")")
+
     def visit_UnparsedFragment(self, node: UnparsedFragment):
         token_list = ', '.join(f"({token.type}, {token.string!r})" for token in node.data)
         self.write(f"_Code([{token_list}])")

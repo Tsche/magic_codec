@@ -110,7 +110,7 @@ args_fragment:
     | a=unparsed_balanced { [self.make_fragment(a)] }
 
 suite_fragment:
-    | NEWLINE INDENT a=unparsed_block+ DEDENT { self.make_fragment(a) }
+    | first=NEWLINE INDENT a=unparsed_block+ last=DEDENT { self.source_range(first, last) }
     | a=unparsed_line { self.make_fragment(a) }
 
 

@@ -19,16 +19,19 @@ class Token(namedtuple("Token", ["type", "string"])):
     def start(self):
         if not self._sloc:
             return (0, 0)
+        return self._sloc[0]
     
     @property
     def end(self):
         if not self._sloc:
             return (0, 1)
+        return self._sloc[1]
     
     @property
     def line(self):
         if not self._sloc:
             return ""
+        return self._sloc[2]
 
     def __new__(cls, other: int | Self | tuple | TokenInfo, string: str = ""):
         type_: int

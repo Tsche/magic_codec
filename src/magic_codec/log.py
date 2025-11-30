@@ -74,9 +74,6 @@ def handle_exception(type_, exception, trace):
         trace: Exception trace
     """
     logger = logging.getLogger(__package__)
-    if logger.isEnabledFor(logging.DEBUG):
-        logger.exception("Exception occurred: ", exc_info=(type_, exception, trace))
-    else:
-        logger.error("Exception occurred: %s %s", type_.__name__, exception)
+    logger.exception("Exception occurred: ", exc_info=(type_, exception, trace))
 
     raise SystemExit(1)
